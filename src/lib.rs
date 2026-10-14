@@ -8,6 +8,7 @@ pub mod lua_host;
 pub mod package;
 pub mod runtime;
 pub mod trust;
+pub mod ui;
 pub mod value;
 
 #[cfg(windows)]

@@ -1,4 +1,4 @@
-//! Windows-only Excel add-in layer: exports, registration, and the trust banner.
+//! Windows-only Excel add-in layer: exports, registration, and the ribbon status button.
 //!
 //! Worksheet functions (all thread-unsafe on purpose, so Lua runs on Excel's main thread and a
 //! single non-`Send` Lua state per workbook is enough):
@@ -7,9 +7,9 @@
 //! * `LUA.EVAL(code, [a1..a10])` — evaluate a chunk/expression; arguments are `...`
 //! * `LUA.STATUS()`              — scripts status for this workbook (none / blocked / enabled)
 
-mod banner;
 mod ffi;
 mod oper;
+mod ribbon;
 
 use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use ffi::*;
 
-use crate::runtime::{Book, CallError, Runtime, workbook_path_from_cell_filename};
+use crate::runtime::{CallError, Runtime, Status, workbook_path_from_cell_filename};
 use crate::trust::TrustStore;
 use crate::value::Value;
 
@@ -70,18 +70,15 @@ fn dispatch(
         return Value::Str("#LUA: first argument must be text".into());
     };
     let wb = caller_workbook();
-    let result = with_runtime(|rt| {
-        let r = run(rt, wb.as_deref(), &first, &vals[1..]);
-        // Raise the banner from the same call that was refused.
-        if let (Err(CallError::Blocked), Some(path)) = (&r, wb.as_deref())
-            && let Some((_, n)) = rt.is_blocked(path)
-        {
-            banner::show(path, n);
-        }
-        r
-    });
+    let result = with_runtime(|rt| run(rt, wb.as_deref(), &first, &vals[1..]));
     result.unwrap_or_else(|e| error_text(&e))
 }
+
+/// Parameters of the `LUA.CALL`/`LUA.EVAL` entry points: the name/code plus ten arguments.
+/// The registered type text is derived from this, and `udf!` builds a `[_; UDF_PARAMS]` array
+/// from its parameter list, so the two cannot drift apart (they once did, and Excel crashed
+/// reading an argument it never passed).
+const UDF_PARAMS: usize = 11;
 
 macro_rules! udf {
     ($name:ident, $run:expr) => {
@@ -99,7 +96,8 @@ macro_rules! udf {
             a9: *const Xloper12,
             a10: *const Xloper12,
         ) -> *mut Xloper12 {
-            guarded(|| dispatch(&[f, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10], $run))
+            let all: [*const Xloper12; UDF_PARAMS] = [f, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10];
+            guarded(|| dispatch(&all, $run))
         }
     };
 }
@@ -113,13 +111,16 @@ pub extern "system" fn LuaStatus() -> *mut Xloper12 {
         let Some(wb) = caller_workbook() else {
             return Value::Str("unsaved workbook".into());
         };
-        let s = with_runtime(|rt| match rt.state(&wb) {
-            Book::NoScripts => "no Lua scripts".to_owned(),
-            Book::Blocked { scripts, .. } => {
-                format!("{scripts} script(s) DISABLED - click Enable Lua")
+        let s = with_runtime(|rt| match rt.status(&wb) {
+            Status::NoScripts => "no Lua scripts".to_owned(),
+            Status::Blocked { names } => {
+                format!(
+                    "{} script(s) BLOCKED - use the Lua ribbon button",
+                    names.len()
+                )
             }
-            Book::Active { .. } => "Lua enabled".to_owned(),
-            Book::Failed { message, .. } => format!("Lua failed to load: {message}"),
+            Status::Active { .. } => "Lua enabled".to_owned(),
+            Status::Failed { message } => format!("Lua failed to load: {message}"),
         });
         Value::Str(s)
     })
@@ -129,7 +130,8 @@ pub extern "system" fn LuaStatus() -> *mut Xloper12 {
 
 struct FnDef {
     proc_name: &'static str,
-    type_text: &'static str,
+    /// Number of worksheet arguments the exported function takes.
+    params: usize,
     excel_name: &'static str,
     arg_text: &'static str,
     help: &'static str,
@@ -138,21 +140,21 @@ struct FnDef {
 const FUNCTIONS: [FnDef; 3] = [
     FnDef {
         proc_name: "LuaCall",
-        type_text: "QQQQQQQQQQQ",
+        params: UDF_PARAMS,
         excel_name: "LUA.CALL",
         arg_text: "function,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
         help: "Calls a global Lua function defined by this workbook's embedded scripts",
     },
     FnDef {
         proc_name: "LuaEval",
-        type_text: "QQQQQQQQQQQ",
+        params: UDF_PARAMS,
         excel_name: "LUA.EVAL",
         arg_text: "code,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
         help: "Evaluates a Lua expression or chunk; arguments are available as ...",
     },
     FnDef {
         proc_name: "LuaStatus",
-        type_text: "Q",
+        params: 0,
         excel_name: "LUA.STATUS",
         arg_text: "",
         help: "Shows whether this workbook's Lua scripts are enabled",
@@ -165,9 +167,11 @@ fn register_all() -> bool {
         return false;
     }
     for f in &FUNCTIONS {
+        // Type text is the return type followed by one code per argument; all are `Q` (XLOPER12).
+        let type_text = "Q".repeat(1 + f.params);
         let bufs: Vec<Vec<u16>> = [
             f.proc_name,
-            f.type_text,
+            type_text.as_str(),
             f.excel_name,
             f.arg_text,
             "Lua",
@@ -210,14 +214,48 @@ fn register_all() -> bool {
     true
 }
 
-#[unsafe(no_mangle)]
-pub extern "system" fn xlAutoOpen() -> i32 {
-    catch_unwind(register_all).unwrap_or(false) as i32
+/// Main Excel window, for the COM bootstrap.
+pub(crate) fn excel_main_window() -> Option<windows::Win32::Foundation::HWND> {
+    let mut out = Xloper12::nil();
+    if excel12(xlGetHwnd, Some(&mut out), &mut []) != xlretSuccess {
+        return None;
+    }
+    // Excel returns the HWND as a 32-bit integer.
+    let h = unsafe { out.val.w } as u32 as usize;
+    Some(windows::Win32::Foundation::HWND(
+        h as *mut core::ffi::c_void,
+    ))
+}
+
+/// Creates `%APPDATA%\xll-bridge\lua` (module search path) so the folder exists from first run.
+fn ensure_config_dirs() {
+    if let Some(dir) = TrustStore::default_path().and_then(|p| p.parent().map(|d| d.join("lua"))) {
+        let _ = std::fs::create_dir_all(dir);
+    }
 }
 
 #[unsafe(no_mangle)]
+pub extern "system" fn xlAutoOpen() -> i32 {
+    catch_unwind(|| {
+        ensure_config_dirs();
+        let ok = register_all();
+        // The ribbon button is optional: UDFs must keep working if COM registration fails.
+        let _ = ribbon::register();
+        ok
+    })
+    .unwrap_or(false) as i32
+}
+
+/// Excel exiting, or the add-in being unloaded. The ribbon registration is left in place.
+#[unsafe(no_mangle)]
 pub extern "system" fn xlAutoClose() -> i32 {
-    let _ = catch_unwind(banner::dismiss);
+    1
+}
+
+/// The user removed the add-in from the Add-ins dialog: take the ribbon registration with it.
+#[unsafe(no_mangle)]
+pub extern "system" fn xlAutoRemove() -> i32 {
+    let _ = catch_unwind(ribbon::unregister);
     1
 }
 

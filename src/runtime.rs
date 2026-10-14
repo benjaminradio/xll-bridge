@@ -18,9 +18,32 @@ use crate::value::Value;
 
 pub enum Book {
     NoScripts,
-    Blocked { digest: String, scripts: usize },
-    Active { digest: String, host: LuaHost },
-    Failed { digest: String, message: String },
+    Blocked {
+        digest: String,
+        names: Vec<String>,
+    },
+    Active {
+        digest: String,
+        names: Vec<String>,
+        host: LuaHost,
+    },
+    Failed {
+        digest: String,
+        message: String,
+    },
+}
+
+/// What a UI needs to know about a workbook, without access to the Lua state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// No scripts (or no file on disk): nothing to trust.
+    NoScripts,
+    /// Scripts present and trusted; Lua is running.
+    Active { names: Vec<String> },
+    /// Scripts present but not trusted; nothing has been executed.
+    Blocked { names: Vec<String> },
+    /// Trusted, but loading the scripts failed.
+    Failed { message: String },
 }
 
 struct Entry {
@@ -50,6 +73,8 @@ impl From<HostError> for CallError {
 pub struct Runtime {
     trust: TrustStore,
     books: HashMap<String, Entry>,
+    /// Shared sandbox for `LUA.EVAL` where there is no trusted script state.
+    sandbox: Option<LuaHost>,
 }
 
 impl Runtime {
@@ -57,6 +82,7 @@ impl Runtime {
         Runtime {
             trust,
             books: HashMap::new(),
+            sandbox: None,
         }
     }
 
@@ -81,17 +107,21 @@ impl Runtime {
             _ => return Book::NoScripts,
         };
         let digest = scripts.digest();
+        let names: Vec<String> = scripts.scripts.iter().map(|s| s.name.clone()).collect();
         // A save by Excel changes the mtime but not the scripts: keep the live Lua state.
-        if let Some(Book::Active { digest: d, host }) = previous
+        if let Some(Book::Active {
+            digest: d, host, ..
+        }) = previous
             && d == digest
         {
-            return Book::Active { digest, host };
+            return Book::Active {
+                digest,
+                names,
+                host,
+            };
         }
         if !self.trust.is_trusted(workbook, &digest) {
-            return Book::Blocked {
-                digest,
-                scripts: scripts.scripts.len(),
-            };
+            return Book::Blocked { digest, names };
         }
         activate(workbook, &scripts, digest)
     }
@@ -124,12 +154,25 @@ impl Runtime {
         Ok(self.active(workbook)?.call(func, args)?)
     }
 
+    /// Evaluates an expression. With no trusted scripts to run in (unsaved workbook, or one
+    /// without scripts) it runs in the sandbox; a workbook whose scripts are blocked stays blocked.
     pub fn eval(
         &mut self,
         workbook: Option<&Path>,
         code: &str,
         args: &[Value],
     ) -> Result<Value, CallError> {
+        let sandboxed = match workbook {
+            None => true,
+            Some(p) => matches!(self.state(p), Book::NoScripts),
+        };
+        if sandboxed {
+            if self.sandbox.is_none() {
+                self.sandbox = Some(LuaHost::sandboxed()?);
+            }
+            let host = self.sandbox.as_ref().expect("just created");
+            return Ok(host.eval(code, args)?);
+        }
         Ok(self.active(workbook)?.eval(code, args)?)
     }
 
@@ -143,17 +186,30 @@ impl Runtime {
         }
     }
 
-    pub fn is_blocked(&mut self, workbook: &Path) -> Option<(String, usize)> {
+    /// Summary for UI (ribbon, `LUA.STATUS`).
+    pub fn status(&mut self, workbook: &Path) -> Status {
         match self.state(workbook) {
-            Book::Blocked { digest, scripts } => Some((digest.clone(), *scripts)),
-            _ => None,
+            Book::NoScripts => Status::NoScripts,
+            Book::Blocked { names, .. } => Status::Blocked {
+                names: names.clone(),
+            },
+            Book::Active { names, .. } => Status::Active {
+                names: names.clone(),
+            },
+            Book::Failed { message, .. } => Status::Failed {
+                message: message.clone(),
+            },
         }
     }
 }
 
 fn activate(workbook: &Path, scripts: &ScriptSet, digest: String) -> Book {
     match LuaHost::new(scripts, &HostContext { workbook }) {
-        Ok(host) => Book::Active { digest, host },
+        Ok(host) => Book::Active {
+            digest,
+            names: scripts.scripts.iter().map(|s| s.name.clone()).collect(),
+            host,
+        },
         Err(e) => Book::Failed {
             digest,
             message: e.to_string(),
@@ -207,7 +263,7 @@ mod tests {
             rt.call(Some(&wb), "one", &[]),
             Err(CallError::Blocked)
         ));
-        assert!(rt.is_blocked(&wb).is_some());
+        assert!(matches!(rt.status(&wb), Status::Blocked { .. }));
         assert!(!marker.exists(), "Lua ran while the workbook was untrusted");
 
         rt.enable(&wb).unwrap();
@@ -237,6 +293,36 @@ mod tests {
             rt.call(Some(&wb), "one", &[]),
             Err(CallError::Blocked)
         ));
+    }
+
+    #[test]
+    fn eval_is_sandboxed_without_scripts_but_blocked_with_untrusted_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain.xlsx");
+        minimal_xlsx(&plain);
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        // Unsaved and script-less workbooks may evaluate expressions, with no ambient authority.
+        assert_eq!(rt.eval(None, "1 +2", &[]).unwrap(), Value::Num(3.0));
+        assert_eq!(rt.eval(Some(&plain), "1 +2", &[]).unwrap(), Value::Num(3.0));
+        assert_eq!(rt.eval(None, "io == nil", &[]).unwrap(), Value::Bool(true));
+
+        let (_d, wb) = workbook_with("function f() return 1 end");
+        assert!(matches!(
+            rt.eval(Some(&wb), "1", &[]),
+            Err(CallError::Blocked)
+        ));
+        assert_eq!(rt.status(&plain), Status::NoScripts);
+        rt.enable(&wb).unwrap();
+        assert_eq!(
+            rt.eval(Some(&wb), "io ~= nil", &[]).unwrap(),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            rt.status(&wb),
+            Status::Active {
+                names: vec!["main".into()]
+            }
+        );
     }
 
     #[test]

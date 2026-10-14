@@ -8,9 +8,14 @@
 //! * errors are `xl.NA`, `xl.VALUE`, `xl.DIV0`, ... and may be returned or compared with `==`
 //! * a range is a table of rows (`{{1,2},{3,4}}`); returning a flat list yields one column
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use mlua::{Function, Lua, LuaOptions, MultiValue, StdLib, UserData, Value as LV};
+use mlua::chunk::ChunkMode;
+use mlua::{
+    Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, UserData, Value as LV, VmState,
+};
 
 use crate::package::ScriptSet;
 use crate::value::{Array, ErrorCode, Value};
@@ -59,8 +64,15 @@ pub struct HostContext<'a> {
     pub workbook: &'a Path,
 }
 
+/// VM instructions a sandboxed call may run before it is aborted (a few seconds of work).
+const SANDBOX_INSTRUCTION_LIMIT: u64 = 200_000_000;
+const SANDBOX_HOOK_STEP: u32 = 100_000;
+const SANDBOX_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
 pub struct LuaHost {
     lua: Lua,
+    /// Present for sandboxed states: instructions executed in the current call.
+    budget: Option<Rc<Cell<u64>>>,
 }
 
 impl LuaHost {
@@ -72,12 +84,49 @@ impl LuaHost {
         // SAFETY: enables loading C modules via `require`/`package.loadlib`. Reachable only
         // after the user explicitly trusted this exact script set (see trust.rs).
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE, LuaOptions::default()) };
-        install_xl_table(&lua, ctx)?;
+        install_xl_table(&lua, Some(ctx.workbook))?;
         configure_package_path(&lua, ctx.workbook)?;
         for s in &scripts.scripts {
-            lua.load(&s.code).set_name(format!("={}", s.name)).exec()?;
+            lua.load(&s.code)
+                .set_name(format!("={}", s.name))
+                .set_mode(ChunkMode::Text)
+                .exec()?;
         }
-        Ok(LuaHost { lua })
+        Ok(LuaHost { lua, budget: None })
+    }
+
+    /// A state for expressions typed into cells (`LUA.EVAL`) in workbooks that carry no trusted
+    /// scripts. Pure computation only: no io/os/package/debug, no `load`/`dofile`/`loadfile`,
+    /// bounded memory and instruction count. Safe to run without any trust decision.
+    pub fn sandboxed() -> Result<Self, HostError> {
+        let libs = StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH;
+        let lua = Lua::new_with(libs, LuaOptions::default())?;
+        let globals = lua.globals();
+        for name in ["dofile", "loadfile", "load", "loadstring", "require"] {
+            globals.set(name, LV::Nil)?;
+        }
+        lua.set_memory_limit(SANDBOX_MEMORY_LIMIT)?;
+        install_xl_table(&lua, None)?;
+        let budget = Rc::new(Cell::new(0u64));
+        let hook_budget = Rc::clone(&budget);
+        lua.set_hook(
+            HookTriggers::new().every_nth_instruction(SANDBOX_HOOK_STEP),
+            move |_, _| {
+                let used = hook_budget.get() + u64::from(SANDBOX_HOOK_STEP);
+                hook_budget.set(used);
+                if used > SANDBOX_INSTRUCTION_LIMIT {
+                    Err(mlua::Error::runtime(
+                        "expression exceeded the instruction limit",
+                    ))
+                } else {
+                    Ok(VmState::Continue)
+                }
+            },
+        )?;
+        Ok(LuaHost {
+            lua,
+            budget: Some(budget),
+        })
     }
 
     pub fn call(&self, func: &str, args: &[Value]) -> Result<Value, HostError> {
@@ -103,6 +152,9 @@ impl LuaHost {
     }
 
     fn invoke(&self, f: &Function, args: &[Value]) -> Result<Value, HostError> {
+        if let Some(b) = &self.budget {
+            b.set(0);
+        }
         let lua_args: Vec<LV> = args
             .iter()
             .map(|a| to_lua(&self.lua, a))
@@ -115,14 +167,16 @@ impl LuaHost {
     }
 }
 
-fn install_xl_table(lua: &Lua, ctx: &HostContext<'_>) -> mlua::Result<()> {
+fn install_xl_table(lua: &Lua, workbook: Option<&Path>) -> mlua::Result<()> {
     let xl = lua.create_table()?;
     for e in ErrorCode::ALL {
         xl.set(e.lua_name(), lua.create_userdata(XlError(e))?)?;
     }
     xl.set("EMPTY", lua.create_userdata(XlEmpty)?)?;
     xl.set("version", env!("CARGO_PKG_VERSION"))?;
-    xl.set("workbook", ctx.workbook.to_string_lossy().into_owned())?;
+    if let Some(wb) = workbook {
+        xl.set("workbook", wb.to_string_lossy().into_owned())?;
+    }
     lua.globals().set("xl", xl)
 }
 
@@ -357,6 +411,50 @@ mod tests {
             panic!()
         };
         assert!(m.contains("bad thing") && !m.contains('\n'));
+    }
+
+    #[test]
+    fn sandbox_has_no_ambient_authority() {
+        let h = LuaHost::sandboxed().unwrap();
+        for name in [
+            "io", "os", "package", "debug", "dofile", "loadfile", "load", "require",
+        ] {
+            let code = format!("return {name} == nil");
+            assert_eq!(
+                h.eval(&code, &[]).unwrap(),
+                Value::Bool(true),
+                "{name} must be absent"
+            );
+        }
+        assert_eq!(h.eval("1 +2", &[]).unwrap(), Value::Num(3.0));
+        assert_eq!(
+            h.eval("string.rep('ab', 3)", &[]).unwrap(),
+            Value::Str("ababab".into())
+        );
+        assert_eq!(h.eval("xl.NA", &[]).unwrap(), Value::Err(ErrorCode::NA));
+    }
+
+    #[test]
+    fn sandbox_stops_runaway_code_and_recovers() {
+        let h = LuaHost::sandboxed().unwrap();
+        let Err(HostError::Lua(m)) = h.eval("while true do end", &[]) else {
+            panic!("loop must be aborted")
+        };
+        assert!(m.contains("instruction limit"), "{m}");
+        // The budget is per call, so the state stays usable.
+        assert_eq!(h.eval("2 * 21", &[]).unwrap(), Value::Num(42.0));
+    }
+
+    #[test]
+    fn sandbox_limits_memory() {
+        let h = LuaHost::sandboxed().unwrap();
+        assert!(h.eval("string.rep('x', 200 * 1024 * 1024)", &[]).is_err());
+    }
+
+    #[test]
+    fn binary_chunks_are_rejected() {
+        let h = LuaHost::sandboxed().unwrap();
+        assert!(h.eval("\x1bLua", &[]).is_err());
     }
 
     #[test]

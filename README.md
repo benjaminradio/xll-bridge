@@ -2,7 +2,7 @@
 
 A native Excel add-in (XLL, Rust) that exposes Lua (5.4 via [mlua]) for UDFs and data manipulation.
 Scripts live **inside the workbook** as a custom XML part and are **disabled until you enable them**,
-like VBA macros.
+like VBA macros. A ribbon button shows the state at a glance.
 
 > Status: scaffold. The portable core is unit-tested on Linux; the Windows/Excel layer
 > cross-compiles and exports the expected symbols but **has not been run inside Excel yet**.
@@ -16,7 +16,9 @@ like VBA macros.
 | `trust` | trust store pinned to (workbook path, script SHA-256) | any |
 | `lua_host` | Lua state per workbook, `Value` ⇄ Lua | any |
 | `runtime` | per-workbook state machine: NoScripts / Blocked / Active / Failed | any |
-| `xll/` | XLOPER12 FFI, registration, exports, security banner | Windows x64 |
+| `ui` | what the ribbon button shows for each state (colour, label, tooltips) | any |
+| `xll/` | XLOPER12 FFI, registration, exports | Windows x64 |
+| `xll/ribbon/` | COM add-in (same DLL) that provides the Lua ribbon tab/button | Windows x64 |
 | `bin/xllb-pack` | CLI that embeds `.lua` files into a workbook | any |
 
 ## Trust model
@@ -25,8 +27,20 @@ like VBA macros.
 * Trust is stored in `%APPDATA%\xll-bridge\trust.json`, keyed by workbook path **and** a digest of all
   scripts. Editing any script, or moving the file, brings the banner back. A missing/corrupt trust
   file means nothing is trusted.
-* When a `LUA.*` call hits a blocked workbook it returns `#BLOCKED: …` and a yellow bar appears at
-  the top of Excel with **Enable Lua** / ✕.
+* When a `LUA.*` call hits a blocked workbook it returns `#BLOCKED: …`. The **Lua** ribbon tab has one
+  button that reflects the active workbook:
+
+  | colour | meaning |
+  |---|---|
+  | green  | no Lua scripts in the workbook |
+  | yellow | trusted scripts are loaded and running |
+  | red    | scripts present but **blocked** (or failed to load) — nothing has run |
+
+  Clicking the red button lists the scripts and asks for confirmation; **Yes** trusts them and
+  recalculates every open workbook so the `#BLOCKED` cells fill in.
+* `LUA.EVAL` in an unsaved workbook, or one with no scripts, runs in a **sandbox**: no `io`/`os`/`package`/
+  `debug`/`load`/`dofile`, 64 MB memory cap and an instruction limit. In a workbook whose scripts are
+  blocked it stays blocked.
 * Once enabled, scripts get the full Lua standard library (`io`, `os`, `package`, C modules).
   The trust prompt is the only barrier — appropriate for an internal tool where you write the scripts.
 
@@ -51,27 +65,29 @@ Lua conventions: ranges are tables of rows (`{{1,2},{3,4}}`), a flat list return
 cells are `nil` (`xl.EMPTY` inside arrays), errors are `xl.NA`, `xl.VALUE`, `xl.DIV0`, …
 `require` searches the workbook's folder then `%APPDATA%\xll-bridge\lua` (`.lua` and `.dll`).
 
+## Ribbon button: how it works
+
+An XLL can't add ribbon controls, so the same DLL is also an in-process COM add-in
+(`IDTExtensibility2` + `IRibbonExtensibility`). On load, `xlAutoOpen` registers it under
+`HKCU\Software\Classes` and `HKCU\Software\Microsoft\Office\Excel\Addins\XllBridge.Ribbon` (no admin
+rights) and then connects it immediately, so no Excel restart is needed. Removing the add-in from the
+Add-ins dialog (`xlAutoRemove`) deletes those keys; `regsvr32`-style `DllRegisterServer` /
+`DllUnregisterServer` are exported too. A 500 ms timer on Excel's UI thread notices workbook switches and
+refreshes the button. If the COM side fails for any reason the worksheet functions keep working.
+
+## Files
+
+* `%APPDATA%\xll-bridge\trust.json` — trusted (workbook, script digest) pairs; created on first Enable
+* `%APPDATA%\xll-bridge\lua\` — shared Lua/DLL modules for `require`; created when the add-in loads
+
 ## Known limitations / next steps
 
-* After clicking **Enable Lua**, press **Ctrl+Alt+F9**: UDF cells that returned `#BLOCKED` are not dirty,
-  so Excel won't recompute them on its own.
-* The bar is a window owned by Excel positioned under a fixed ribbon offset, not Office's real message
-  bar (not available to XLLs). Layout may need tuning on your Excel build/DPI.
+* Workbooks must be saved to a local path (OneDrive/SharePoint copies are resolved via `LocalFullName`
+  where Excel provides it). Scripts are read from the file on disk, so re-save after embedding.
 * Functions are registered thread-unsafe, so recalculation is single-threaded.
+* The ribbon is untested against every Excel build; it targets Excel 2010+ (32x32 bitmap icons).
 * Not yet implemented: reading arbitrary ranges/cells from Lua (`xl.range`), writing back, async/RTD
-  for long-running external programs, a process-spawn helper with timeouts.
+  for long-running external programs, a process-spawn helper with timeouts, a "revoke trust" action.
 * x64 only.
 
 [mlua]: https://github.com/mlua-rs/mlua
-
-## CI and releases
-
-* `.github/workflows/ci.yml` — on every push/PR: fmt, clippy (`-D warnings`) and tests on Linux; clippy,
-  tests and a release build on Windows x64 (MSVC). The Windows job uploads an artifact
-  **`xll-bridge-windows-x64`** containing `xll-bridge.xll`, `xllb-pack.exe`, a ready-to-open
-  `demo.xlsx` with embedded Lua, `demo.lua`, and `SHA256SUMS.txt`.
-* `.github/workflows/release.yml` — pushing a tag like `v0.1.0` runs the same build and publishes a
-  GitHub release with a zip of that artifact.
-
-To test: download the artifact, open Excel, load `xll-bridge.xll` (File ▸ Options ▸ Add-ins ▸ Go ▸
-Browse; you may need to right-click the file ▸ Properties ▸ Unblock), then open `demo.xlsx`.
