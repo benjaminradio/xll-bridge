@@ -80,8 +80,18 @@ Open the `.xll` in Excel (File ▸ Options ▸ Add-ins ▸ Go ▸ Browse), open 
 
 ### The Files panel
 
-The **Files** button on the Lua tab opens a small tool window next to the right edge of Excel (it floats
-above Excel, minimises with it, and can be moved and resized) showing the workbook's tree. You can:
+The **Files** button on the Lua tab opens a panel docked on the right side of Excel, inside its
+window: the workbook area gives up a strip and the panel sits in it, showing the workbook's tree.
+Drag its left edge to resize it (the width is remembered). **Float** in the panel's header turns it into
+a free-standing tool window instead (and **Dock** puts it back); ✕ closes it. If Excel will not let the
+workbook area be resized (it undoes the change every tick) the panel falls back to floating by itself
+and notes why in `addin.log`.
+
+Docking works by watching Excel's workbook area (`XLDESK`, a child of the frame) every 50 ms and
+re-applying the strip whenever Excel re-lays it out — Excel's window procedure is not subclassed. With
+several Excel windows (one per workbook) it follows the window you are working in.
+
+In the panel you can:
 
 * **New folder** (type the name in place), **Add files…** / **Add folder…** (multi-select, folders are
   imported recursively), or **drag files and folders in from Explorer** onto the panel;
@@ -114,15 +124,21 @@ refreshes the button. If the COM side fails for any reason the worksheet functio
 
 ## Troubleshooting
 
-* `%APPDATA%\xll-bridge\addin.log` records start-up, button clicks, panics and access violations (with the
-  faulting module and offset). Attach it when reporting a crash.
+* `%APPDATA%\xll-bridge\addin.log` exists only after something went wrong. It records panics and access
+  violations (with the faulting module and offset), preceded by the last events (start-up, button clicks)
+  kept in memory. Attach it when reporting a crash.
 * If Excel shows "Excel is running into problems with the 'XllBridge.Ribbon' add-in" it disables the add-in:
   File ▸ Options ▸ Add-ins ▸ Manage: **Disabled Items** ▸ Go ▸ select it ▸ Enable, then restart Excel.
 
-## Files
+## Files on disk (created only when needed)
 
-* `%APPDATA%\xll-bridge\trust.json` — trusted (workbook, script digest) pairs; created on first Enable
-* `%APPDATA%\xll-bridge\lua\` — shared Lua/DLL modules for `require`; created when the add-in loads
+Nothing is written at start-up; the `%APPDATA%\xll-bridge` folder appears only when one of these is first saved:
+
+* `trust.json` — trusted (workbook, script digest) pairs; written on the first Enable or panel edit
+* `settings.json` — dock/float choice and panel width; written when you change them
+* `addin.log` — only when something went wrong (panic, crash, failed write), with the preceding events
+* `lua\` — shared Lua/DLL modules for `require`; create it yourself if you want one
+* `%LOCALAPPDATA%\xll-bridge\cache\` — native modules extracted from a workbook, when it is enabled
 
 ## Known limitations / next steps
 
@@ -130,8 +146,10 @@ refreshes the button. If the COM side fails for any reason the worksheet functio
   where Excel provides it). Scripts are read from the file on disk, so re-save after embedding.
 * Functions are registered thread-unsafe, so recalculation is single-threaded.
 * The ribbon is untested against every Excel build; it targets Excel 2010+ (32x32 bitmap icons).
-* The Files panel is a floating tool window rather than a docked Office task pane (a docked pane would
-  need an ActiveX host). There is no in-panel text editor yet: export, edit, and add the file again.
+* The docked panel is a child window of Excel's frame, not an Office task pane (that would need an
+  ActiveX host). Keystrokes typed into it (rename, new folder) depend on Excel passing them through; if
+  that misbehaves on your Excel, use **Float**. There is no in-panel text editor yet: export, edit, and
+  add the file again.
 * Not yet implemented: reading arbitrary ranges/cells from Lua (`xl.range`), writing back, async/RTD
   for long-running external programs, a process-spawn helper with timeouts, a "revoke trust" action.
 * x64 only.

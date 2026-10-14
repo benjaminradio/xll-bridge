@@ -354,11 +354,11 @@ impl IDispatch_Impl for Addin_Impl {
                     ret(VARIANT::from(pic), result, params);
                 }
                 6 => {
-                    crate::log::line("ribbon: status button clicked");
+                    crate::log::note("ribbon: status button clicked");
                     on_click()
                 }
                 7 => {
-                    crate::log::line("ribbon: Files button clicked");
+                    crate::log::note("ribbon: Files button clicked");
                     if let Some(app) = app() {
                         pane::toggle(&app);
                     }
@@ -383,7 +383,7 @@ impl IDTExtensibility2_Impl for Addin_Impl {
         let app = unsafe { IDispatch::from_raw_borrowed(&application) }.cloned();
         // SAFETY: plain thread timer on Excel's UI thread; `timer_proc` has the TIMERPROC ABI.
         let timer = unsafe { SetTimer(None, 0, POLL_MS, Some(timer_proc)) };
-        crate::log::line("ribbon: connected to Excel");
+        crate::log::note("ribbon: connected to Excel");
         SHARED.with(|s| {
             let mut s = s.borrow_mut();
             s.app = app;
@@ -393,7 +393,7 @@ impl IDTExtensibility2_Impl for Addin_Impl {
     }
 
     unsafe fn OnDisconnection(&self, _: i32, _: *mut *mut c_void) -> HRESULT {
-        crate::log::line("ribbon: disconnecting");
+        crate::log::note("ribbon: disconnecting");
         pane::shutdown();
         SHARED.with(|s| {
             let mut s = s.borrow_mut();

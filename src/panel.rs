@@ -35,6 +35,12 @@ pub enum Command {
         name: String,
     },
     Refresh,
+    /// Switch between docked and floating.
+    ToggleDock,
+    /// Hide the panel.
+    Close,
+    /// Recreate the window in the currently configured mode (used by the docking fallback).
+    Recreate,
 }
 
 pub fn join(parent: &str, name: &str) -> String {

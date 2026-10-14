@@ -17,13 +17,13 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_3DFACE, CreateFontIndirectW, CreateSolidBrush, DEFAULT_GUI_FONT,
-    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW,
-    Ellipse, EndPaint, FillRect, GetObjectW, GetStockObject, GetSysColor, GetSysColorBrush, HDC,
-    HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, NULL_PEN, PAINTSTRUCT, SelectObject, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    BeginPaint, COLOR_3DFACE, COLOR_3DSHADOW, CreateFontIndirectW, CreateSolidBrush,
+    DEFAULT_GUI_FONT, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect, GetObjectW, GetStockObject, GetSysColor,
+    GetSysColorBrush, HDC, HFONT, HGDIOBJ, InvalidateRect, LOGFONTW, MapWindowPoints, NULL_PEN,
+    PAINTSTRUCT, ScreenToClient, SelectObject, SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -36,14 +36,18 @@ use windows::Win32::UI::Controls::{
     TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_DELETE, VK_F2};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, ReleaseCapture, SetCapture, VK_DELETE, VK_F2,
+};
 use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
 use super::{dialogs, dispatch, live, message};
+use crate::dock::{Dock, Rect as DRect};
 use crate::panel::{self, Command};
 use crate::runtime::Status;
+use crate::settings::{self, Settings};
 use crate::ui::{self, Light, View};
 use crate::vfs::{Bundle, Entry, Kind};
 use crate::xll::with_runtime;
@@ -61,6 +65,11 @@ const ID_ADD_FOLDER: usize = 103;
 const ID_EXPORT: usize = 104;
 const ID_RENAME: usize = 105;
 const ID_DELETE: usize = 106;
+const ID_MODE: usize = 107;
+const ID_CLOSE: usize = 108;
+/// Width of the strip on a docked panel's left edge that can be dragged to resize it (96 DPI).
+const GRIP: i32 = 6;
+const DOCK_TICK_MS: u32 = 50;
 const BUTTONS: [(usize, PCWSTR); 6] = [
     (ID_NEW, w!("New folder")),
     (ID_ADD_FILES, w!("Add files\u{2026}")),
@@ -111,9 +120,24 @@ struct Model {
     signature: String,
     authored_unsaved: Vec<String>,
     busy: bool,
+    settings: Settings,
+    settings_loaded: bool,
+}
+
+/// A docked panel's link to the Excel frame it lives in.
+struct DockCtx {
+    frame: HWND,
+    desk: HWND,
+    dock: Dock,
+    width_px: i32,
+    timer: usize,
+    dragging: bool,
 }
 
 thread_local! {
+    static DOCK: RefCell<Option<DockCtx>> = const { RefCell::new(None) };
+    /// Whether the current window is a docked child (as opposed to a floating tool window).
+    static WIN_DOCKED: Cell<bool> = const { Cell::new(false) };
     static HANDLES: Cell<Option<Handles>> = const { Cell::new(None) };
     static MODEL: RefCell<Model> = RefCell::new(Model::default());
     static QUEUE: RefCell<VecDeque<Command>> = const { RefCell::new(VecDeque::new()) };
@@ -136,6 +160,7 @@ fn from_wide_ptr(p: PWSTR) -> Option<String> {
 }
 
 pub fn shutdown() {
+    dock_stop();
     if let Some(h) = handles() {
         // SAFETY: our own window, on the thread that created it.
         let _ = unsafe { DestroyWindow(h.win) };
@@ -195,11 +220,9 @@ fn register_class() {
     DONE.with(|d| d.set(true));
 }
 
-/// Creates the panel window (hidden) on first use. `owner` is Excel's main window.
-fn ensure_window(owner: HWND) -> Option<Handles> {
-    if let Some(h) = handles() {
-        return Some(h);
-    }
+/// Creates the panel window (hidden). `parent` is Excel's main frame when `docked` (the panel is
+/// then a child of it) or Excel's main window as owner when floating.
+fn create_window(parent: HWND, docked: bool) -> Option<Handles> {
     register_class();
     // SAFETY: Win32 window creation on the UI thread; all strings are static or outlive the calls.
     unsafe {
@@ -208,34 +231,52 @@ fn ensure_window(owner: HWND) -> Option<Handles> {
             dwICC: ICC_TREEVIEW_CLASSES,
         });
         let hinst = GetModuleHandleW(None).ok()?;
-        // Start flush against the right edge of Excel, below the ribbon.
-        let mut rc = RECT::default();
-        let have_owner = GetWindowRect(owner, &mut rc).is_ok();
-        let w_px = dpi_scale(owner, PANEL_WIDTH);
-        let (x, y, h) = if have_owner {
-            let y = rc.top + dpi_scale(owner, 140);
-            (
-                rc.right - w_px - dpi_scale(owner, 14),
-                y,
-                (rc.bottom - y - dpi_scale(owner, 60)).max(dpi_scale(owner, 360)),
+        let have_parent = !parent.0.is_null();
+        let w_px = dpi_scale(parent, PANEL_WIDTH);
+        let win = if docked {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                CLASS,
+                TITLE,
+                WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN,
+                0,
+                0,
+                w_px,
+                dpi_scale(parent, 400),
+                Some(parent),
+                None,
+                Some(hinst.into()),
+                None,
             )
         } else {
-            (100, 100, dpi_scale(owner, 520))
-        };
-        let win = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            CLASS,
-            TITLE,
-            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN,
-            x,
-            y,
-            w_px,
-            h,
-            have_owner.then_some(owner),
-            None,
-            Some(hinst.into()),
-            None,
-        )
+            // Start flush against the right edge of Excel, below the ribbon.
+            let mut rc = RECT::default();
+            let have_rect = have_parent && GetWindowRect(parent, &mut rc).is_ok();
+            let (x, y, h) = if have_rect {
+                let y = rc.top + dpi_scale(parent, 140);
+                (
+                    rc.right - w_px - dpi_scale(parent, 14),
+                    y,
+                    (rc.bottom - y - dpi_scale(parent, 60)).max(dpi_scale(parent, 360)),
+                )
+            } else {
+                (100, 100, dpi_scale(parent, 520))
+            };
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                CLASS,
+                TITLE,
+                WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN,
+                x,
+                y,
+                w_px,
+                h,
+                have_parent.then_some(parent),
+                None,
+                Some(hinst.into()),
+                None,
+            )
+        }
         .ok()?;
         let child = |ex, class: PCWSTR, text: PCWSTR, style: WINDOW_STYLE, id: usize| {
             CreateWindowExW(
@@ -266,7 +307,7 @@ fn ensure_window(owner: HWND) -> Option<Handles> {
             300,
         );
         let (normal, _) = make_fonts();
-        for (id, label) in BUTTONS {
+        let button = |id: usize, label: PCWSTR| {
             let b = child(
                 WINDOW_EX_STYLE(0),
                 w!("BUTTON"),
@@ -280,7 +321,12 @@ fn ensure_window(owner: HWND) -> Option<Handles> {
                 Some(WPARAM(normal.0 as usize)),
                 Some(LPARAM(1)),
             );
+        };
+        for (id, label) in BUTTONS {
+            button(id, label);
         }
+        button(ID_MODE, if docked { w!("Float") } else { w!("Dock") });
+        button(ID_CLOSE, w!("\u{2715}"));
         SendMessageW(
             foot,
             WM_SETFONT,
@@ -290,9 +336,80 @@ fn ensure_window(owner: HWND) -> Option<Handles> {
         DragAcceptFiles(win, true);
         let h = Handles { win, tree, foot };
         HANDLES.with(|c| c.set(Some(h)));
+        WIN_DOCKED.with(|d| d.set(docked));
         layout(&h);
         Some(h)
     }
+}
+
+fn load_settings() -> Settings {
+    MODEL.with(|m| {
+        let mut m = m.borrow_mut();
+        if !m.settings_loaded {
+            m.settings = settings::load();
+            m.settings_loaded = true;
+        }
+        m.settings
+    })
+}
+
+/// Excel's frame window for the active window, and its workbook area (`XLDESK`).
+/// In Excel 2013+ every workbook window has its own frame; older Excel has one.
+fn find_frame(app: &IDispatch) -> Option<(HWND, HWND)> {
+    let class_is = |h: HWND, name: &str| {
+        let mut buf = [0u16; 64];
+        // SAFETY: plain query into a local buffer.
+        let n = unsafe { GetClassNameW(h, &mut buf) } as usize;
+        String::from_utf16_lossy(&buf[..n]) == name
+    };
+    let window_hwnd = dispatch::get(app, "ActiveWindow")
+        .ok()
+        .and_then(|v| IDispatch::try_from(&v).ok())
+        .and_then(|w| dispatch::get(&w, "Hwnd").ok())
+        .and_then(|v| i32::try_from(&v).ok())
+        .map(|h| HWND(h as isize as *mut c_void));
+    let candidates = [window_hwnd, Some(super::excel_hwnd(app))];
+    for frame in candidates.into_iter().flatten() {
+        // SAFETY: window queries on handles that may be stale; failures are handled.
+        unsafe {
+            if frame.0.is_null() || !IsWindow(Some(frame)).as_bool() {
+                continue;
+            }
+            let root = GetAncestor(frame, GA_ROOT);
+            for f in [frame, root] {
+                if f.0.is_null() || !class_is(f, "XLMAIN") {
+                    continue;
+                }
+                if let Ok(desk) = FindWindowExW(Some(f), None, w!("XLDESK"), PCWSTR::null()) {
+                    return Some((f, desk));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The panel window for the current mode, creating (or recreating) it as needed.
+fn ensure_window(app: &IDispatch) -> Option<Handles> {
+    let want_docked = load_settings().docked;
+    let frame = want_docked.then(|| find_frame(app)).flatten();
+    let docked = frame.is_some();
+    if let Some(h) = handles() {
+        if WIN_DOCKED.with(Cell::get) == docked {
+            return Some(h);
+        }
+        dock_stop();
+        // SAFETY: our own window.
+        let _ = unsafe { DestroyWindow(h.win) };
+        HANDLES.with(|c| c.set(None));
+    }
+    if want_docked && !docked {
+        crate::log::note("panel: could not find Excel's workbook area; floating instead");
+    }
+    create_window(
+        frame.map_or_else(|| super::excel_hwnd(app), |(f, _)| f),
+        docked,
+    )
 }
 
 fn layout(h: &Handles) {
@@ -303,15 +420,35 @@ fn layout(h: &Handles) {
             return;
         }
         let s = |v: i32| dpi_scale(h.win, v);
+        let lm = if WIN_DOCKED.with(Cell::get) {
+            s(GRIP)
+        } else {
+            0
+        };
         let (w, total_h) = (rc.right, rc.bottom);
         let (header, pad, btn_h, foot_h) = (s(46), s(6), s(26), s(24));
-        let bw = ((w - 4 * pad) / 3).max(40);
+        // Header buttons, right-aligned.
+        let (close_w, mode_w, hb_h) = (s(26), s(50), s(22));
+        if let Ok(b) = GetDlgItem(Some(h.win), ID_CLOSE as i32) {
+            let _ = MoveWindow(b, w - pad - close_w, s(8), close_w, hb_h, true);
+        }
+        if let Ok(b) = GetDlgItem(Some(h.win), ID_MODE as i32) {
+            let _ = MoveWindow(
+                b,
+                w - pad - close_w - s(4) - mode_w,
+                s(8),
+                mode_w,
+                hb_h,
+                true,
+            );
+        }
+        let bw = ((w - lm - 4 * pad) / 3).max(40);
         for (i, (id, _)) in BUTTONS.iter().enumerate() {
             let (col, row) = ((i % 3) as i32, (i / 3) as i32);
             if let Ok(b) = GetDlgItem(Some(h.win), *id as i32) {
                 let _ = MoveWindow(
                     b,
-                    pad + col * (bw + pad),
+                    lm + pad + col * (bw + pad),
                     header + pad + row * (btn_h + pad / 2),
                     bw,
                     btn_h,
@@ -322,17 +459,17 @@ fn layout(h: &Handles) {
         let tree_top = header + pad * 2 + btn_h * 2 + pad / 2;
         let _ = MoveWindow(
             h.tree,
-            0,
+            lm,
             tree_top,
-            w,
+            w - lm,
             (total_h - tree_top - foot_h).max(10),
             true,
         );
         let _ = MoveWindow(
             h.foot,
-            pad,
+            lm + pad,
             total_h - foot_h + s(4),
-            (w - 2 * pad).max(10),
+            (w - lm - 2 * pad).max(10),
             foot_h - s(4),
             true,
         );
@@ -341,10 +478,9 @@ fn layout(h: &Handles) {
 
 // ------------------------------------------------------------------ show / hide
 
-/// Shows the panel (creating it on first use), or hides it if it is open.
 pub fn toggle(app: &IDispatch) {
     let owner = super::excel_hwnd(app);
-    let Some(h) = ensure_window(owner) else {
+    let Some(h) = ensure_window(app) else {
         crate::log::line("panel: could not create the window");
         message(
             owner,
@@ -355,14 +491,200 @@ pub fn toggle(app: &IDispatch) {
         return;
     };
     // SAFETY: our own window.
-    unsafe {
-        if IsWindowVisible(h.win).as_bool() {
-            let _ = ShowWindow(h.win, SW_HIDE);
-        } else {
-            let _ = ShowWindow(h.win, SW_SHOW);
-            MODEL.with(|m| m.borrow_mut().signature.clear());
-            tick(app);
+    if unsafe { IsWindowVisible(h.win) }.as_bool() {
+        hide_panel(h);
+    } else {
+        show_panel(app, h);
+        tick(app);
+    }
+}
+
+fn hide_panel(h: Handles) {
+    dock_stop();
+    // SAFETY: our own window.
+    let _ = unsafe { ShowWindow(h.win, SW_HIDE) };
+}
+
+fn show_panel(app: &IDispatch, h: Handles) {
+    MODEL.with(|m| m.borrow_mut().signature.clear());
+    if WIN_DOCKED.with(Cell::get) {
+        match find_frame(app) {
+            Some((frame, desk)) => dock_start(h, frame, desk),
+            None => {
+                crate::log::line(
+                    "panel: lost Excel's workbook area while opening; showing floating",
+                );
+                // SAFETY: our own window.
+                let _ = unsafe { ShowWindow(h.win, SW_SHOW) };
+            }
         }
+    } else {
+        // SAFETY: our own window.
+        let _ = unsafe { ShowWindow(h.win, SW_SHOW) };
+    }
+}
+
+// ------------------------------------------------------------------ docking into Excel's frame
+
+fn rect_in(frame: HWND, w: HWND) -> Option<DRect> {
+    let mut r = RECT::default();
+    // SAFETY: window geometry queries.
+    unsafe {
+        GetWindowRect(w, &mut r).ok()?;
+        let mut pts = [
+            POINT {
+                x: r.left,
+                y: r.top,
+            },
+            POINT {
+                x: r.right,
+                y: r.bottom,
+            },
+        ];
+        MapWindowPoints(None, Some(frame), &mut pts);
+        Some(DRect {
+            left: pts[0].x,
+            top: pts[0].y,
+            right: pts[1].x,
+            bottom: pts[1].y,
+        })
+    }
+}
+
+fn move_to(w: HWND, r: DRect) {
+    // SAFETY: our own / Excel's windows; a failed move is harmless.
+    let _ = unsafe {
+        MoveWindow(
+            w,
+            r.left,
+            r.top,
+            (r.right - r.left).max(0),
+            (r.bottom - r.top).max(0),
+            true,
+        )
+    };
+}
+
+unsafe extern "system" fn dock_timer(_: HWND, _: u32, _: usize, _: u32) {
+    let _ = catch_unwind(dock_step);
+}
+
+/// Parks the (child) panel in a strip carved off the right edge of Excel's workbook area and
+/// starts the watchdog that keeps it there.
+fn dock_start(h: Handles, frame: HWND, desk: HWND) {
+    dock_stop();
+    let width_px = dpi_scale(frame, load_settings().panel_width);
+    // SAFETY: SetParent between two windows of this thread; the timer runs on this thread.
+    let timer = unsafe {
+        if GetParent(h.win).ok() != Some(frame) {
+            let _ = SetParent(h.win, Some(frame));
+        }
+        let _ = ShowWindow(h.win, SW_SHOW);
+        let _ = SetWindowPos(
+            h.win,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+        SetTimer(None, 0, DOCK_TICK_MS, Some(dock_timer))
+    };
+    DOCK.with(|d| {
+        *d.borrow_mut() = Some(DockCtx {
+            frame,
+            desk,
+            dock: Dock::new(),
+            width_px,
+            timer,
+            dragging: false,
+        })
+    });
+    dock_step();
+}
+
+/// One watchdog step: if Excel re-laid out its workbook area, carve the strip out again.
+fn dock_step() {
+    let Some(h) = handles() else { return };
+    let Some((frame, desk, mut dock, width)) = DOCK.with(|d| {
+        d.borrow()
+            .as_ref()
+            .map(|c| (c.frame, c.desk, c.dock, c.width_px))
+    }) else {
+        return;
+    };
+    // SAFETY: handle validity queries.
+    let (alive, iconic) = unsafe {
+        (
+            IsWindow(Some(frame)).as_bool() && IsWindow(Some(desk)).as_bool(),
+            IsIconic(frame).as_bool(),
+        )
+    };
+    if !alive {
+        dock_stop();
+        return;
+    }
+    if iconic {
+        return;
+    }
+    let mut client = RECT::default();
+    // SAFETY: our reference frame.
+    if unsafe { GetClientRect(frame, &mut client) }.is_err() {
+        return;
+    }
+    let Some(now) = rect_in(frame, desk) else {
+        return;
+    };
+    let plan = dock.plan(now, client.right, width);
+    if dock.is_fighting() {
+        crate::log::line(
+            "panel: Excel keeps resetting its workbook area; switching to a floating panel",
+        );
+        MODEL.with(|m| m.borrow_mut().settings.docked = false); // this session only; not saved
+        enqueue(Command::Recreate);
+        dock_stop();
+        return;
+    }
+    if plan.desk != now {
+        move_to(desk, plan.desk);
+    }
+    if rect_in(frame, h.win) != Some(plan.panel) {
+        move_to(h.win, plan.panel);
+    }
+    DOCK.with(|d| {
+        if let Some(c) = d.borrow_mut().as_mut() {
+            c.dock = dock;
+        }
+    });
+}
+
+/// Gives Excel its workbook area back and forgets the frame. Safe to call when not docked.
+fn dock_stop() {
+    let Some(ctx) = DOCK.with(|d| d.borrow_mut().take()) else {
+        return;
+    };
+    // SAFETY: kill our timer; query/restore windows that may already be gone.
+    unsafe {
+        let _ = KillTimer(None, ctx.timer);
+        if IsWindow(Some(ctx.frame)).as_bool()
+            && IsWindow(Some(ctx.desk)).as_bool()
+            && let Some(now) = rect_in(ctx.frame, ctx.desk)
+            && let Some(right) = ctx.dock.restore_right(now.right)
+        {
+            move_to(ctx.desk, DRect { right, ..now });
+        }
+    }
+}
+
+/// While docked, follows the active workbook window if it lives in another Excel frame.
+fn follow_active_frame(app: &IDispatch, h: Handles) {
+    let Some((frame, desk)) = find_frame(app) else {
+        return;
+    };
+    let current = DOCK.with(|d| d.borrow().as_ref().map(|c| c.frame));
+    if current.is_some() && current != Some(frame) {
+        dock_start(h, frame, desk);
     }
 }
 
@@ -417,6 +739,9 @@ pub fn tick(app: &IDispatch) {
     });
     if !go {
         return;
+    }
+    if WIN_DOCKED.with(Cell::get) {
+        follow_active_frame(app, h);
     }
     let outcome = catch_unwind(AssertUnwindSafe(|| refresh(app, h)));
     MODEL.with(|m| m.borrow_mut().busy = false);
@@ -561,7 +886,12 @@ fn paint(hwnd: HWND) {
         let old_brush = SelectObject(hdc, HGDIOBJ(dot.0));
         let old_pen = SelectObject(hdc, GetStockObject(NULL_PEN));
         let d = s(14);
-        let _ = Ellipse(hdc, s(10), s(16), s(10) + d, s(16) + d);
+        let lm = if WIN_DOCKED.with(Cell::get) {
+            s(GRIP)
+        } else {
+            0
+        };
+        let _ = Ellipse(hdc, lm + s(10), s(16), lm + s(10) + d, s(16) + d);
         SelectObject(hdc, old_brush);
         SelectObject(hdc, old_pen);
         let _ = DeleteObject(HGDIOBJ(dot.0));
@@ -571,9 +901,9 @@ fn paint(hwnd: HWND) {
         let line = |font: HFONT, color: COLORREF, top: i32, s_: &str| {
             let mut buf: Vec<u16> = s_.encode_utf16().collect();
             let mut r = RECT {
-                left: s(32),
+                left: lm + s(32),
                 top,
-                right: rc.right - s(8),
+                right: rc.right - s(96),
                 bottom: top + s(18),
             };
             SelectObject(hdc, HGDIOBJ(font.0));
@@ -597,6 +927,16 @@ fn paint(hwnd: HWND) {
             s(24),
             view.as_ref().map_or("", |v| v.screentip.as_str()),
         );
+        if lm > 0 {
+            // The drag strip on a docked panel's left edge.
+            let line = RECT {
+                left: s(2),
+                top: 0,
+                right: s(3),
+                bottom: rc.bottom,
+            };
+            FillRect(hdc, &line, GetSysColorBrush(COLOR_3DSHADOW));
+        }
         let _ = EndPaint(hwnd, &ps);
     }
 }
@@ -814,6 +1154,8 @@ fn button_clicked(h: Handles, id: usize) {
         ID_DELETE => selected
             .map(|path| enqueue(Command::Delete { path }))
             .unwrap_or_default(),
+        ID_MODE => enqueue(Command::ToggleDock),
+        ID_CLOSE => enqueue(Command::Close),
         _ => {}
     }
 }
@@ -1009,7 +1351,79 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
             let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
             Some(LRESULT(0))
         }
+        WM_SETCURSOR => {
+            if !WIN_DOCKED.with(Cell::get) || (lparam.0 & 0xFFFF) as u32 != HTCLIENT {
+                return None;
+            }
+            let dragging = DOCK.with(|d| d.borrow().as_ref().is_some_and(|c| c.dragging));
+            let mut pt = POINT::default();
+            // SAFETY: cursor queries for our own window.
+            unsafe {
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                if dragging || pt.x < dpi_scale(hwnd, GRIP) {
+                    SetCursor(LoadCursorW(None, IDC_SIZEWE).ok());
+                    return Some(LRESULT(1));
+                }
+            }
+            None
+        }
+        WM_LBUTTONDOWN => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            if WIN_DOCKED.with(Cell::get) && x < dpi_scale(hwnd, GRIP) {
+                DOCK.with(|d| {
+                    if let Some(c) = d.borrow_mut().as_mut() {
+                        c.dragging = true;
+                    }
+                });
+                // SAFETY: capture for our own window; released on button-up.
+                unsafe { SetCapture(hwnd) };
+            }
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE => {
+            let dragging = DOCK.with(|d| d.borrow().as_ref().is_some_and(|c| c.dragging));
+            if dragging {
+                let x = (lparam.0 & 0xFFFF) as i16 as i32;
+                let mut rc = RECT::default();
+                // SAFETY: our own window.
+                let _ = unsafe { GetClientRect(hwnd, &mut rc) };
+                // Dragging the left edge left by n pixels makes the panel n pixels wider.
+                let width = (rc.right - x).max(0);
+                DOCK.with(|d| {
+                    if let Some(c) = d.borrow_mut().as_mut() {
+                        c.width_px = width;
+                    }
+                });
+                dock_step();
+            }
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP | WM_CAPTURECHANGED => {
+            let was_dragging = DOCK.with(|d| {
+                d.borrow_mut()
+                    .as_mut()
+                    .is_some_and(|c| std::mem::replace(&mut c.dragging, false))
+            });
+            if was_dragging {
+                let mut rc = RECT::default();
+                // SAFETY: release capture; read the final width back from the window itself.
+                unsafe {
+                    let _ = ReleaseCapture();
+                    let _ = GetClientRect(hwnd, &mut rc);
+                }
+                let dpi = dpi_scale(hwnd, 96).max(1);
+                let saved = MODEL.with(|m| {
+                    let mut m = m.borrow_mut();
+                    m.settings.panel_width = rc.right * 96 / dpi;
+                    m.settings
+                });
+                settings::save(&saved);
+            }
+            Some(LRESULT(0))
+        }
         WM_DESTROY => {
+            dock_stop();
             HANDLES.with(|c| c.set(None));
             None
         }
@@ -1054,12 +1468,31 @@ fn refresh_live(active: &Active, force: bool) -> Option<Bundle> {
 }
 
 fn process_queue() {
-    let Some(h) = handles() else { return };
     let Some(app) = super::app() else {
         QUEUE.with(|q| q.borrow_mut().clear());
         return;
     };
     while let Some(cmd) = QUEUE.with(|q| q.borrow_mut().pop_front()) {
+        // Mode switches and closing may destroy the window, so look it up afresh every time.
+        let Some(h) = handles() else {
+            QUEUE.with(|q| q.borrow_mut().clear());
+            return;
+        };
+        match cmd {
+            Command::Close => {
+                hide_panel(h);
+                continue;
+            }
+            Command::ToggleDock => {
+                switch_mode(&app);
+                continue;
+            }
+            Command::Recreate => {
+                recreate(&app);
+                continue;
+            }
+            _ => {}
+        }
         let active = active_workbook(&app);
         let r = catch_unwind(AssertUnwindSafe(|| handle(h.win, active.as_ref(), cmd)));
         if r.is_err() {
@@ -1069,6 +1502,30 @@ fn process_queue() {
     }
     MODEL.with(|m| m.borrow_mut().signature.clear());
     tick(&app);
+}
+
+/// Docked <-> floating: remember the choice, then recreate the window in the other mode.
+fn switch_mode(app: &IDispatch) {
+    let saved = MODEL.with(|m| {
+        let mut m = m.borrow_mut();
+        m.settings.docked = !m.settings.docked;
+        m.settings
+    });
+    settings::save(&saved);
+    recreate(app);
+}
+
+/// Destroys the window and builds it again in the configured mode, shown.
+fn recreate(app: &IDispatch) {
+    dock_stop();
+    if let Some(h) = handles() {
+        // SAFETY: our own window; nothing touches it after this returns to the message loop.
+        let _ = unsafe { DestroyWindow(h.win) };
+        HANDLES.with(|c| c.set(None));
+    }
+    if let Some(h) = ensure_window(app) {
+        show_panel(app, h);
+    }
 }
 
 enum Outcome {
@@ -1094,7 +1551,9 @@ fn handle(owner: HWND, active: Option<&Active>, cmd: Command) {
     };
     let current = refresh_live(active, true).unwrap_or_default();
     let outcome = match &cmd {
-        Command::Refresh => Outcome::Nothing,
+        Command::Refresh | Command::ToggleDock | Command::Close | Command::Recreate => {
+            Outcome::Nothing
+        }
         Command::NewFolder { .. } | Command::Rename { .. } => edit(&current, &cmd),
         Command::Delete { path } => {
             let what = panel::delete_summary(&current, path);
@@ -1235,7 +1694,7 @@ mod tests {
 
     fn setup() -> Option<Handles> {
         shutdown();
-        ensure_window(HWND::default())
+        create_window(HWND::default(), false)
     }
 
     fn show(h: Handles, b: &Bundle) {
@@ -1384,6 +1843,147 @@ mod tests {
         show(h, &b);
         assert_eq!(tree_count(h), 5);
         shutdown();
+    }
+
+    unsafe extern "system" fn test_proc(h: HWND, m: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+        // SAFETY: forwards to the default procedure unchanged.
+        unsafe { DefWindowProcW(h, m, w, l) }
+    }
+
+    /// A stand-in for Excel's frame: a top-level window with an `XLDESK` child.
+    fn fake_excel() -> Option<(HWND, HWND)> {
+        // SAFETY: test-only window creation on the test thread.
+        unsafe {
+            let hinst = GetModuleHandleW(None).ok()?;
+            for class in [w!("XllTestFrame"), w!("XLDESK")] {
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(test_proc),
+                    hInstance: hinst.into(),
+                    lpszClassName: class,
+                    ..Default::default()
+                };
+                RegisterClassW(&wc); // already-registered is fine
+            }
+            let frame = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("XllTestFrame"),
+                w!("fake excel"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                1000,
+                700,
+                None,
+                None,
+                Some(hinst.into()),
+                None,
+            )
+            .ok()?;
+            let mut rc = RECT::default();
+            GetClientRect(frame, &mut rc).ok()?;
+            let desk = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("XLDESK"),
+                w!(""),
+                WS_CHILD,
+                0,
+                100,
+                rc.right,
+                400,
+                Some(frame),
+                None,
+                Some(hinst.into()),
+                None,
+            )
+            .ok()?;
+            Some((frame, desk))
+        }
+    }
+
+    fn client_width(w: HWND) -> i32 {
+        let mut rc = RECT::default();
+        // SAFETY: test window.
+        let _ = unsafe { GetClientRect(w, &mut rc) };
+        rc.right
+    }
+
+    #[test]
+    fn docking_carves_a_strip_and_keeps_it_when_excel_relays_out() {
+        let Some((frame, desk)) = fake_excel() else {
+            eprintln!("cannot create windows on this machine: skipping docking test");
+            return;
+        };
+        shutdown();
+        let h = create_window(frame, true).expect("docked panel");
+        dock_start(h, frame, desk);
+
+        let want = dpi_scale(frame, 340);
+        let full = client_width(frame);
+        let desk_rect = rect_in(frame, desk).unwrap();
+        let panel = rect_in(frame, h.win).unwrap();
+        assert_eq!(
+            desk_rect.right,
+            full - want,
+            "workbook area gave up the strip"
+        );
+        assert_eq!(
+            (panel.left, panel.right),
+            (full - want, full),
+            "panel sits in the strip"
+        );
+        assert_eq!((panel.top, panel.bottom), (desk_rect.top, desk_rect.bottom));
+
+        // Excel re-lays out at full width and moves the top edge (formula bar grew): we follow.
+        // SAFETY: test windows.
+        unsafe { MoveWindow(desk, 0, 130, full, 380, true).unwrap() };
+        dock_step();
+        let (d, p) = (
+            rect_in(frame, desk).unwrap(),
+            rect_in(frame, h.win).unwrap(),
+        );
+        assert_eq!(
+            (d.right, d.top, p.left, p.top),
+            (full - want, 130, full - want, 130)
+        );
+
+        // The frame is resized and Excel lays out at the new width.
+        // SAFETY: test windows.
+        unsafe {
+            SetWindowPos(
+                frame,
+                None,
+                0,
+                0,
+                1300,
+                700,
+                SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+            .unwrap()
+        };
+        let wide = client_width(frame);
+        assert!(wide > full);
+        // SAFETY: test windows.
+        unsafe { MoveWindow(desk, 0, 130, wide, 380, true).unwrap() };
+        dock_step();
+        let (d, p) = (
+            rect_in(frame, desk).unwrap(),
+            rect_in(frame, h.win).unwrap(),
+        );
+        assert_eq!((d.right, p.left, p.right), (wide - want, wide - want, wide));
+
+        // Dragging the grip changes the width; the strip stays glued to the right edge.
+        DOCK.with(|c| c.borrow_mut().as_mut().unwrap().width_px = 420);
+        dock_step();
+        assert_eq!(rect_in(frame, desk).unwrap().right, wide - 420);
+        assert_eq!(rect_in(frame, h.win).unwrap().right, wide);
+
+        // Closing gives Excel its width back.
+        dock_stop();
+        assert_eq!(rect_in(frame, desk).unwrap().right, wide);
+        assert!(DOCK.with(|c| c.borrow().is_none()));
+        shutdown();
+        // SAFETY: test window.
+        let _ = unsafe { DestroyWindow(frame) };
     }
 
     #[test]

@@ -290,23 +290,15 @@ pub(crate) fn excel_main_window() -> Option<windows::Win32::Foundation::HWND> {
     ))
 }
 
-/// Creates `%APPDATA%\xll-bridge\lua` (module search path) so the folder exists from first run.
-fn ensure_config_dirs() {
-    if let Some(dir) = TrustStore::default_path().and_then(|p| p.parent().map(|d| d.join("lua"))) {
-        let _ = std::fs::create_dir_all(dir);
-    }
-}
-
 #[unsafe(no_mangle)]
 pub extern "system" fn xlAutoOpen() -> i32 {
     catch_unwind(|| {
         install_diagnostics();
-        crate::log::line(&format!("xlAutoOpen v{}", env!("CARGO_PKG_VERSION")));
-        ensure_config_dirs();
+        crate::log::note(&format!("xlAutoOpen v{}", env!("CARGO_PKG_VERSION")));
         let ok = register_all();
         // The ribbon button is optional: UDFs must keep working if COM registration fails.
         match ribbon::register() {
-            Ok(()) => crate::log::line("ribbon: registered"),
+            Ok(()) => crate::log::note("ribbon: registered"),
             Err(e) => crate::log::line(&format!("ribbon: registration failed: {e}")),
         }
         ok
