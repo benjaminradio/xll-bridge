@@ -214,6 +214,69 @@ fn register_all() -> bool {
     true
 }
 
+/// Records panics and access violations in `addin.log`. Excel's own crash dialog says nothing
+/// about the cause; this does. First-chance exceptions Excel handles itself are logged too, so
+/// the count is capped and a line is not proof of a crash on its own.
+fn install_diagnostics() {
+    use std::sync::Once;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use windows::Win32::System::Diagnostics::Debug::{
+        AddVectoredExceptionHandler, EXCEPTION_POINTERS,
+    };
+    use windows::Win32::System::LibraryLoader::{
+        GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GetModuleFileNameW, GetModuleHandleExW,
+    };
+    use windows::core::PCWSTR;
+
+    unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
+        static SEEN: AtomicU32 = AtomicU32::new(0);
+        // SAFETY: the OS passes valid exception pointers.
+        let (code, addr) = unsafe {
+            let rec = (*info).ExceptionRecord;
+            (
+                (*rec).ExceptionCode.0 as u32,
+                (*rec).ExceptionAddress as usize,
+            )
+        };
+        // Access violation, stack overflow, fast-fail.
+        if matches!(code, 0xC000_0005 | 0xC000_00FD | 0xC000_0409)
+            && SEEN.fetch_add(1, Ordering::Relaxed) < 20
+        {
+            let mut place = String::from("unknown module");
+            // SAFETY: address-based module lookup; buffer sized for a long path.
+            unsafe {
+                let mut module = windows::Win32::Foundation::HMODULE::default();
+                if GetModuleHandleExW(
+                    GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                        | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    PCWSTR(addr as *const u16),
+                    &mut module,
+                )
+                .is_ok()
+                {
+                    let mut buf = vec![0u16; 520];
+                    let n = GetModuleFileNameW(Some(module), &mut buf) as usize;
+                    place = format!(
+                        "{}+{:#x}",
+                        String::from_utf16_lossy(&buf[..n]),
+                        addr - module.0 as usize
+                    );
+                }
+            }
+            crate::log::line(&format!("exception {code:#010x} at {addr:#x} in {place}"));
+        }
+        0 // EXCEPTION_CONTINUE_SEARCH: observe only
+    }
+
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        std::panic::set_hook(Box::new(|info| crate::log::line(&format!("panic: {info}"))));
+        // SAFETY: registers a process-wide observer; it never alters the exception flow.
+        unsafe { AddVectoredExceptionHandler(1, Some(veh)) };
+    });
+}
+
 /// Main Excel window, for the COM bootstrap.
 pub(crate) fn excel_main_window() -> Option<windows::Win32::Foundation::HWND> {
     let mut out = Xloper12::nil();
@@ -237,10 +300,15 @@ fn ensure_config_dirs() {
 #[unsafe(no_mangle)]
 pub extern "system" fn xlAutoOpen() -> i32 {
     catch_unwind(|| {
+        install_diagnostics();
+        crate::log::line(&format!("xlAutoOpen v{}", env!("CARGO_PKG_VERSION")));
         ensure_config_dirs();
         let ok = register_all();
         // The ribbon button is optional: UDFs must keep working if COM registration fails.
-        let _ = ribbon::register();
+        match ribbon::register() {
+            Ok(()) => crate::log::line("ribbon: registered"),
+            Err(e) => crate::log::line(&format!("ribbon: registration failed: {e}")),
+        }
         ok
     })
     .unwrap_or(false) as i32

@@ -14,7 +14,8 @@ like VBA macros. A ribbon button shows the state at a glance.
 | `value` | Excel value model (`Value`, `Array`, `ErrorCode`) | any |
 | `vfs` | the embedded file tree: folders, text/binary files, import/export, path safety | any |
 | `package` | read/write that tree as a custom XML part in an `.xlsx`/`.xlsm` | any |
-| `panel` | model of the Lua files task pane (HTML page, state, commands) | any |
+| `panel` | commands of the Lua files panel and how tree edits are applied | any |
+| `log` | tiny diagnostic log (`%APPDATA%\xll-bridge\addin.log`) | any |
 | `trust` | trust store pinned to (workbook path, script SHA-256) | any |
 | `lua_host` | Lua state per workbook, `Value` ⇄ Lua | any |
 | `runtime` | per-workbook state machine: NoScripts / Blocked / Active / Failed | any |
@@ -79,11 +80,18 @@ Open the `.xll` in Excel (File ▸ Options ▸ Add-ins ▸ Go ▸ Browse), open 
 
 ### The Files panel
 
-The **Files** button on the Lua tab opens a task pane on the right with the workbook's tree. You can
-create folders, add files and folders (multi-select, recursive), rename, delete (with confirmation),
-export a file or a folder to disk, and refresh. It edits the **open** workbook through Excel's
-`CustomXMLParts`, so there is nothing to reload: **save the workbook to apply the changes** (the pane
-says "Unsaved changes" until you do). A folder named `lib` you add is available to `require` after saving.
+The **Files** button on the Lua tab opens a small tool window next to the right edge of Excel (it floats
+above Excel, minimises with it, and can be moved and resized) showing the workbook's tree. You can:
+
+* **New folder** (type the name in place), **Add files…** / **Add folder…** (multi-select, folders are
+  imported recursively), or **drag files and folders in from Explorer** onto the panel;
+* **Rename** (button or F2, edited in place), **Delete** (button or Delete key, with confirmation);
+* **Export…** a file (Save As) or a folder (pick a destination).
+
+Additions go into the selected folder (or the selected file's folder). The panel follows the active
+workbook and edits the **open** workbook through Excel's `CustomXMLParts`, so nothing needs reloading:
+**save the workbook to apply the changes** (the footer says "Unsaved changes" until you do). A folder
+named `lib` you add is available to `require` after saving.
 
 Trust and edits: if the workbook was green or yellow, files you add or change are trusted too (they are
 your own work), so they stay enabled after saving. A red/blocked workbook stays blocked — review the
@@ -104,6 +112,13 @@ Add-ins dialog (`xlAutoRemove`) deletes those keys; `regsvr32`-style `DllRegiste
 `DllUnregisterServer` are exported too. A 500 ms timer on Excel's UI thread notices workbook switches and
 refreshes the button. If the COM side fails for any reason the worksheet functions keep working.
 
+## Troubleshooting
+
+* `%APPDATA%\xll-bridge\addin.log` records start-up, button clicks, panics and access violations (with the
+  faulting module and offset). Attach it when reporting a crash.
+* If Excel shows "Excel is running into problems with the 'XllBridge.Ribbon' add-in" it disables the add-in:
+  File ▸ Options ▸ Add-ins ▸ Manage: **Disabled Items** ▸ Go ▸ select it ▸ Enable, then restart Excel.
+
 ## Files
 
 * `%APPDATA%\xll-bridge\trust.json` — trusted (workbook, script digest) pairs; created on first Enable
@@ -115,8 +130,8 @@ refreshes the button. If the COM side fails for any reason the worksheet functio
   where Excel provides it). Scripts are read from the file on disk, so re-save after embedding.
 * Functions are registered thread-unsafe, so recalculation is single-threaded.
 * The ribbon is untested against every Excel build; it targets Excel 2010+ (32x32 bitmap icons).
-* The Files panel hosts the system web-browser control in an Office task pane; it needs `Shell.Explorer.2`
-  (present on Windows 10/11). Drag-and-drop into the panel and an in-panel text editor are not done yet.
+* The Files panel is a floating tool window rather than a docked Office task pane (a docked pane would
+  need an ActiveX host). There is no in-panel text editor yet: export, edit, and add the file again.
 * Not yet implemented: reading arbitrary ranges/cells from Lua (`xl.range`), writing back, async/RTD
   for long-running external programs, a process-spawn helper with timeouts, a "revoke trust" action.
 * x64 only.

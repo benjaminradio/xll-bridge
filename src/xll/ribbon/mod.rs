@@ -6,7 +6,7 @@
 //! thread-local Lua runtime — with the worksheet functions.
 //!
 //! The button is one control whose icon/label follow the active workbook's trust state; a
-//! 500 ms timer on Excel's UI thread notices workbook switches and invalidates the control.
+//! 200 ms timer on Excel's UI thread notices workbook switches and invalidates the control.
 
 #![allow(non_snake_case)] // COM method names
 
@@ -31,10 +31,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDYES, KillTimer, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
     MB_YESNO, MessageBoxW, SetTimer,
 };
-use windows::core::{
-    BSTR, Error, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, Result, implement,
-    interface,
-};
+use windows::core::{BSTR, Error, GUID, HRESULT, Interface, PCWSTR, Result, implement, interface};
 
 use super::with_runtime;
 use crate::runtime::Status;
@@ -89,23 +86,6 @@ unsafe trait IDTExtensibility2: IDispatch {
     unsafe fn OnBeginShutdown(&self, custom: *mut *mut c_void) -> HRESULT;
 }
 
-/// Office hands the add-in a factory for task panes through this callback interface.
-#[interface("000C033E-0000-0000-C000-000000000046")]
-unsafe trait ICustomTaskPaneConsumer: IUnknown {
-    unsafe fn CTPFactoryAvailable(&self, ctp_factory_inst: *mut c_void) -> HRESULT;
-}
-
-#[interface("000C033A-0000-0000-C000-000000000046")]
-unsafe trait ICTPFactory: IUnknown {
-    unsafe fn CreateCTP(
-        &self,
-        ctp_ax_id: *const u16,
-        ctp_title: *const u16,
-        ctp_parent_window: VARIANT,
-        result: *mut *mut c_void,
-    ) -> HRESULT;
-}
-
 #[interface("000C0396-0000-0000-C000-000000000046")]
 unsafe trait IRibbonExtensibility: IDispatch {
     unsafe fn GetCustomUI(&self, ribbon_id: *const u16, ribbon_xml: *mut *mut u16) -> HRESULT;
@@ -127,7 +107,7 @@ pub(super) fn is_connected() -> bool {
     SHARED.with(|s| s.borrow().app.is_some())
 }
 
-#[implement(IDTExtensibility2, IRibbonExtensibility, ICustomTaskPaneConsumer)]
+#[implement(IDTExtensibility2, IRibbonExtensibility)]
 pub(super) struct Addin;
 
 // ------------------------------------------------------------------ current state
@@ -373,8 +353,12 @@ impl IDispatch_Impl for Addin_Impl {
                     let pic = icon::picture(current().1.light)?;
                     ret(VARIANT::from(pic), result, params);
                 }
-                6 => on_click(),
+                6 => {
+                    crate::log::line("ribbon: status button clicked");
+                    on_click()
+                }
                 7 => {
+                    crate::log::line("ribbon: Files button clicked");
                     if let Some(app) = app() {
                         pane::toggle(&app);
                     }
@@ -399,6 +383,7 @@ impl IDTExtensibility2_Impl for Addin_Impl {
         let app = unsafe { IDispatch::from_raw_borrowed(&application) }.cloned();
         // SAFETY: plain thread timer on Excel's UI thread; `timer_proc` has the TIMERPROC ABI.
         let timer = unsafe { SetTimer(None, 0, POLL_MS, Some(timer_proc)) };
+        crate::log::line("ribbon: connected to Excel");
         SHARED.with(|s| {
             let mut s = s.borrow_mut();
             s.app = app;
@@ -408,6 +393,7 @@ impl IDTExtensibility2_Impl for Addin_Impl {
     }
 
     unsafe fn OnDisconnection(&self, _: i32, _: *mut *mut c_void) -> HRESULT {
+        crate::log::line("ribbon: disconnecting");
         pane::shutdown();
         SHARED.with(|s| {
             let mut s = s.borrow_mut();
@@ -427,16 +413,6 @@ impl IDTExtensibility2_Impl for Addin_Impl {
         S_OK
     }
     unsafe fn OnBeginShutdown(&self, _: *mut *mut c_void) -> HRESULT {
-        S_OK
-    }
-}
-
-impl ICustomTaskPaneConsumer_Impl for Addin_Impl {
-    unsafe fn CTPFactoryAvailable(&self, factory: *mut c_void) -> HRESULT {
-        // SAFETY: borrowed interface pointer from Office; cloning AddRefs it.
-        if let Some(f) = unsafe { ICTPFactory::from_raw_borrowed(&factory) } {
-            pane::set_factory(f.clone());
-        }
         S_OK
     }
 }
@@ -531,15 +507,6 @@ mod tests {
             "onLoad + 5 on the status button + 1 on the files button"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));
-    }
-
-    #[test]
-    fn object_is_a_task_pane_consumer_and_tolerates_a_missing_factory() {
-        let obj = create_addin();
-        let consumer: ICustomTaskPaneConsumer = obj.cast().expect("ICustomTaskPaneConsumer");
-        // SAFETY: a null factory pointer must be ignored, not dereferenced.
-        let hr = unsafe { consumer.CTPFactoryAvailable(std::ptr::null_mut()) };
-        assert!(hr.is_ok());
     }
 
     #[test]

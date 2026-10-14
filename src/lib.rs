@@ -4,6 +4,7 @@
 //! `value`, `package` (script storage), `trust`, `lua_host` and `runtime` are portable;
 //! `xll` (XLOPER12, registration, banner) is Windows-only.
 
+pub mod log;
 pub mod lua_host;
 pub mod package;
 pub mod panel;
