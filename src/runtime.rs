@@ -12,9 +12,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::lua_host::{HostContext, HostError, LuaHost};
-use crate::package::{self, ScriptSet};
+use crate::package;
 use crate::trust::{TrustStore, normalize_path};
 use crate::value::Value;
+use crate::vfs::Bundle;
 
 pub enum Book {
     NoScripts,
@@ -100,14 +101,14 @@ impl Runtime {
     }
 
     fn load(&mut self, workbook: &Path, previous: Option<Book>) -> Book {
-        let scripts = match package::read_scripts(workbook) {
-            Ok(Some(s)) if !s.is_empty() => s,
+        let scripts = match package::read_bundle(workbook) {
+            Ok(Some(s)) if s.file_count() > 0 => s,
             // Unreadable (e.g. mid-save, not yet a zip) is treated like "no scripts"; the next
             // mtime change retries.
             _ => return Book::NoScripts,
         };
         let digest = scripts.digest();
-        let names: Vec<String> = scripts.scripts.iter().map(|s| s.name.clone()).collect();
+        let names = script_names(&scripts);
         // A save by Excel changes the mtime but not the scripts: keep the live Lua state.
         if let Some(Book::Active {
             digest: d, host, ..
@@ -129,8 +130,8 @@ impl Runtime {
     /// User clicked "Enable": trust the scripts as currently on disk and start Lua.
     pub fn enable(&mut self, workbook: &Path) -> std::io::Result<()> {
         let key = normalize_path(workbook);
-        let (digest, scripts) = match package::read_scripts(workbook) {
-            Ok(Some(s)) if !s.is_empty() => (s.digest(), s),
+        let (digest, scripts) = match package::read_bundle(workbook) {
+            Ok(Some(s)) if s.file_count() > 0 => (s.digest(), s),
             _ => return Err(std::io::Error::other("no scripts to enable")),
         };
         self.trust.trust(workbook, &digest)?;
@@ -186,6 +187,37 @@ impl Runtime {
         }
     }
 
+    /// Digest of the file set on disk for this workbook (None when there are no files).
+    pub fn disk_digest(&mut self, workbook: &Path) -> Option<String> {
+        match self.state(workbook) {
+            Book::NoScripts => None,
+            Book::Blocked { digest, .. }
+            | Book::Active { digest, .. }
+            | Book::Failed { digest, .. } => Some(digest.clone()),
+        }
+    }
+
+    /// The user changed this workbook's embedded files through the panel (not yet saved).
+    /// If the workbook had no files, or was already trusted, the author is the user: trust the
+    /// new file set too so it stays enabled once saved. A blocked workbook stays blocked.
+    /// Returns whether the new set was trusted.
+    pub fn note_edit(&mut self, workbook: &Path, new_digest: &str) -> bool {
+        let allowed = matches!(self.state(workbook), Book::NoScripts | Book::Active { .. });
+        allowed && self.trust.pretrust(workbook, new_digest).is_ok()
+    }
+
+    /// A file set the user authored in an unsaved workbook has now been saved to `workbook`:
+    /// trust it (if the saved digest is the one they authored) and reload so it activates.
+    pub fn adopt_authored(&mut self, workbook: &Path, digest: &str) -> bool {
+        if self.disk_digest(workbook).as_deref() != Some(digest)
+            || self.trust.pretrust(workbook, digest).is_err()
+        {
+            return false;
+        }
+        self.books.remove(&normalize_path(workbook));
+        true
+    }
+
     /// Summary for UI (ribbon, `LUA.STATUS`).
     pub fn status(&mut self, workbook: &Path) -> Status {
         match self.state(workbook) {
@@ -203,11 +235,44 @@ impl Runtime {
     }
 }
 
-fn activate(workbook: &Path, scripts: &ScriptSet, digest: String) -> Book {
-    match LuaHost::new(scripts, &HostContext { workbook }) {
+/// Names shown in the UI: every embedded file, capped.
+fn script_names(bundle: &Bundle) -> Vec<String> {
+    const CAP: usize = 40;
+    let mut names: Vec<String> = bundle
+        .entries()
+        .into_iter()
+        .filter(|e| e.kind == crate::vfs::Kind::File)
+        .map(|e| e.path)
+        .collect();
+    if names.len() > CAP {
+        let more = names.len() - CAP;
+        names.truncate(CAP);
+        names.push(format!("\u{2026} and {more} more"));
+    }
+    names
+}
+
+/// `%LOCALAPPDATA%\xll-bridge\cache` (or the XDG/HOME equivalent): extracted native modules.
+pub fn native_cache_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("xll-bridge").join("cache"))
+}
+
+fn activate(workbook: &Path, bundle: &Bundle, digest: String) -> Book {
+    let cache = native_cache_dir();
+    match LuaHost::new(
+        bundle,
+        &HostContext {
+            workbook,
+            cache_dir: cache.as_deref(),
+        },
+    ) {
         Ok(host) => Book::Active {
             digest,
-            names: scripts.scripts.iter().map(|s| s.name.clone()).collect(),
+            names: script_names(bundle),
             host,
         },
         Err(e) => Book::Failed {
@@ -232,19 +297,17 @@ pub fn workbook_path_from_cell_filename(s: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::package::{Script, embed_scripts, testutil::minimal_xlsx};
+    use crate::package::{
+        embed_bundle,
+        testutil::{bundle_of, minimal_xlsx},
+    };
 
     fn workbook_with(code: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let (base, wb) = (dir.path().join("base.xlsx"), dir.path().join("book.xlsx"));
         minimal_xlsx(&base);
-        let set = ScriptSet {
-            scripts: vec![Script {
-                name: "main".into(),
-                code: code.into(),
-            }],
-        };
-        embed_scripts(&base, &wb, &set).unwrap();
+        let set = bundle_of(&[("main.lua", code)]);
+        embed_bundle(&base, &wb, &set).unwrap();
         (dir, wb)
     }
 
@@ -279,13 +342,8 @@ mod tests {
         assert!(rt.call(Some(&wb), "one", &[]).is_ok());
 
         let edited = d.path().join("edited.xlsx");
-        let set = ScriptSet {
-            scripts: vec![Script {
-                name: "main".into(),
-                code: "function one() return 2 end".into(),
-            }],
-        };
-        embed_scripts(&wb, &edited, &set).unwrap();
+        let set = bundle_of(&[("main.lua", "function one() return 2 end")]);
+        embed_bundle(&wb, &edited, &set).unwrap();
         std::fs::copy(&edited, &wb).unwrap();
         // mtime granularity can hide the change on fast filesystems; force a fresh read.
         rt.books.clear();
@@ -320,9 +378,67 @@ mod tests {
         assert_eq!(
             rt.status(&wb),
             Status::Active {
-                names: vec!["main".into()]
+                names: vec!["main.lua".into()]
             }
         );
+    }
+
+    #[test]
+    fn editing_through_the_panel_keeps_trusted_workbooks_trusted_but_not_blocked_ones() {
+        let (d, wb) = workbook_with("function one() return 1 end");
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        // Blocked: an edit must not grant trust.
+        assert!(!rt.note_edit(&wb, "new-digest"));
+        rt.enable(&wb).unwrap();
+        // Trusted: the author's edit is pre-trusted; the digest on disk stays trusted too.
+        let disk = rt.disk_digest(&wb).unwrap();
+        assert!(rt.note_edit(&wb, "new-digest"));
+        assert!(rt.trust.is_trusted(&wb, "new-digest") && rt.trust.is_trusted(&wb, &disk));
+        // Saved-as later: the digest they authored while unsaved is adopted, others are not.
+        assert!(!rt.adopt_authored(&wb, "something-else"));
+        let (_d2, wb2) = workbook_with("function two() return 2 end");
+        let authored = rt.disk_digest(&wb2).unwrap();
+        assert!(matches!(rt.status(&wb2), Status::Blocked { .. }));
+        assert!(rt.adopt_authored(&wb2, &authored));
+        assert!(matches!(rt.status(&wb2), Status::Active { .. }));
+        // A workbook without files: the first files the user adds are theirs.
+        let plain = d.path().join("plain.xlsx");
+        minimal_xlsx(&plain);
+        assert_eq!(rt.disk_digest(&plain), None);
+        assert!(rt.note_edit(&plain, "first"));
+    }
+
+    #[test]
+    fn only_empty_folders_do_not_count_as_scripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, wb) = (dir.path().join("b.xlsx"), dir.path().join("w.xlsx"));
+        minimal_xlsx(&base);
+        let mut b = crate::vfs::Bundle::new();
+        b.mkdir("only/folders").unwrap();
+        embed_bundle(&base, &wb, &b).unwrap();
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        assert_eq!(rt.status(&wb), Status::NoScripts);
+    }
+
+    #[test]
+    fn the_shipped_demo_runs_end_to_end_with_a_module_in_a_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, wb) = (dir.path().join("b.xlsx"), dir.path().join("demo.xlsx"));
+        minimal_xlsx(&base);
+        let b = bundle_of(&[
+            ("demo.lua", include_str!("../examples/demo.lua")),
+            ("lib/mathx.lua", include_str!("../examples/lib/mathx.lua")),
+        ]);
+        embed_bundle(&base, &wb, &b).unwrap();
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        assert!(matches!(
+            rt.call(Some(&wb), "hypot", &[]),
+            Err(CallError::Blocked)
+        ));
+        rt.enable(&wb).unwrap();
+        let args = [Value::Num(3.0), Value::Num(4.0)];
+        assert_eq!(rt.call(Some(&wb), "hypot", &args).unwrap(), Value::Num(5.0));
+        assert_eq!(rt.call(Some(&wb), "add", &args).unwrap(), Value::Num(7.0));
     }
 
     #[test]

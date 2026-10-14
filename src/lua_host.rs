@@ -17,8 +17,8 @@ use mlua::{
     Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, UserData, Value as LV, VmState,
 };
 
-use crate::package::ScriptSet;
 use crate::value::{Array, ErrorCode, Value};
+use crate::vfs::Bundle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -62,6 +62,9 @@ impl UserData for XlEmpty {
 
 pub struct HostContext<'a> {
     pub workbook: &'a Path,
+    /// Where native modules (`.dll`/`.so`) from the embedded tree are extracted so `require` can
+    /// load them. `None` disables extraction.
+    pub cache_dir: Option<&'a Path>,
 }
 
 /// VM instructions a sandboxed call may run before it is aborted (a few seconds of work).
@@ -76,19 +79,27 @@ pub struct LuaHost {
 }
 
 impl LuaHost {
-    /// Builds the state and runs every script once, defining its globals.
+    /// Builds the state and runs the root-level `.lua` files once, in name order, defining
+    /// their globals. Files in folders are available to `require` and `xl.read_file`.
     ///
     /// The full standard library is available (io, os, package, ...) and C modules may be
-    /// loaded: once a workbook is trusted its scripts are treated as the user's own code.
-    pub fn new(scripts: &ScriptSet, ctx: &HostContext<'_>) -> Result<Self, HostError> {
+    /// loaded: once a workbook is trusted its files are treated as the user's own code.
+    pub fn new(bundle: &Bundle, ctx: &HostContext<'_>) -> Result<Self, HostError> {
         // SAFETY: enables loading C modules via `require`/`package.loadlib`. Reachable only
-        // after the user explicitly trusted this exact script set (see trust.rs).
+        // after the user explicitly trusted this exact file set (see trust.rs).
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE, LuaOptions::default()) };
         install_xl_table(&lua, Some(ctx.workbook))?;
-        configure_package_path(&lua, ctx.workbook)?;
-        for s in &scripts.scripts {
-            lua.load(&s.code)
-                .set_name(format!("={}", s.name))
+        let shared = Rc::new(bundle.clone());
+        install_embedded_fs(&lua, &shared)?;
+        let native = match ctx.cache_dir {
+            Some(dir) => extract_native(bundle, dir)
+                .map_err(|e| HostError::Lua(format!("cannot extract native modules: {e}")))?,
+            None => None,
+        };
+        configure_package_path(&lua, ctx.workbook, native.as_deref())?;
+        for f in bundle.root_scripts() {
+            lua.load(strip_bom(&f.data))
+                .set_name(format!("={}", f.path))
                 .set_mode(ChunkMode::Text)
                 .exec()?;
         }
@@ -180,8 +191,99 @@ fn install_xl_table(lua: &Lua, workbook: Option<&Path>) -> mlua::Result<()> {
     lua.globals().set("xl", xl)
 }
 
+fn strip_bom(data: &[u8]) -> &[u8] {
+    data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(data)
+}
+
+const NATIVE_EXTS: [&str; 3] = [".dll", ".so", ".dylib"];
+
+/// Writes the native libraries of the tree under `<cache>/<digest prefix>/` and returns that
+/// directory (or `None` if there are none). Existing files of the right size are reused.
+fn extract_native(bundle: &Bundle, cache: &Path) -> std::io::Result<Option<PathBuf>> {
+    let natives: Vec<_> = bundle
+        .files()
+        .iter()
+        .filter(|f| {
+            NATIVE_EXTS
+                .iter()
+                .any(|e| f.path.to_lowercase().ends_with(e))
+        })
+        .collect();
+    if natives.is_empty() {
+        return Ok(None);
+    }
+    let root = cache.join(&bundle.digest()[..16]);
+    for f in natives {
+        let target = root.join(&f.path); // paths are validated by `Bundle`: no `..`, no drive letters
+        if std::fs::metadata(&target).is_ok_and(|m| m.len() == f.data.len() as u64) {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, &f.data)?;
+    }
+    Ok(Some(root))
+}
+
+/// `xl.read_file(path)`, `xl.files()` and a `require` searcher backed by the embedded tree.
+fn install_embedded_fs(lua: &Lua, bundle: &Rc<Bundle>) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+
+    let b = Rc::clone(bundle);
+    xl.set(
+        "read_file",
+        lua.create_function(move |lua, path: String| match b.get(&path) {
+            Some(f) => Ok(LV::String(lua.create_string(&f.data)?)),
+            None => Ok(LV::Nil),
+        })?,
+    )?;
+
+    let b = Rc::clone(bundle);
+    xl.set(
+        "files",
+        lua.create_function(move |lua, ()| {
+            let t = lua.create_table()?;
+            for (i, f) in b.files().iter().enumerate() {
+                t.raw_set(i + 1, f.path.as_str())?;
+            }
+            Ok(t)
+        })?,
+    )?;
+
+    let b = Rc::clone(bundle);
+    let searcher = lua.create_function(move |lua, name: String| -> mlua::Result<MultiValue> {
+        let rel = name.replace('.', "/");
+        let candidates = [format!("{rel}.lua"), format!("{rel}/init.lua")];
+        for path in &candidates {
+            if let Some(f) = b.get(path) {
+                let loader = lua
+                    .load(strip_bom(&f.data))
+                    .set_name(format!("={}", f.path))
+                    .set_mode(ChunkMode::Text)
+                    .into_function()?;
+                return Ok(MultiValue::from_iter([
+                    LV::Function(loader),
+                    LV::String(lua.create_string(&f.path)?),
+                ]));
+            }
+        }
+        let tried: String = candidates
+            .iter()
+            .map(|c| format!("\n\tno embedded file '{c}'"))
+            .collect();
+        Ok(MultiValue::from_iter([LV::String(
+            lua.create_string(&tried)?,
+        )]))
+    })?;
+    let package: mlua::Table = lua.globals().get("package")?;
+    let searchers: mlua::Table = package.get("searchers")?;
+    let insert: Function = lua.globals().get::<mlua::Table>("table")?.get("insert")?;
+    insert.call::<()>((searchers, 2, searcher))
+}
+
 /// `require` finds modules next to the workbook, then in `%APPDATA%\xll-bridge\lua`.
-fn configure_package_path(lua: &Lua, workbook: &Path) -> mlua::Result<()> {
+fn configure_package_path(lua: &Lua, workbook: &Path, native: Option<&Path>) -> mlua::Result<()> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(d) = workbook.parent() {
         dirs.push(d.to_path_buf());
@@ -200,10 +302,14 @@ fn configure_package_path(lua: &Lua, workbook: &Path) -> mlua::Result<()> {
         })
         .collect();
     let dll_ext = if cfg!(windows) { "dll" } else { "so" };
-    let c_paths: Vec<String> = dirs
+    let mut c_paths: Vec<String> = dirs
         .iter()
         .map(|d| format!("{}{sep}?.{dll_ext}", d.to_string_lossy()))
         .collect();
+    // Embedded native modules go first: `require("a.b")` finds `<cache>/a/b.dll`.
+    if let Some(n) = native {
+        c_paths.insert(0, format!("{}{sep}?.{dll_ext}", n.to_string_lossy()));
+    }
 
     let package: mlua::Table = lua.globals().get("package")?;
     let old_path: String = package.get("path")?;
@@ -308,19 +414,18 @@ fn table_to_array(t: &mlua::Table) -> mlua::Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::package::Script;
+    use crate::package::testutil::bundle_of;
 
     fn host(code: &str) -> LuaHost {
-        let set = ScriptSet {
-            scripts: vec![Script {
-                name: "t".into(),
-                code: code.into(),
-            }],
-        };
+        host_of(&bundle_of(&[("t.lua", code)]), None)
+    }
+
+    fn host_of(b: &Bundle, cache: Option<&Path>) -> LuaHost {
         LuaHost::new(
-            &set,
+            b,
             &HostContext {
                 workbook: Path::new("/tmp/book.xlsx"),
+                cache_dir: cache,
             },
         )
         .unwrap()
@@ -466,5 +571,97 @@ mod tests {
             "function sh() local p = io.popen('echo hi') local s = p:read('*l') p:close() return s end",
         );
         assert_eq!(h.call("sh", &[]).unwrap(), Value::Str("hi".into()));
+    }
+
+    #[test]
+    fn require_reads_modules_from_the_embedded_tree() {
+        let b = bundle_of(&[
+            (
+                "main.lua",
+                "local u = require('lib.util') function twice(x) return u.double(x) end function ver() return require('pkg').name end",
+            ),
+            (
+                "lib/util.lua",
+                "return { double = function(x) return x * 2 end }",
+            ),
+            ("pkg/init.lua", "return { name = 'pkg-init' }"),
+        ]);
+        let h = host_of(&b, None);
+        assert_eq!(
+            h.call("twice", &[Value::Num(4.0)]).unwrap(),
+            Value::Num(8.0)
+        );
+        assert_eq!(h.call("ver", &[]).unwrap(), Value::Str("pkg-init".into()));
+        let Value::Str(m) = h
+            .eval("select(2, pcall(require, 'nope.missing'))", &[])
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert!(m.contains("no embedded file 'nope/missing.lua'"), "{m}");
+    }
+
+    #[test]
+    fn only_root_lua_files_run_at_load_and_in_name_order() {
+        let b = bundle_of(&[
+            ("b.lua", "order = (order or '') .. 'b'"),
+            ("a.lua", "order = (order or '') .. 'a'"),
+            ("lib/never.lua", "order = 'WRONG'"),
+            ("notes.txt", "order = 'WRONG'"),
+        ]);
+        let h = host_of(&b, None);
+        assert_eq!(h.eval("order", &[]).unwrap(), Value::Str("ab".into()));
+    }
+
+    #[test]
+    fn read_file_and_files_expose_data_binary_safely() {
+        let mut b = bundle_of(&[("main.lua", "")]);
+        b.put_file("data/blob.bin", vec![0, 255, 10, 0], true)
+            .unwrap();
+        let h = host_of(&b, None);
+        assert_eq!(
+            h.eval("#xl.read_file('DATA/blob.bin')", &[]).unwrap(),
+            Value::Num(4.0)
+        );
+        assert_eq!(
+            h.eval("xl.read_file('missing')", &[]).unwrap(),
+            Value::Empty
+        );
+        assert_eq!(h.eval("#xl.files()", &[]).unwrap(), Value::Num(2.0));
+    }
+
+    #[test]
+    fn native_libraries_are_extracted_once_into_the_cache() {
+        let cache = tempfile::tempdir().unwrap();
+        let mut b = bundle_of(&[("main.lua", "")]);
+        b.put_file("native/thing.dll", vec![1, 2, 3], true).unwrap();
+        b.put_file("data.bin", vec![9], true).unwrap();
+        let _ = host_of(&b, Some(cache.path()));
+        let dir = cache.path().join(&b.digest()[..16]);
+        assert_eq!(
+            std::fs::read(dir.join("native/thing.dll")).unwrap(),
+            [1, 2, 3]
+        );
+        assert!(
+            !dir.join("data.bin").exists(),
+            "only native libraries are extracted"
+        );
+        // Reused on the next activation, and cpath points at it.
+        let h = host_of(&b, Some(cache.path()));
+        let Value::Str(cpath) = h.eval("package.cpath", &[]).unwrap() else {
+            panic!()
+        };
+        assert!(cpath.contains(&b.digest()[..16]));
+    }
+
+    #[test]
+    fn bom_prefixed_scripts_load() {
+        let mut b = Bundle::new();
+        b.put_file("main.lua", b"\xEF\xBB\xBFx = 41".to_vec(), true)
+            .unwrap();
+        assert_eq!(
+            host_of(&b, None).eval("x + 1", &[]).unwrap(),
+            Value::Num(42.0)
+        );
     }
 }

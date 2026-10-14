@@ -27,3 +27,9 @@ function hostname()
   p:close()
   return s
 end
+
+-- Uses a module stored in the lib/ folder of the embedded file tree.
+local mathx = require("lib.mathx")
+function hypot(a, b)
+  return mathx.hypot(a, b)
+end

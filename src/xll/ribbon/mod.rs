@@ -11,8 +11,11 @@
 #![allow(non_snake_case)] // COM method names
 
 mod com;
+mod dialogs;
 mod dispatch;
 mod icon;
+mod live;
+mod pane;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -28,7 +31,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDYES, KillTimer, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
     MB_YESNO, MessageBoxW, SetTimer,
 };
-use windows::core::{BSTR, Error, GUID, HRESULT, Interface, PCWSTR, Result, implement, interface};
+use windows::core::{
+    BSTR, Error, GUID, HRESULT, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, Result, implement,
+    interface,
+};
 
 use super::with_runtime;
 use crate::runtime::Status;
@@ -37,7 +43,7 @@ use crate::ui::{self, View};
 pub use com::{register, unregister};
 
 const BUTTON_ID: &str = "btnLuaStatus";
-const POLL_MS: u32 = 500;
+const POLL_MS: u32 = 200;
 
 const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office/2006/01/customui" onLoad="OnRibbonLoad">
   <ribbon>
@@ -48,6 +54,9 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
                   getLabel="GetLabel" getImage="GetImage"
                   getScreentip="GetScreentip" getSupertip="GetSupertip"
                   onAction="OnStatusClick"/>
+          <button id="btnLuaFiles" size="large" label="Files" imageMso="FileOpen"
+                  screentip="Lua files" supertip="Show or hide the panel that lists the files embedded in this workbook, with add, delete, rename, import and export."
+                  onAction="OnFilesClick"/>
         </group>
       </tab>
     </tabs>
@@ -55,13 +64,14 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
 </customUI>"#;
 
 // IDispatch ids for the ribbon callbacks (names must match RIBBON_XML).
-const CALLBACKS: [(&str, i32); 6] = [
+const CALLBACKS: [(&str, i32); 7] = [
     ("OnRibbonLoad", 1),
     ("GetLabel", 2),
     ("GetScreentip", 3),
     ("GetSupertip", 4),
     ("GetImage", 5),
     ("OnStatusClick", 6),
+    ("OnFilesClick", 7),
 ];
 
 #[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
@@ -77,6 +87,23 @@ unsafe trait IDTExtensibility2: IDispatch {
     unsafe fn OnAddInsUpdate(&self, custom: *mut *mut c_void) -> HRESULT;
     unsafe fn OnStartupComplete(&self, custom: *mut *mut c_void) -> HRESULT;
     unsafe fn OnBeginShutdown(&self, custom: *mut *mut c_void) -> HRESULT;
+}
+
+/// Office hands the add-in a factory for task panes through this callback interface.
+#[interface("000C033E-0000-0000-C000-000000000046")]
+unsafe trait ICustomTaskPaneConsumer: IUnknown {
+    unsafe fn CTPFactoryAvailable(&self, ctp_factory_inst: *mut c_void) -> HRESULT;
+}
+
+#[interface("000C033A-0000-0000-C000-000000000046")]
+unsafe trait ICTPFactory: IUnknown {
+    unsafe fn CreateCTP(
+        &self,
+        ctp_ax_id: *const u16,
+        ctp_title: *const u16,
+        ctp_parent_window: VARIANT,
+        result: *mut *mut c_void,
+    ) -> HRESULT;
 }
 
 #[interface("000C0396-0000-0000-C000-000000000046")]
@@ -100,7 +127,7 @@ pub(super) fn is_connected() -> bool {
     SHARED.with(|s| s.borrow().app.is_some())
 }
 
-#[implement(IDTExtensibility2, IRibbonExtensibility)]
+#[implement(IDTExtensibility2, IRibbonExtensibility, ICustomTaskPaneConsumer)]
 pub(super) struct Addin;
 
 // ------------------------------------------------------------------ current state
@@ -152,6 +179,9 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
         });
         if changed {
             invalidate_button();
+        }
+        if let Some(app) = app() {
+            pane::tick(&app);
         }
     }));
 }
@@ -344,6 +374,11 @@ impl IDispatch_Impl for Addin_Impl {
                     ret(VARIANT::from(pic), result, params);
                 }
                 6 => on_click(),
+                7 => {
+                    if let Some(app) = app() {
+                        pane::toggle(&app);
+                    }
+                }
                 _ => return Err(Error::from_hresult(HRESULT(0x8002_0003u32 as i32))), // DISP_E_MEMBERNOTFOUND
             }
             Ok(())
@@ -373,6 +408,7 @@ impl IDTExtensibility2_Impl for Addin_Impl {
     }
 
     unsafe fn OnDisconnection(&self, _: i32, _: *mut *mut c_void) -> HRESULT {
+        pane::shutdown();
         SHARED.with(|s| {
             let mut s = s.borrow_mut();
             if s.timer != 0 {
@@ -391,6 +427,16 @@ impl IDTExtensibility2_Impl for Addin_Impl {
         S_OK
     }
     unsafe fn OnBeginShutdown(&self, _: *mut *mut c_void) -> HRESULT {
+        S_OK
+    }
+}
+
+impl ICustomTaskPaneConsumer_Impl for Addin_Impl {
+    unsafe fn CTPFactoryAvailable(&self, factory: *mut c_void) -> HRESULT {
+        // SAFETY: borrowed interface pointer from Office; cloning AddRefs it.
+        if let Some(f) = unsafe { ICTPFactory::from_raw_borrowed(&factory) } {
+            pane::set_factory(f.clone());
+        }
         S_OK
     }
 }
@@ -451,6 +497,7 @@ mod tests {
         assert!(xml.contains("<customUI") && xml.contains(BUTTON_ID));
 
         let disp: IDispatch = obj.cast().unwrap();
+        let mut checked = 0;
         for attr in [
             "onLoad",
             "getLabel",
@@ -460,25 +507,38 @@ mod tests {
             "onAction",
         ] {
             let needle = format!("{attr}=\"");
-            let start = xml
-                .find(&needle)
-                .unwrap_or_else(|| panic!("{attr} missing from ribbon XML"))
-                + needle.len();
-            let name = &xml[start..start + xml[start..].find('"').unwrap()];
-            let id = CALLBACKS
-                .iter()
-                .find(|(n, _)| *n == name)
-                .unwrap_or_else(|| panic!("{name} not dispatchable"))
-                .1;
-            let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
-            let mut got = 0i32;
-            // SAFETY: one NUL-terminated name, one id slot.
-            unsafe {
-                disp.GetIDsOfNames(&GUID::zeroed(), &PCWSTR(wide.as_ptr()), 1, 0x0400, &mut got)
+            for (at, _) in xml.match_indices(&needle) {
+                let start = at + needle.len();
+                let name = &xml[start..start + xml[start..].find('"').unwrap()];
+                let id = CALLBACKS
+                    .iter()
+                    .find(|(n, _)| *n == name)
+                    .unwrap_or_else(|| panic!("{name} not dispatchable"))
+                    .1;
+                let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+                let mut got = 0i32;
+                // SAFETY: one NUL-terminated name, one id slot.
+                unsafe {
+                    disp.GetIDsOfNames(&GUID::zeroed(), &PCWSTR(wide.as_ptr()), 1, 0x0400, &mut got)
+                }
+                .unwrap();
+                assert_eq!(got, id, "{name}");
+                checked += 1;
             }
-            .unwrap();
-            assert_eq!(got, id, "{name}");
         }
+        assert!(
+            checked >= 8,
+            "expected both buttons' callbacks, checked {checked}"
+        );
+    }
+
+    #[test]
+    fn object_is_a_task_pane_consumer_and_tolerates_a_missing_factory() {
+        let obj = create_addin();
+        let consumer: ICustomTaskPaneConsumer = obj.cast().expect("ICustomTaskPaneConsumer");
+        // SAFETY: a null factory pointer must be ignored, not dereferenced.
+        let hr = unsafe { consumer.CTPFactoryAvailable(std::ptr::null_mut()) };
+        assert!(hr.is_ok());
     }
 
     #[test]

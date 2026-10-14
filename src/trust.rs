@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+const MAX_PER_WORKBOOK: usize = 4;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct Entry {
     workbook: String,
@@ -67,13 +69,46 @@ impl TrustStore {
             .any(|e| e.workbook == key && e.digest == digest)
     }
 
-    /// Trusts this exact script set, replacing any earlier digest for the same workbook.
+    /// The user explicitly enabled this exact file set: it becomes the only trusted one.
     pub fn trust(&mut self, workbook: &Path, digest: &str) -> std::io::Result<()> {
         let key = normalize_path(workbook);
         self.entries.retain(|e| e.workbook != key);
         self.entries.push(Entry {
             workbook: key,
             digest: digest.to_owned(),
+        });
+        self.save()
+    }
+
+    /// The user edited a trusted (or file-free) workbook themselves; also trust what they have
+    /// built so it stays enabled once saved, without revoking the version currently on disk.
+    /// At most [`MAX_PER_WORKBOOK`] digests are kept per workbook (oldest dropped).
+    pub fn pretrust(&mut self, workbook: &Path, digest: &str) -> std::io::Result<()> {
+        let key = normalize_path(workbook);
+        if self
+            .entries
+            .iter()
+            .any(|e| e.workbook == key && e.digest == digest)
+        {
+            return Ok(());
+        }
+        self.entries.push(Entry {
+            workbook: key.clone(),
+            digest: digest.to_owned(),
+        });
+        let mut excess = self
+            .entries
+            .iter()
+            .filter(|e| e.workbook == key)
+            .count()
+            .saturating_sub(MAX_PER_WORKBOOK);
+        self.entries.retain(|e| {
+            if excess > 0 && e.workbook == key {
+                excess -= 1;
+                false
+            } else {
+                true
+            }
         });
         self.save()
     }
@@ -114,6 +149,29 @@ mod tests {
         assert!(!t.is_trusted(Path::new(r"C:\Other\Book.xlsx"), "aa"));
         t.trust(wb, "bb").unwrap();
         assert!(!t.is_trusted(wb, "aa"), "new digest replaces the old one");
+    }
+
+    #[test]
+    fn pretrust_adds_without_revoking_and_is_bounded() {
+        let mut t = TrustStore::ephemeral();
+        let wb = Path::new("/w/a.xlsx");
+        t.trust(wb, "disk").unwrap();
+        t.pretrust(wb, "edit1").unwrap();
+        assert!(t.is_trusted(wb, "disk") && t.is_trusted(wb, "edit1"));
+        for i in 2..=6 {
+            t.pretrust(wb, &format!("edit{i}")).unwrap();
+        }
+        assert!(t.is_trusted(wb, "edit6"));
+        assert!(
+            !t.is_trusted(wb, "disk"),
+            "oldest entries are dropped past the cap"
+        );
+        // An explicit Enable resets to exactly one digest.
+        t.trust(wb, "only").unwrap();
+        assert!(!t.is_trusted(wb, "edit6") && t.is_trusted(wb, "only"));
+        // Other workbooks are untouched.
+        t.pretrust(Path::new("/w/b.xlsx"), "x").unwrap();
+        assert!(t.is_trusted(wb, "only"));
     }
 
     #[test]

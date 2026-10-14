@@ -1,0 +1,224 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN" "http://www.w3.org/TR/html4/strict.dtd">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<meta http-equiv="X-UA-Compatible" content="IE=edge">
+<style type="text/css">
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #ffffff;
+               font-family: "Segoe UI", Tahoma, Arial, sans-serif; font-size: 12px; color: #1f1f1f; }
+  #head { position: absolute; top: 0; left: 0; right: 0; height: 40px; border-bottom: 1px solid #d4d4d4; background: #f7f7f7; }
+  #dot { position: absolute; left: 10px; top: 14px; width: 12px; height: 12px; background: #2ea043; border: 1px solid #1f6f2e; }
+  #wb { position: absolute; left: 30px; right: 8px; top: 4px; height: 16px; font-weight: bold; overflow: hidden; white-space: nowrap; }
+  #st { position: absolute; left: 30px; right: 8px; top: 21px; height: 14px; color: #555555; overflow: hidden; white-space: nowrap; }
+  #bar { position: absolute; top: 41px; left: 0; right: 0; height: 30px; border-bottom: 1px solid #e3e3e3; background: #ffffff; padding: 3px 4px; overflow: hidden; }
+  .btn { display: inline-block; margin: 0 3px 0 0; padding: 2px 7px; border: 1px solid #c8c8c8; background: #fafafa; cursor: default; white-space: nowrap; }
+  .btn:hover { background: #e8f0fb; border-color: #8fb4e8; }
+  .off { color: #a0a0a0; background: #f4f4f4; border-color: #e0e0e0; }
+  #tree { position: absolute; top: 72px; bottom: 26px; left: 0; right: 0; overflow: auto; }
+  #foot { position: absolute; bottom: 0; left: 0; right: 0; height: 25px; border-top: 1px solid #d4d4d4; background: #f7f7f7; padding: 5px 8px 0 8px; overflow: hidden; white-space: nowrap; }
+  .row { height: 22px; line-height: 22px; white-space: nowrap; cursor: default; position: relative; }
+  .row:hover { background: #f0f5fc; }
+  .sel, .sel:hover { background: #cfe2fa; }
+  .tw { display: inline-block; width: 14px; text-align: center; color: #666666; }
+  .ic { display: inline-block; width: 13px; height: 10px; margin: 0 5px -1px 0; border: 1px solid #9a9a9a; background: #ececec; }
+  .dir .ic { background: #f3c85a; border-color: #b8902a; }
+  .nm { }
+  .run { color: #2ea043; margin-left: 5px; font-size: 10px; }
+  .sz { position: absolute; right: 8px; top: 0; color: #888888; font-size: 11px; background: transparent; }
+  .edit { height: 18px; margin: 1px 0 0 0; font-size: 12px; width: 60%; }
+  #hint { color: #888888; padding: 14px 12px; line-height: 17px; }
+  .err { color: #b3261e; }
+</style>
+</head>
+<body>
+<div id="head"><div id="dot"></div><div id="wb">Lua files</div><div id="st"></div></div>
+<div id="bar"></div>
+<div id="tree"></div>
+<div id="foot"></div>
+<script type="text/javascript">
+var Q = [];            // commands waiting for the host (see pull)
+var S = null;          // last state from the host
+var expanded = {};     // folder path -> true
+var sel = null;        // { p: path, k: 'f' | 'd' }
+var editing = null;    // { mode: 'new' | 'rename', path: ..., parent: ... }
+
+function pull() { return Q.length ? Q.shift() : ""; }
+function send() {
+  var parts = [];
+  for (var i = 0; i < arguments.length; i++) { parts.push(encodeURIComponent(arguments[i])); }
+  Q.push(parts.join("|"));
+}
+function $(id) { return document.getElementById(id); }
+function clear(el) { while (el.firstChild) { el.removeChild(el.firstChild); } }
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) { e.className = cls; }
+  if (text !== undefined && text !== null) { e.appendChild(document.createTextNode(text)); }
+  return e;
+}
+function baseName(p) { var i = p.lastIndexOf("/"); return i < 0 ? p : p.substring(i + 1); }
+function parentOf(p) { var i = p.lastIndexOf("/"); return i < 0 ? "" : p.substring(0, i); }
+function size(n) {
+  if (n < 1024) { return n + " B"; }
+  if (n < 1048576) { return (Math.round(n / 102.4) / 10) + " KB"; }
+  return (Math.round(n / 104857.6) / 10) + " MB";
+}
+function entryFor(p) {
+  if (!S) { return null; }
+  for (var i = 0; i < S.entries.length; i++) { if (S.entries[i].p === p) { return S.entries[i]; } }
+  return null;
+}
+// Where "Add" and "New folder" put things: the selected folder, else the selected file's folder.
+function targetDir() {
+  if (!sel) { return ""; }
+  return sel.k === "d" ? sel.p : parentOf(sel.p);
+}
+function visible(p) {
+  var par = parentOf(p);
+  while (par !== "") { if (!expanded[par]) { return false; } par = parentOf(par); }
+  return true;
+}
+
+function button(label, enabled, handler) {
+  var b = el("span", "btn" + (enabled ? "" : " off"), label);
+  if (enabled) { b.onclick = handler; }
+  return b;
+}
+function renderBar() {
+  var bar = $("bar"); clear(bar);
+  var has = !!(S && S.wb && S.ok);
+  var one = has && sel !== null;
+  bar.appendChild(button("New folder", has, function () { startEdit("new", targetDir()); }));
+  bar.appendChild(button("Add files…", has, function () { send("addfiles", targetDir()); }));
+  bar.appendChild(button("Add folder…", has, function () { send("addfolder", targetDir()); }));
+  bar.appendChild(button("Export…", one, function () { send("export", sel.p); }));
+  bar.appendChild(button("Rename", one, function () { startEdit("rename", sel.p); }));
+  bar.appendChild(button("Delete", one, function () { send("delete", sel.p); }));
+  bar.appendChild(button("Refresh", has, function () { send("refresh"); }));
+}
+
+function renderHead() {
+  var colors = { green: ["#2ea043", "#1f6f2e"], yellow: ["#f5be00", "#a07e00"], red: ["#d63031", "#8f1d1e"] };
+  var c = (S && colors[S.light]) || colors.green;
+  var dot = $("dot");
+  dot.style.background = c[0]; dot.style.borderColor = c[1];
+  clear($("wb")); $("wb").appendChild(document.createTextNode(S && S.wb ? S.wb : "No workbook"));
+  clear($("st")); $("st").appendChild(document.createTextNode(S ? S.status : ""));
+}
+
+function renderFoot() {
+  var f = $("foot"); clear(f);
+  if (!S) { return; }
+  if (S.msg) {
+    f.appendChild(el("span", S.err ? "err" : "", S.msg));
+  } else if (S.dirty) {
+    f.appendChild(el("span", "", "Unsaved changes — save the workbook to apply them."));
+  } else if (S.wb && S.ok) {
+    f.appendChild(el("span", "", S.n + " file" + (S.n === 1 ? "" : "s")));
+  }
+}
+
+function makeEditor(initial, onDone) {
+  var inp = document.createElement("input");
+  inp.type = "text"; inp.className = "edit"; inp.value = initial;
+  var finished = false;
+  function done(commit) {
+    if (finished) { return; }
+    finished = true;
+    editing = null;
+    if (commit && inp.value !== "" ) { onDone(inp.value); } else { render(); }
+  }
+  inp.onkeydown = function (e) {
+    e = e || window.event;
+    if (e.keyCode === 13) { done(true); } else if (e.keyCode === 27) { done(false); }
+    e.cancelBubble = true;
+  };
+  inp.onblur = function () { done(false); };
+  return inp;
+}
+
+function startEdit(mode, path) {
+  if (mode === "new" && path !== "") { expanded[path] = true; }
+  editing = { mode: mode, path: path };
+  render();
+}
+
+function row(depth, kind, path, name, extra) {
+  var r = el("div", "row " + (kind === "d" ? "dir" : "file") + (sel && sel.p === path ? " sel" : ""));
+  r.style.paddingLeft = (6 + depth * 16) + "px";
+  var tw = el("span", "tw", kind === "d" ? (expanded[path] ? "▾" : "▸") : "");
+  r.appendChild(tw);
+  r.appendChild(el("span", "ic"));
+  return r;
+}
+
+function render() {
+  renderHead(); renderBar(); renderFoot();
+  var tree = $("tree"); clear(tree);
+  if (!S || !S.wb) { tree.appendChild(el("div", "", "")); tree.firstChild.id = "hint"; tree.firstChild.appendChild(document.createTextNode("Open a workbook to manage its embedded Lua files.")); return; }
+  if (!S.ok) { var h = el("div", "", S.hint || ""); h.id = "hint"; tree.appendChild(h); return; }
+
+  var pendingNew = (editing && editing.mode === "new") ? editing.path : null;
+  if (pendingNew === "") { tree.appendChild(editRow(0, "new", "")); }
+
+  var list = S.entries;
+  if (list.length === 0 && pendingNew === null) {
+    var hint = el("div", "", "No embedded files. Use “Add files…” or “New folder”, or drop a script in and save the workbook.");
+    hint.id = "hint"; tree.appendChild(hint);
+  }
+  for (var i = 0; i < list.length; i++) {
+    (function (e) {
+      if (!visible(e.p)) { return; }
+      var depth = e.p.split("/").length - 1;
+      var r = row(depth, e.k, e.p);
+      if (editing && editing.mode === "rename" && editing.path === e.p) {
+        r.appendChild(makeEditor(baseName(e.p), function (v) { send("rename", e.p, v); }));
+        tree.appendChild(r);
+        window.setTimeout(function () { try { r.lastChild.focus(); r.lastChild.select(); } catch (x) {} }, 10);
+        return;
+      }
+      r.appendChild(el("span", "nm", baseName(e.p)));
+      if (e.r) { var run = el("span", "run", "▶ runs at load"); r.appendChild(run); }
+      if (e.k === "f") { r.appendChild(el("span", "sz", size(e.s))); }
+      r.onclick = function () {
+        sel = { p: e.p, k: e.k };
+        if (e.k === "d") { expanded[e.p] = !expanded[e.p]; }
+        render();
+      };
+      tree.appendChild(r);
+      if (pendingNew !== null && pendingNew === e.p && e.k === "d") { tree.appendChild(editRow(depth + 1, "new", e.p)); }
+    })(list[i]);
+  }
+  if (sel && !entryFor(sel.p)) { sel = null; renderBar(); }
+}
+
+function editRow(depth, mode, parent) {
+  var r = el("div", "row dir");
+  r.style.paddingLeft = (6 + depth * 16) + "px";
+  r.appendChild(el("span", "tw", ""));
+  r.appendChild(el("span", "ic"));
+  r.appendChild(makeEditor("", function (v) { send("newfolder", parent, v); }));
+  window.setTimeout(function () { try { r.lastChild.focus(); } catch (x) {} }, 10);
+  return r;
+}
+
+document.onkeydown = function (e) {
+  e = e || window.event;
+  if (!sel || editing) { return; }
+  if (e.keyCode === 46) { send("delete", sel.p); }
+  else if (e.keyCode === 113) { startEdit("rename", sel.p); }
+};
+document.oncontextmenu = function () { return false; };
+document.onselectstart = function (e) { var t = (e || window.event).srcElement; return t && t.tagName === "INPUT"; };
+
+// Called by the host with a fresh state object.
+function setState(s) {
+  S = s;
+  // Keep folders the user opened; open the first level of a new workbook.
+  if (S && S.fresh) { expanded = {}; sel = null; }
+  render();
+}
+render();
+</script>
+</body>
+</html>

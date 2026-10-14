@@ -53,14 +53,14 @@ pub fn view(status: &Status) -> View {
             light: Light::Yellow,
             label: "Lua: running".into(),
             screentip: "Lua scripts are running".into(),
-            supertip: format!("Trusted scripts loaded for this workbook:\n{}", list(names)),
+            supertip: format!("Trusted files loaded for this workbook:\n{}", list(names)),
         },
         Status::Blocked { names } => View {
             light: Light::Red,
             label: "Lua: blocked".into(),
             screentip: "Lua scripts are blocked".into(),
             supertip: format!(
-                "This workbook contains Lua scripts that have not been enabled. Nothing has been run.\n{}\n\nClick to review and enable.",
+                "This workbook contains embedded Lua files that have not been enabled. Nothing has been run.\n{}\n\nClick to review and enable.",
                 list(names)
             ),
         },

@@ -51,7 +51,8 @@ jobs:
           cp examples/demo.lua dist/
           python -m pip install --quiet openpyxl
           python examples/make_demo_workbook.py dist/demo-plain.xlsx
-          ./dist/xllb-pack.exe embed dist/demo-plain.xlsx dist/demo.xlsx examples/demo.lua
+          ./dist/xllb-pack.exe embed dist/demo-plain.xlsx dist/demo.xlsx examples/demo.lua examples/lib
+          ./dist/xllb-pack.exe list dist/demo.xlsx
           rm dist/demo-plain.xlsx
           cp README.md dist/
           (cd dist && sha256sum * > SHA256SUMS.txt)

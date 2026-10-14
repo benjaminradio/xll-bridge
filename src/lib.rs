@@ -6,10 +6,12 @@
 
 pub mod lua_host;
 pub mod package;
+pub mod panel;
 pub mod runtime;
 pub mod trust;
 pub mod ui;
 pub mod value;
+pub mod vfs;
 
 #[cfg(windows)]
 mod xll;

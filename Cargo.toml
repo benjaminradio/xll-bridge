@@ -14,6 +14,7 @@ name = "xllb-pack"
 path = "src/bin/xllb-pack.rs"
 
 [dependencies]
+base64 = "0.23.1"
 mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
 quick-xml = "0.42.0"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -23,7 +24,7 @@ thiserror = "2.0.21"
 zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_UI_Accessibility", "Win32_System_Threading", "Win32_Security", "Win32_System_Com_StructuredStorage"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_Registry", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_System_LibraryLoader", "Win32_UI_Accessibility", "Win32_System_Threading", "Win32_Security", "Win32_System_Com_StructuredStorage", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
 windows-core = "0.62"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

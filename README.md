@@ -1,7 +1,7 @@
 # xll-bridge
 
 A native Excel add-in (XLL, Rust) that exposes Lua (5.4 via [mlua]) for UDFs and data manipulation.
-Scripts live **inside the workbook** as a custom XML part and are **disabled until you enable them**,
+Files (Lua scripts, modules, data, even DLLs) live **inside the workbook** as a custom XML part and are **disabled until you enable them**,
 like VBA macros. A ribbon button shows the state at a glance.
 
 > Status: scaffold. The portable core is unit-tested on Linux; the Windows/Excel layer
@@ -12,13 +12,15 @@ like VBA macros. A ribbon button shows the state at a glance.
 | Module | Role | Platform |
 |---|---|---|
 | `value` | Excel value model (`Value`, `Array`, `ErrorCode`) | any |
-| `package` | read/write the scripts custom XML part in an `.xlsx`/`.xlsm` | any |
+| `vfs` | the embedded file tree: folders, text/binary files, import/export, path safety | any |
+| `package` | read/write that tree as a custom XML part in an `.xlsx`/`.xlsm` | any |
+| `panel` | model of the Lua files task pane (HTML page, state, commands) | any |
 | `trust` | trust store pinned to (workbook path, script SHA-256) | any |
 | `lua_host` | Lua state per workbook, `Value` ⇄ Lua | any |
 | `runtime` | per-workbook state machine: NoScripts / Blocked / Active / Failed | any |
 | `ui` | what the ribbon button shows for each state (colour, label, tooltips) | any |
 | `xll/` | XLOPER12 FFI, registration, exports | Windows x64 |
-| `xll/ribbon/` | COM add-in (same DLL) that provides the Lua ribbon tab/button | Windows x64 |
+| `xll/ribbon/` | COM add-in (same DLL): Lua ribbon tab, status button, Lua files task pane | Windows x64 |
 | `bin/xllb-pack` | CLI that embeds `.lua` files into a workbook | any |
 
 ## Trust model
@@ -49,8 +51,9 @@ like VBA macros. A ribbon button shows the state at a glance.
 ```sh
 cargo build --release --target x86_64-pc-windows-gnu      # or -msvc on Windows
 cp target/x86_64-pc-windows-gnu/release/xll_bridge.dll xll_bridge.xll
-cargo run --bin xllb-pack -- embed Book.xlsx Book-lua.xlsx main.lua
+cargo run --bin xllb-pack -- embed Book.xlsx Book-lua.xlsx main.lua lib/   # files and folders
 cargo run --bin xllb-pack -- list Book-lua.xlsx
+cargo run --bin xllb-pack -- extract Book-lua.xlsx ./out
 ```
 
 Open the `.xll` in Excel (File ▸ Options ▸ Add-ins ▸ Go ▸ Browse), open the workbook, then:
@@ -60,6 +63,32 @@ Open the `.xll` in Excel (File ▸ Options ▸ Add-ins ▸ Go ▸ Browse), open 
 =LUA.EVAL("... * 2", A1)         evaluates an expression/chunk; args arrive as ...
 =LUA.STATUS()                    none / disabled / enabled
 ```
+
+### The embedded file tree
+
+* `.lua` files in the **root** run (in name order) when the workbook is enabled and define the globals
+  `LUA.CALL` can call.
+* Files in **folders** are modules: `require("lib.util")` loads `lib/util.lua` (or `lib/util/init.lua`)
+  from the workbook.
+* `xl.read_file("data/x.csv")` returns any embedded file's bytes as a Lua string; `xl.files()` lists them.
+* `.dll`/`.so` files are extracted (only after the workbook is enabled) to
+  `%LOCALAPPDATA%\xll-bridge\cache\<digest>\` and added to `package.cpath`, so `require("native.thing")`
+  finds `native/thing.dll`.
+* Paths are validated everywhere (no `..`, drive letters, reserved Windows names); text files are stored
+  with `\n` line endings; limits are 32 MB per file and 64 MB per workbook.
+
+### The Files panel
+
+The **Files** button on the Lua tab opens a task pane on the right with the workbook's tree. You can
+create folders, add files and folders (multi-select, recursive), rename, delete (with confirmation),
+export a file or a folder to disk, and refresh. It edits the **open** workbook through Excel's
+`CustomXMLParts`, so there is nothing to reload: **save the workbook to apply the changes** (the pane
+says "Unsaved changes" until you do). A folder named `lib` you add is available to `require` after saving.
+
+Trust and edits: if the workbook was green or yellow, files you add or change are trusted too (they are
+your own work), so they stay enabled after saving. A red/blocked workbook stays blocked — review the
+files in the panel, then use the ribbon button. Files authored in an unsaved workbook are trusted once
+saved.
 
 Lua conventions: ranges are tables of rows (`{{1,2},{3,4}}`), a flat list returns a column, empty
 cells are `nil` (`xl.EMPTY` inside arrays), errors are `xl.NA`, `xl.VALUE`, `xl.DIV0`, …
@@ -86,6 +115,8 @@ refreshes the button. If the COM side fails for any reason the worksheet functio
   where Excel provides it). Scripts are read from the file on disk, so re-save after embedding.
 * Functions are registered thread-unsafe, so recalculation is single-threaded.
 * The ribbon is untested against every Excel build; it targets Excel 2010+ (32x32 bitmap icons).
+* The Files panel hosts the system web-browser control in an Office task pane; it needs `Shell.Explorer.2`
+  (present on Windows 10/11). Drag-and-drop into the panel and an in-panel text editor are not done yet.
 * Not yet implemented: reading arbitrary ranges/cells from Lua (`xl.range`), writing back, async/RTD
   for long-running external programs, a process-spawn helper with timeouts, a "revoke trust" action.
 * x64 only.

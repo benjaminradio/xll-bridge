@@ -1,28 +1,34 @@
-//! Script storage: a custom XML part inside the .xlsx/.xlsm package.
+//! Embedded file storage: a custom XML part inside the .xlsx/.xlsm package.
 //!
-//! Layout written by [`embed_scripts`]:
+//! Layout written by [`embed_bundle`]:
 //!
 //! ```text
-//! customXml/itemN.xml            <scripts xmlns="urn:xll-bridge:scripts:v1">…</scripts>
+//! customXml/itemN.xml            <files xmlns="urn:xll-bridge:files:v1">…</files>
 //! customXml/itemPropsN.xml       datastore item properties (required by OPC for custom XML)
 //! customXml/_rels/itemN.xml.rels relationship item -> itemProps
 //! xl/_rels/workbook.xml.rels     + relationship workbook -> item
 //! [Content_Types].xml            + override for itemProps
 //! ```
 //!
-//! Excel round-trips custom XML parts it doesn't understand, so scripts survive a save.
-//! Reading never executes anything: it only parses XML.
+//! Excel round-trips custom XML parts it doesn't understand, so the files survive a save, and the
+//! same part is reachable at runtime through `Workbook.CustomXMLParts`. Reading never executes
+//! anything: it only parses XML. The original flat `<scripts>` format is still read.
 
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
-use quick_xml::events::Event;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
+use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, XmlVersion};
-use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
-pub const SCRIPTS_NS: &str = "urn:xll-bridge:scripts:v1";
+use crate::vfs::{Bundle, is_xml_text};
+
+pub const FILES_NS: &str = "urn:xll-bridge:files:v1";
+/// The first, flat format: `<scripts><script name="x">code</script></scripts>`.
+pub const LEGACY_NS: &str = "urn:xll-bridge:scripts:v1";
 
 const CONTENT_TYPES: &str = "[Content_Types].xml";
 const WORKBOOK_RELS: &str = "xl/_rels/workbook.xml.rels";
@@ -32,8 +38,8 @@ const REL_TYPE_CUSTOM_XML_PROPS: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/customXmlProps";
 const CT_ITEM_PROPS: &str = "application/vnd.openxmlformats-officedocument.customXmlProperties+xml";
 const XML_DECL: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n";
-/// Upper bound on any single part we read into memory.
-const MAX_PART_BYTES: u64 = 16 * 1024 * 1024;
+/// Upper bound on any single part we read into memory (base64 inflates the 64 MB payload cap).
+const MAX_PART_BYTES: u64 = 160 * 1024 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackageError {
@@ -47,34 +53,8 @@ pub enum PackageError {
     Invalid(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Script {
-    pub name: String,
-    pub code: String,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ScriptSet {
-    pub scripts: Vec<Script>,
-}
-
-impl ScriptSet {
-    pub fn is_empty(&self) -> bool {
-        self.scripts.is_empty()
-    }
-
-    /// SHA-256 over names and code, in document order. This is what trust is pinned to,
-    /// so any edit to any script re-triggers the banner.
-    pub fn digest(&self) -> String {
-        let mut h = Sha256::new();
-        for s in &self.scripts {
-            h.update((s.name.len() as u64).to_le_bytes());
-            h.update(s.name.as_bytes());
-            h.update((s.code.len() as u64).to_le_bytes());
-            h.update(s.code.as_bytes());
-        }
-        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-    }
+fn xml_err(e: impl std::fmt::Display) -> PackageError {
+    PackageError::Xml(e.to_string())
 }
 
 // ---------------------------------------------------------------- XML (de)serialisation
@@ -87,125 +67,179 @@ fn escape(s: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
-            // XML 1.0 forbids most control characters; keep tab/LF, normalise CR away.
-            '\r' => {}
-            c if (c as u32) < 0x20 && c != '\t' && c != '\n' => {}
             c => out.push(c),
         }
     }
     out
 }
 
-pub fn scripts_to_xml(set: &ScriptSet) -> String {
+pub fn bundle_to_xml(b: &Bundle) -> String {
     let mut out = String::from(XML_DECL);
-    out.push_str(&format!("<scripts xmlns=\"{SCRIPTS_NS}\">\n"));
-    for s in &set.scripts {
-        out.push_str(&format!(
-            "  <script name=\"{}\">{}</script>\n",
-            escape(&s.name),
-            escape(&s.code)
-        ));
+    out.push_str(&format!("<files xmlns=\"{FILES_NS}\">\n"));
+    let mut dirs: Vec<&String> = b.explicit_dirs().iter().collect();
+    dirs.sort();
+    for d in dirs {
+        out.push_str(&format!("  <dir path=\"{}\"/>\n", escape(d)));
     }
-    out.push_str("</scripts>\n");
+    let mut files: Vec<_> = b.files().iter().collect();
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    for f in files {
+        if is_xml_text(&f.data) {
+            // `is_xml_text` guarantees valid UTF-8.
+            let text = String::from_utf8_lossy(&f.data);
+            out.push_str(&format!(
+                "  <file path=\"{}\">{}</file>\n",
+                escape(&f.path),
+                escape(&text)
+            ));
+        } else {
+            out.push_str(&format!(
+                "  <file path=\"{}\" encoding=\"base64\">{}</file>\n",
+                escape(&f.path),
+                B64.encode(&f.data)
+            ));
+        }
+    }
+    out.push_str("</files>\n");
     out
 }
 
-fn script_name(e: &quick_xml::events::BytesStart<'_>) -> Result<String, PackageError> {
+fn attr(e: &BytesStart<'_>, name: &str) -> Result<Option<String>, PackageError> {
     for a in e.attributes().flatten() {
-        if a.key.as_ref() == "name" {
-            return Ok(a
-                .normalized_value(XmlVersion::Implicit1_0)
-                .map_err(|e| PackageError::Xml(e.to_string()))?
-                .into_owned());
+        if a.key.as_ref() == name {
+            return Ok(Some(
+                a.normalized_value(XmlVersion::Implicit1_0)
+                    .map_err(xml_err)?
+                    .into_owned(),
+            ));
         }
     }
-    Ok(String::new())
+    Ok(None)
 }
 
-/// Parses a custom XML item. `Ok(None)` means "valid XML, but not our part".
-pub fn scripts_from_xml(xml: &str) -> Result<Option<ScriptSet>, PackageError> {
+fn root_ns(e: &BytesStart<'_>) -> Option<String> {
+    attr(e, "xmlns").ok().flatten()
+}
+
+enum Open {
+    File {
+        path: String,
+        base64: bool,
+        text: String,
+    },
+    Script {
+        name: String,
+        text: String,
+    },
+}
+
+/// Parses a custom XML item. `Ok(None)` means "valid XML, but not ours".
+pub fn bundle_from_xml(xml: &str) -> Result<Option<Bundle>, PackageError> {
     let mut reader = Reader::from_str(xml);
-    let mut set = ScriptSet::default();
-    let mut seen_root = false;
-    let mut current: Option<(String, String)> = None;
+    let mut bundle = Bundle::new();
+    let mut root: Option<&'static str> = None; // "files" | "scripts"
+    let mut open: Option<Open> = None;
+    let add_err = |e: crate::vfs::VfsError| PackageError::Invalid(e.to_string());
 
     loop {
-        let event = reader
-            .read_event()
-            .map_err(|e| PackageError::Xml(e.to_string()))?;
-        match event {
-            Event::Start(e) => {
-                let local = e.local_name();
-                if !seen_root {
-                    if local.as_ref() != "scripts" {
-                        return Ok(None);
-                    }
-                    let ns_ok = e
-                        .attributes()
-                        .flatten()
-                        .any(|a| a.key.as_ref() == "xmlns" && a.value.as_ref() == SCRIPTS_NS);
-                    if !ns_ok {
-                        return Ok(None);
-                    }
-                    seen_root = true;
-                } else if local.as_ref() == "script" {
-                    current = Some((script_name(&e)?, String::new()));
-                }
+        match reader.read_event().map_err(xml_err)? {
+            Event::Start(e) | Event::Empty(e) if root.is_none() => {
+                let ns = root_ns(&e);
+                root = match (e.local_name().as_ref(), ns.as_deref()) {
+                    ("files", Some(FILES_NS)) => Some("files"),
+                    ("scripts", Some(LEGACY_NS)) => Some("scripts"),
+                    _ => return Ok(None),
+                };
             }
-            Event::Empty(e) => {
-                if !seen_root {
-                    // `<scripts xmlns=".."/>`: our part, with nothing in it.
-                    let ours = e.local_name().as_ref() == "scripts"
-                        && e.attributes()
-                            .flatten()
-                            .any(|a| a.key.as_ref() == "xmlns" && a.value.as_ref() == SCRIPTS_NS);
-                    return Ok(ours.then(ScriptSet::default));
-                } else if e.local_name().as_ref() == "script" {
-                    set.scripts.push(Script {
-                        name: script_name(&e)?,
-                        code: String::new(),
+            Event::Start(e) => match (root, e.local_name().as_ref()) {
+                (Some("files"), "file") => {
+                    let path = attr(&e, "path")?.ok_or_else(|| xml_err("file without path"))?;
+                    let base64 = attr(&e, "encoding")?.as_deref() == Some("base64");
+                    open = Some(Open::File {
+                        path,
+                        base64,
+                        text: String::new(),
                     });
                 }
-            }
-            Event::Text(t) => {
-                if let Some((_, code)) = current.as_mut() {
-                    let text = t.xml_content(XmlVersion::Implicit1_0);
-                    code.push_str(&text);
+                (Some("scripts"), "script") => {
+                    open = Some(Open::Script {
+                        name: attr(&e, "name")?.unwrap_or_default(),
+                        text: String::new(),
+                    });
                 }
-            }
+                _ => {}
+            },
+            Event::Empty(e) => match (root, e.local_name().as_ref()) {
+                (Some("files"), "dir") => {
+                    let path = attr(&e, "path")?.ok_or_else(|| xml_err("dir without path"))?;
+                    bundle.mkdir(&path).map_err(add_err)?;
+                }
+                (Some("files"), "file") => {
+                    let path = attr(&e, "path")?.ok_or_else(|| xml_err("file without path"))?;
+                    bundle.put_file(&path, Vec::new(), true).map_err(add_err)?;
+                }
+                (Some("scripts"), "script") => {
+                    let name = attr(&e, "name")?.unwrap_or_default();
+                    bundle
+                        .put_file(&format!("{name}.lua"), Vec::new(), true)
+                        .map_err(add_err)?;
+                }
+                _ => {}
+            },
+            Event::Text(t) => match open.as_mut() {
+                Some(Open::File { text, .. } | Open::Script { text, .. }) => {
+                    text.push_str(&t.xml_content(XmlVersion::Implicit1_0));
+                }
+                None => {}
+            },
             Event::GeneralRef(r) => {
-                if let Some((_, code)) = current.as_mut() {
+                if let Some(Open::File { text, .. } | Open::Script { text, .. }) = open.as_mut() {
                     if let Ok(Some(c)) = r.resolve_char_ref() {
-                        code.push(c);
+                        text.push(c);
                     } else {
                         match r.as_ref() {
-                            "amp" => code.push('&'),
-                            "lt" => code.push('<'),
-                            "gt" => code.push('>'),
-                            "quot" => code.push('"'),
-                            "apos" => code.push('\''),
+                            "amp" => text.push('&'),
+                            "lt" => text.push('<'),
+                            "gt" => text.push('>'),
+                            "quot" => text.push('"'),
+                            "apos" => text.push('\''),
                             _ => {}
                         }
                     }
                 }
             }
             Event::CData(c) => {
-                if let Some((_, code)) = current.as_mut() {
-                    code.push_str(&c.into_inner());
+                if let Some(Open::File { text, .. } | Open::Script { text, .. }) = open.as_mut() {
+                    text.push_str(&c.into_inner());
                 }
             }
             Event::End(e) => {
-                if e.local_name().as_ref() == "script"
-                    && let Some((name, code)) = current.take()
-                {
-                    set.scripts.push(Script { name, code });
+                let local = e.local_name();
+                if matches!(local.as_ref(), "file" | "script") {
+                    match open.take() {
+                        Some(Open::File { path, base64, text }) => {
+                            let data = if base64 {
+                                let compact: String = text.split_whitespace().collect();
+                                B64.decode(compact).map_err(xml_err)?
+                            } else {
+                                text.into_bytes()
+                            };
+                            bundle.put_file(&path, data, true).map_err(add_err)?;
+                        }
+                        Some(Open::Script { name, text }) => {
+                            bundle
+                                .put_file(&format!("{name}.lua"), text.into_bytes(), true)
+                                .map_err(add_err)?;
+                        }
+                        None => {}
+                    }
                 }
             }
             Event::Eof => break,
             _ => {}
         }
     }
-    Ok(if seen_root { Some(set) } else { None })
+    Ok(root.map(|_| bundle))
 }
 
 // ---------------------------------------------------------------- package I/O
@@ -229,10 +263,10 @@ fn is_item_part(name: &str) -> Option<u32> {
     rest.parse().ok() // "itemProps1" does not parse, which is what we want
 }
 
-/// Finds our scripts part in a workbook package. Returns the item number along with the scripts.
-fn find_scripts<R: Read + Seek>(
+/// Finds our part in a workbook package: (item number, bundle) and the highest item number used.
+fn find_bundle<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
-) -> Result<(Option<(u32, ScriptSet)>, u32), PackageError> {
+) -> Result<(Option<(u32, Bundle)>, u32), PackageError> {
     let names: Vec<String> = zip
         .file_names()
         .filter_map(|n| n.ok().map(|n| n.into_owned()))
@@ -252,19 +286,18 @@ fn find_scripts<R: Read + Seek>(
         };
         // Foreign custom XML parts may be anything; only ours matters, so ignore parse failures.
         if let Ok(xml) = std::str::from_utf8(&bytes)
-            && let Ok(Some(set)) = scripts_from_xml(xml)
+            && let Ok(Some(b)) = bundle_from_xml(xml)
         {
-            found = Some((n, set));
+            found = Some((n, b));
         }
     }
     Ok((found, max_item))
 }
 
-/// Reads the embedded scripts, if any. Does not run or compile anything.
-pub fn read_scripts(path: &Path) -> Result<Option<ScriptSet>, PackageError> {
-    let file = std::fs::File::open(path)?;
-    let mut zip = ZipArchive::new(file)?;
-    Ok(find_scripts(&mut zip)?.0.map(|(_, set)| set))
+/// Reads the embedded files from a saved workbook, if any. Does not run or compile anything.
+pub fn read_bundle(path: &Path) -> Result<Option<Bundle>, PackageError> {
+    let mut zip = ZipArchive::new(std::fs::File::open(path)?)?;
+    Ok(find_bundle(&mut zip)?.0.map(|(_, b)| b))
 }
 
 fn insert_before(xml: &str, closing_tag: &str, snippet: &str) -> Result<String, PackageError> {
@@ -274,17 +307,17 @@ fn insert_before(xml: &str, closing_tag: &str, snippet: &str) -> Result<String, 
     Ok(format!("{}{}{}", &xml[..idx], snippet, &xml[idx..]))
 }
 
-/// Writes `dst` as a copy of `src` carrying `scripts`. An existing scripts part is replaced
-/// in place; otherwise a new one is wired into the package. `src` and `dst` may not be equal.
-pub fn embed_scripts(src: &Path, dst: &Path, scripts: &ScriptSet) -> Result<(), PackageError> {
+/// Writes `dst` as a copy of `src` carrying `bundle`. An existing part is replaced in place;
+/// otherwise a new one is wired into the package. `src` and `dst` may not be equal.
+pub fn embed_bundle(src: &Path, dst: &Path, bundle: &Bundle) -> Result<(), PackageError> {
     if src == dst {
         return Err(PackageError::Invalid(
             "source and destination must differ".into(),
         ));
     }
     let mut zip = ZipArchive::new(std::fs::File::open(src)?)?;
-    let (existing, max_item) = find_scripts(&mut zip)?;
-    let xml = scripts_to_xml(scripts);
+    let (existing, max_item) = find_bundle(&mut zip)?;
+    let xml = bundle_to_xml(bundle);
     let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
 
     let mut out = ZipWriter::new(std::fs::File::create(dst)?);
@@ -294,7 +327,7 @@ pub fn embed_scripts(src: &Path, dst: &Path, scripts: &ScriptSet) -> Result<(), 
                 let target = format!("customXml/item{n}.xml");
                 for i in 0..zip.len() {
                     let f = zip.by_index_raw(i)?;
-                    if f.name().is_ok_and(|n| n == target) {
+                    if f.name().is_ok_and(|name| name == target) {
                         continue;
                     }
                     out.raw_copy_file(f)?;
@@ -325,7 +358,7 @@ pub fn embed_scripts(src: &Path, dst: &Path, scripts: &ScriptSet) -> Result<(), 
                 for i in 0..zip.len() {
                     let f = zip.by_index_raw(i)?;
                     if f.name()
-                        .is_ok_and(|n| n == CONTENT_TYPES || n == WORKBOOK_RELS)
+                        .is_ok_and(|name| name == CONTENT_TYPES || name == WORKBOOK_RELS)
                     {
                         continue;
                     }
@@ -342,7 +375,7 @@ pub fn embed_scripts(src: &Path, dst: &Path, scripts: &ScriptSet) -> Result<(), 
                     format!(
                         "{XML_DECL}<ds:datastoreItem ds:itemID=\"{{8F0B5C2E-4D1A-4E37-9B6A-5A7C1E3D2F10}}\" \
                          xmlns:ds=\"http://schemas.openxmlformats.org/officeDocument/2006/customXml\">\
-                         <ds:schemaRefs><ds:schemaRef ds:uri=\"{SCRIPTS_NS}\"/></ds:schemaRefs>\
+                         <ds:schemaRefs><ds:schemaRef ds:uri=\"{FILES_NS}\"/></ds:schemaRefs>\
                          </ds:datastoreItem>"
                     )
                     .as_bytes(),
@@ -395,77 +428,107 @@ pub(crate) mod testutil {
         z.write_all(b"<workbook/>").unwrap();
         z.finish().unwrap();
     }
+
+    /// Convenience for tests: a bundle of (path, text) files.
+    pub fn bundle_of(files: &[(&str, &str)]) -> Bundle {
+        let mut b = Bundle::new();
+        for (p, c) in files {
+            b.put_file(p, c.as_bytes().to_vec(), true).unwrap();
+        }
+        b
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testutil::minimal_xlsx;
+    use super::testutil::{bundle_of, minimal_xlsx};
     use super::*;
 
-    fn sample() -> ScriptSet {
-        ScriptSet {
-            scripts: vec![
-                Script {
-                    name: "main".into(),
-                    code: "function f(a) return a < 2 and \"x&y\" end".into(),
-                },
-                Script {
-                    name: "util".into(),
-                    code: "-- ]]> tricky\nx = 1\n".into(),
-                },
-            ],
-        }
+    fn sample() -> Bundle {
+        let mut b = bundle_of(&[
+            ("main.lua", "function f(a) return a < 2 and \"x&y\" end\n"),
+            ("lib/util.lua", "-- ]]> tricky <b>\r\nx = 1\n"),
+        ]);
+        b.put_file("bin/native.dll", vec![0, 1, 2, 0xff, b'<', b'&', 13], true)
+            .unwrap();
+        b.mkdir("empty/nested").unwrap();
+        b
     }
 
     #[test]
-    fn xml_round_trip_preserves_code() {
-        let set = sample();
-        let back = scripts_from_xml(&scripts_to_xml(&set)).unwrap().unwrap();
-        assert_eq!(back.scripts[0].code, set.scripts[0].code);
-        assert_eq!(back.scripts[1].code.replace('\r', ""), set.scripts[1].code);
-        assert_eq!(back.digest(), set.digest());
-    }
-
-    #[test]
-    fn foreign_xml_is_ignored() {
-        assert_eq!(scripts_from_xml("<other xmlns=\"urn:x\"/>").unwrap(), None);
+    fn xml_round_trip_is_exact_for_text_binary_and_folders() {
+        let b = sample();
+        let xml = bundle_to_xml(&b);
+        assert!(
+            xml.contains("encoding=\"base64\"") && xml.contains("<dir path=\"empty/nested\"/>")
+        );
+        let back = bundle_from_xml(&xml).unwrap().unwrap();
+        assert_eq!(back, b);
+        assert_eq!(back.digest(), b.digest());
         assert_eq!(
-            scripts_from_xml("<scripts xmlns=\"urn:other\"/>").unwrap(),
-            None
+            back.get("bin/native.dll").unwrap().data,
+            vec![0, 1, 2, 0xff, b'<', b'&', 13]
         );
     }
 
     #[test]
-    fn digest_changes_with_content() {
-        let a = sample();
-        let mut b = sample();
-        b.scripts[0].code.push(' ');
-        assert_ne!(a.digest(), b.digest());
+    fn xml_survives_a_reformatting_parser() {
+        // Excel/MSXML may re-serialise: indentation between elements and attribute order change.
+        let xml = format!(
+            "<?xml version=\"1.0\"?>\n<files xmlns=\"{FILES_NS}\">\n\n<file encoding=\"base64\" path=\"a.bin\">\n AAEC\n /w==\n</file>\n<file path=\"t.txt\">hi &#13;there</file></files>"
+        );
+        // base64 is whitespace-tolerant; a literal CR via a character reference is kept as binary-ish text.
+        let b = bundle_from_xml(&xml).unwrap().unwrap();
+        assert_eq!(b.get("a.bin").unwrap().data, vec![0, 1, 2, 0xff]);
+        assert_eq!(b.get("t.txt").unwrap().data, b"hi \rthere");
+    }
+
+    #[test]
+    fn legacy_scripts_format_still_reads() {
+        let xml = format!(
+            "<scripts xmlns=\"{LEGACY_NS}\"><script name=\"main\">return 1</script><script name=\"e\"/></scripts>"
+        );
+        let b = bundle_from_xml(&xml).unwrap().unwrap();
+        assert_eq!(b.get("main.lua").unwrap().data, b"return 1");
+        assert!(b.get("e.lua").is_some());
+    }
+
+    #[test]
+    fn foreign_and_hostile_xml() {
+        assert_eq!(bundle_from_xml("<other xmlns=\"urn:x\"/>").unwrap(), None);
+        assert_eq!(
+            bundle_from_xml("<files xmlns=\"urn:other\"/>").unwrap(),
+            None
+        );
+        let evil =
+            format!("<files xmlns=\"{FILES_NS}\"><file path=\"../../evil.dll\">x</file></files>");
+        assert!(
+            bundle_from_xml(&evil).is_err(),
+            "traversal paths must be rejected on read"
+        );
+        let bad_b64 = format!(
+            "<files xmlns=\"{FILES_NS}\"><file path=\"a\" encoding=\"base64\">***</file></files>"
+        );
+        assert!(bundle_from_xml(&bad_b64).is_err());
     }
 
     #[test]
     fn embed_then_read_then_replace() {
         let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("in.xlsx");
-        let one = dir.path().join("one.xlsx");
-        let two = dir.path().join("two.xlsx");
-        minimal_xlsx(&src);
-        assert!(read_scripts(&src).unwrap().is_none());
-
-        embed_scripts(&src, &one, &sample()).unwrap();
-        assert_eq!(
-            read_scripts(&one).unwrap().unwrap().digest(),
-            sample().digest()
+        let (src, one, two) = (
+            dir.path().join("in.xlsx"),
+            dir.path().join("one.xlsx"),
+            dir.path().join("two.xlsx"),
         );
+        minimal_xlsx(&src);
+        assert!(read_bundle(&src).unwrap().is_none());
 
-        let replacement = ScriptSet {
-            scripts: vec![Script {
-                name: "n".into(),
-                code: "x=2".into(),
-            }],
-        };
-        embed_scripts(&one, &two, &replacement).unwrap();
-        assert_eq!(read_scripts(&two).unwrap().unwrap(), replacement);
+        embed_bundle(&src, &one, &sample()).unwrap();
+        assert_eq!(read_bundle(&one).unwrap().unwrap(), sample());
+
+        let replacement = bundle_of(&[("n.lua", "x=2")]);
+        embed_bundle(&one, &two, &replacement).unwrap();
+        assert_eq!(read_bundle(&two).unwrap().unwrap(), replacement);
 
         // Replacing must not duplicate parts.
         let zip = ZipArchive::new(std::fs::File::open(&two).unwrap()).unwrap();
