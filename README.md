@@ -124,6 +124,14 @@ refreshes the button. If the COM side fails for any reason the worksheet functio
 
 ## Troubleshooting
 
+* **How a formula finds its workbook:** a worksheet function cannot call back into Excel while it is
+  calculating, so the ribbon layer keeps a table of the open workbooks (name -> real local path, via
+  Excel's `LocalFullName`, which resolves OneDrive/SharePoint-synced files) and the function looks its
+  workbook up by name. `CELL("filename")` is only a fallback for local files, because for synced files it
+  returns a `https://` URL. If a workbook cannot be found you get `#NOPATH: …` with what was seen, and
+  `=LUA.STATUS()` prints the same detail. A workbook that is newly opened and contains embedded files is
+  recalculated once when it appears, so cells that ran too early fill in by themselves.
+
 * `%APPDATA%\xll-bridge\addin.log` exists only after something went wrong. It records panics and access
   violations (with the faulting module and offset), preceded by the last events (start-up, button clicks)
   kept in memory. Attach it when reporting a crash.

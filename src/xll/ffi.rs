@@ -87,6 +87,7 @@ const xlSpecial: i32 = 0x4000;
 pub const xlFree: i32 = xlSpecial;
 pub const xlCoerce: i32 = 2 | xlSpecial;
 pub const xlGetHwnd: i32 = 8 | xlSpecial;
+pub const xlSheetNm: i32 = 5 | xlSpecial;
 pub const xlGetName: i32 = 9 | xlSpecial;
 pub const xlfCaller: i32 = 89;
 pub const xlfCell: i32 = 125;

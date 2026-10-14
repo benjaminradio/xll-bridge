@@ -99,8 +99,95 @@ struct Shared {
     shown: Option<View>,
 }
 
+/// Open workbooks by (lower-cased) name, with their real on-disk paths. Worksheet functions
+/// cannot call back into Excel's object model while calculating, so the timer keeps this table
+/// current for them.
+#[derive(Default)]
+struct Books {
+    by_name: std::collections::HashMap<String, PathBuf>,
+    last_count: i32,
+    last_refresh: Option<std::time::Instant>,
+    /// Cells of a newly seen workbook with embedded files may have been calculated before we
+    /// could tell them where it lives; recalculate once when it appears.
+    recalc_pending: bool,
+}
+
+const BOOKS_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
 thread_local! {
+    static BOOKS: RefCell<Books> = RefCell::new(Books::default());
     static SHARED: RefCell<Shared> = RefCell::new(Shared::default());
+}
+
+/// The local path of the open workbook called `name` (e.g. `demo.xlsx`), if known.
+pub(super) fn workbook_path_by_name(name: &str) -> Option<PathBuf> {
+    BOOKS.with(|b| b.borrow().by_name.get(&name.to_lowercase()).cloned())
+}
+
+fn local_path_of(wb: &IDispatch) -> Option<PathBuf> {
+    ["LocalFullName", "FullName"]
+        .into_iter()
+        .filter_map(|p| dispatch::get(wb, p).ok())
+        .filter_map(|v| bstr_of(&v))
+        .map(PathBuf::from)
+        .find(|p| p.is_absolute() && p.is_file())
+}
+
+/// Re-reads the open-workbook table when the number of workbooks changed or it is a bit old.
+fn refresh_books(app: &IDispatch) {
+    let Some(coll) = dispatch::get(app, "Workbooks")
+        .ok()
+        .and_then(|v| IDispatch::try_from(&v).ok())
+    else {
+        return;
+    };
+    let count = dispatch::get(&coll, "Count")
+        .ok()
+        .and_then(|v| i32::try_from(&v).ok())
+        .unwrap_or(0);
+    let due = BOOKS.with(|b| {
+        let b = b.borrow();
+        b.last_count != count || b.last_refresh.is_none_or(|t| t.elapsed() > BOOKS_REFRESH)
+    });
+    if due {
+        let mut map = std::collections::HashMap::new();
+        for i in 1..=count {
+            let Some(wb) = dispatch::get_with(&coll, "Item", &[VARIANT::from(i)])
+                .ok()
+                .and_then(|v| IDispatch::try_from(&v).ok())
+            else {
+                continue;
+            };
+            if let (Some(name), Some(path)) = (
+                dispatch::get(&wb, "Name").ok().and_then(|v| bstr_of(&v)),
+                local_path_of(&wb),
+            ) {
+                map.insert(name.to_lowercase(), path);
+            }
+        }
+        let appeared: Vec<PathBuf> = BOOKS.with(|b| {
+            let b = b.borrow();
+            map.iter()
+                .filter(|(k, _)| !b.by_name.contains_key(*k))
+                .map(|(_, p)| p.clone())
+                .collect()
+        });
+        let has_files = appeared
+            .iter()
+            .any(|p| with_runtime(|rt| !matches!(rt.status(p), Status::NoScripts)));
+        BOOKS.with(|b| {
+            let mut b = b.borrow_mut();
+            b.by_name = map;
+            b.last_count = count;
+            b.last_refresh = Some(std::time::Instant::now());
+            b.recalc_pending |= has_files;
+        });
+    }
+    if BOOKS.with(|b| b.borrow().recalc_pending)
+        && dispatch::call(app, "CalculateFull", &[]).is_ok()
+    {
+        BOOKS.with(|b| b.borrow_mut().recalc_pending = false);
+    }
 }
 
 pub(super) fn is_connected() -> bool {
@@ -161,6 +248,7 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
             invalidate_button();
         }
         if let Some(app) = app() {
+            refresh_books(&app);
             pane::tick(&app);
         }
     }));

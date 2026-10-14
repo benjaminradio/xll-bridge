@@ -59,7 +59,7 @@ pub enum CallError {
     Blocked,
     #[error("#NOSCRIPTS: this workbook has no embedded Lua scripts")]
     NoScripts,
-    #[error("#UNSAVED: save the workbook to disk first")]
+    #[error("#NOPATH: cannot locate this workbook on disk")]
     NoPath,
     #[error("#LUA: {0}")]
     Lua(String),
@@ -282,6 +282,14 @@ fn activate(workbook: &Path, bundle: &Bundle, digest: String) -> Book {
     }
 }
 
+/// `"[demo.xlsx]Sheet1"` (what `xlSheetNm` returns) -> `"demo.xlsx"`.
+pub fn workbook_name_from_sheet_name(s: &str) -> Option<String> {
+    let open = s.find('[')?;
+    let close = s[open..].find(']')? + open;
+    let name = &s[open + 1..close];
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// Splits Excel's `CELL("filename")` result, `C:\dir\[Book.xlsx]Sheet1`, into the file path.
 /// `None` for unsaved workbooks (empty string) and non-local locations (URLs).
 pub fn workbook_path_from_cell_filename(s: &str) -> Option<PathBuf> {
@@ -452,6 +460,20 @@ mod tests {
             Err(CallError::NoScripts)
         ));
         assert!(matches!(rt.call(None, "f", &[]), Err(CallError::NoPath)));
+    }
+
+    #[test]
+    fn extracts_the_workbook_name_from_a_sheet_reference() {
+        assert_eq!(
+            workbook_name_from_sheet_name("[demo.xlsx]Demo").as_deref(),
+            Some("demo.xlsx")
+        );
+        assert_eq!(
+            workbook_name_from_sheet_name("[Book 1]Sheet1").as_deref(),
+            Some("Book 1")
+        );
+        assert_eq!(workbook_name_from_sheet_name("Sheet1"), None);
+        assert_eq!(workbook_name_from_sheet_name("[]Sheet1"), None);
     }
 
     #[test]

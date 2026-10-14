@@ -17,7 +17,9 @@ use std::path::PathBuf;
 
 use ffi::*;
 
-use crate::runtime::{CallError, Runtime, Status, workbook_path_from_cell_filename};
+use crate::runtime::{
+    CallError, Runtime, Status, workbook_name_from_sheet_name, workbook_path_from_cell_filename,
+};
 use crate::trust::TrustStore;
 use crate::value::Value;
 
@@ -31,22 +33,64 @@ pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
     RUNTIME.with(|r| f(&mut r.borrow_mut()))
 }
 
-/// Path of the workbook containing the calling cell, via `CELL("filename", caller)`.
-fn caller_workbook() -> Option<PathBuf> {
+/// Where the workbook containing the calling cell lives on disk.
+///
+/// 1. The workbook's name comes from `xlSheetNm` (`"[demo.xlsx]Sheet1"`), and its real local path
+///    from the table the ribbon layer keeps by asking Excel for `LocalFullName`. That is what
+///    copes with OneDrive/SharePoint-synced files, for which `CELL("filename")` returns a URL.
+/// 2. Failing that, `CELL("filename")` itself, if it names a local file (covers a workbook opened a
+///    moment ago, before the table has caught up).
+///
+/// On failure the `Err` explains what was seen, for the cell and for `addin.log`.
+fn locate_caller() -> Result<PathBuf, String> {
     let mut caller = Xloper12::nil();
-    if excel12(xlfCaller, Some(&mut caller), &mut []) != xlretSuccess {
-        return None;
+    let rc = excel12(xlfCaller, Some(&mut caller), &mut []);
+    if rc != xlretSuccess {
+        return Err(format!("not called from a cell (xlfCaller returned {rc})"));
     }
+    let result = locate_from(&mut caller);
+    free(&mut caller);
+    result
+}
+
+fn locate_from(caller: &mut Xloper12) -> Result<PathBuf, String> {
+    let string_result = |rc: i32, out: &Xloper12| {
+        (rc == xlretSuccess && out.base_type() == xltypeStr)
+            .then(|| unsafe { read_counted(out.val.str_) })
+    };
+
+    let mut sheet = Xloper12::nil();
+    let rc_sheet = excel12(xlSheetNm, Some(&mut sheet), &mut [&mut *caller]);
+    let sheet_name = string_result(rc_sheet, &sheet);
+    free(&mut sheet);
+    let book = sheet_name
+        .as_deref()
+        .and_then(workbook_name_from_sheet_name);
+    if let Some(path) = book.as_deref().and_then(ribbon::workbook_path_by_name) {
+        return Ok(path);
+    }
+
     let what = ffi::counted_utf16("filename");
     let mut what = Xloper12::borrowed_str(&what);
-    let mut out = Xloper12::nil();
-    let rc = excel12(xlfCell, Some(&mut out), &mut [&mut what, &mut caller]);
-    let path = (rc == xlretSuccess && out.base_type() == xltypeStr)
-        .then(|| unsafe { read_counted(out.val.str_) })
-        .and_then(|s| workbook_path_from_cell_filename(&s));
-    free(&mut out);
-    free(&mut caller);
-    path
+    let mut cell = Xloper12::nil();
+    let rc_cell = excel12(xlfCell, Some(&mut cell), &mut [&mut what, &mut *caller]);
+    let cell_text = string_result(rc_cell, &cell);
+    free(&mut cell);
+    if let Some(path) = cell_text
+        .as_deref()
+        .and_then(workbook_path_from_cell_filename)
+        && path.is_file()
+    {
+        return Ok(path);
+    }
+
+    let detail = format!(
+        "workbook {:?}: not in Excel's open-workbook table, CELL(\"filename\") gave {:?} (xlSheetNm rc {rc_sheet}, CELL rc {rc_cell})",
+        book.as_deref().unwrap_or("?"),
+        cell_text.as_deref().unwrap_or("")
+    );
+    crate::log::note(&format!("locate_caller failed: {detail}"));
+    Err(detail)
 }
 
 fn error_text(e: &CallError) -> Value {
@@ -69,9 +113,13 @@ fn dispatch(
     let Some(Value::Str(first)) = vals.first().cloned() else {
         return Value::Str("#LUA: first argument must be text".into());
     };
-    let wb = caller_workbook();
-    let result = with_runtime(|rt| run(rt, wb.as_deref(), &first, &vals[1..]));
-    result.unwrap_or_else(|e| error_text(&e))
+    let located = locate_caller();
+    let result = with_runtime(|rt| run(rt, located.as_deref().ok(), &first, &vals[1..]));
+    match (result, &located) {
+        // Say *why* the workbook could not be found rather than a generic message.
+        (Err(CallError::NoPath), Err(detail)) => Value::Str(format!("#NOPATH: {detail}")),
+        (result, _) => result.unwrap_or_else(|e| error_text(&e)),
+    }
 }
 
 /// Parameters of the `LUA.CALL`/`LUA.EVAL` entry points: the name/code plus ten arguments.
@@ -108,8 +156,9 @@ udf!(LuaEval, |rt, wb, code, args| rt.eval(wb, code, args));
 #[unsafe(no_mangle)]
 pub extern "system" fn LuaStatus() -> *mut Xloper12 {
     guarded(|| {
-        let Some(wb) = caller_workbook() else {
-            return Value::Str("unsaved workbook".into());
+        let wb = match locate_caller() {
+            Ok(wb) => wb,
+            Err(detail) => return Value::Str(format!("cannot locate this workbook: {detail}")),
         };
         let s = with_runtime(|rt| match rt.status(&wb) {
             Status::NoScripts => "no Lua scripts".to_owned(),
