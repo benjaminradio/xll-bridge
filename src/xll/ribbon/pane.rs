@@ -683,10 +683,23 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(html.to_lowercase().contains("<input"), "{html}");
-        let evil = bundle_of(&[("<img src=x onerror=alert(1)>.lua", "x")]);
-        assert!(
-            evil.entries().is_empty(),
-            "such names are rejected at the model level anyway"
-        );
+
+        // Names with markup-significant characters render as plain text.
+        let odd = bundle_of(&[("a&b'c.lua", "x")]);
+        let js = panel::state_js(&PanelState {
+            workbook: Some("Book1.xlsx"),
+            ok: true,
+            hint: "",
+            view: &view,
+            dirty: false,
+            fresh: true,
+            message: None,
+            bundle: Some(&odd),
+        });
+        run(&win, &js);
+        let text = BSTR::try_from(&dispatch::get(&tree, "innerText").unwrap())
+            .unwrap()
+            .to_string();
+        assert!(text.contains("a&b'c.lua"), "{text}");
     }
 }

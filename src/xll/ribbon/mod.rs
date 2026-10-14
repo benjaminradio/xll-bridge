@@ -526,10 +526,11 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(
-            checked >= 8,
-            "expected both buttons' callbacks, checked {checked}"
+        assert_eq!(
+            checked, 7,
+            "onLoad + 5 on the status button + 1 on the files button"
         );
+        assert!(xml.contains("onAction=\"OnFilesClick\""));
     }
 
     #[test]
