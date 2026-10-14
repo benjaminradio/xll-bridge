@@ -36,9 +36,14 @@ struct XlError(ErrorCode);
 
 impl UserData for XlError {
     fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_meta_method("__tostring", |_, this, ()| Ok(format!("#{}", this.0.lua_name())));
+        methods.add_meta_method("__tostring", |_, this, ()| {
+            Ok(format!("#{}", this.0.lua_name()))
+        });
         methods.add_meta_method("__eq", |_, this, other: mlua::AnyUserData| {
-            Ok(other.borrow::<XlError>().map(|o| o.0 == this.0).unwrap_or(false))
+            Ok(other
+                .borrow::<XlError>()
+                .map(|o| o.0 == this.0)
+                .unwrap_or(false))
         });
     }
 }
@@ -85,7 +90,12 @@ impl LuaHost {
 
     /// Runs a chunk with the arguments available as `...`. A bare expression is accepted too.
     pub fn eval(&self, code: &str, args: &[Value]) -> Result<Value, HostError> {
-        let f = match self.lua.load(format!("return {code}")).set_name("=eval").into_function() {
+        let f = match self
+            .lua
+            .load(format!("return {code}"))
+            .set_name("=eval")
+            .into_function()
+        {
             Ok(f) => f,
             Err(_) => self.lua.load(code).set_name("=eval").into_function()?,
         };
@@ -93,7 +103,10 @@ impl LuaHost {
     }
 
     fn invoke(&self, f: &Function, args: &[Value]) -> Result<Value, HostError> {
-        let lua_args: Vec<LV> = args.iter().map(|a| to_lua(&self.lua, a)).collect::<Result<_, _>>()?;
+        let lua_args: Vec<LV> = args
+            .iter()
+            .map(|a| to_lua(&self.lua, a))
+            .collect::<Result<_, _>>()?;
         let ret: MultiValue = f.call(MultiValue::from_iter(lua_args))?;
         match ret.into_iter().next() {
             None => Ok(Value::Empty),
@@ -119,7 +132,9 @@ fn configure_package_path(lua: &Lua, workbook: &Path) -> mlua::Result<()> {
     if let Some(d) = workbook.parent() {
         dirs.push(d.to_path_buf());
     }
-    if let Some(p) = crate::trust::TrustStore::default_path().and_then(|p| p.parent().map(|d| d.join("lua"))) {
+    if let Some(p) =
+        crate::trust::TrustStore::default_path().and_then(|p| p.parent().map(|d| d.join("lua")))
+    {
         dirs.push(p);
     }
     let sep = std::path::MAIN_SEPARATOR;
@@ -219,7 +234,11 @@ fn table_to_array(t: &mlua::Table) -> mlua::Result<Value> {
                 }
                 rows.push(cells);
             }
-            (_, true) => return Err(mlua::Error::runtime("mixed rows and scalars in returned table")),
+            (_, true) => {
+                return Err(mlua::Error::runtime(
+                    "mixed rows and scalars in returned table",
+                ));
+            }
             (_, false) => rows.push(vec![from_lua(&item)?]),
         }
     }
@@ -238,14 +257,28 @@ mod tests {
     use crate::package::Script;
 
     fn host(code: &str) -> LuaHost {
-        let set = ScriptSet { scripts: vec![Script { name: "t".into(), code: code.into() }] };
-        LuaHost::new(&set, &HostContext { workbook: Path::new("/tmp/book.xlsx") }).unwrap()
+        let set = ScriptSet {
+            scripts: vec![Script {
+                name: "t".into(),
+                code: code.into(),
+            }],
+        };
+        LuaHost::new(
+            &set,
+            &HostContext {
+                workbook: Path::new("/tmp/book.xlsx"),
+            },
+        )
+        .unwrap()
     }
 
     #[test]
     fn scalar_call() {
         let h = host("function add(a, b) return a + b end");
-        assert_eq!(h.call("add", &[Value::Num(2.0), Value::Num(3.0)]).unwrap(), Value::Num(5.0));
+        assert_eq!(
+            h.call("add", &[Value::Num(2.0), Value::Num(3.0)]).unwrap(),
+            Value::Num(5.0)
+        );
     }
 
     #[test]
@@ -256,10 +289,18 @@ mod tests {
 
     #[test]
     fn ranges_in_and_out() {
-        let h = host("function transpose(r) local o = {} for i = 1, #r[1] do o[i] = {} for j = 1, #r do o[i][j] = r[j][i] end end return o end");
-        let input = Value::Array(Array::new(2, 3, (1..=6).map(|n| Value::Num(n as f64)).collect()));
+        let h = host(
+            "function transpose(r) local o = {} for i = 1, #r[1] do o[i] = {} for j = 1, #r do o[i][j] = r[j][i] end end return o end",
+        );
+        let input = Value::Array(Array::new(
+            2,
+            3,
+            (1..=6).map(|n| Value::Num(n as f64)).collect(),
+        ));
         let out = h.call("transpose", &[input]).unwrap();
-        let Value::Array(a) = out else { panic!("expected array") };
+        let Value::Array(a) = out else {
+            panic!("expected array")
+        };
         assert_eq!((a.rows, a.cols), (3, 2));
         assert_eq!(a.data[1], Value::Num(4.0));
     }
@@ -267,33 +308,54 @@ mod tests {
     #[test]
     fn flat_list_is_a_column_and_ragged_rows_pad() {
         let h = host("function col() return {1, 2, 3} end function rag() return {{1}, {2, 3}} end");
-        let Value::Array(c) = h.call("col", &[]).unwrap() else { panic!() };
+        let Value::Array(c) = h.call("col", &[]).unwrap() else {
+            panic!()
+        };
         assert_eq!((c.rows, c.cols), (3, 1));
-        let Value::Array(r) = h.call("rag", &[]).unwrap() else { panic!() };
+        let Value::Array(r) = h.call("rag", &[]).unwrap() else {
+            panic!()
+        };
         assert_eq!((r.rows, r.cols), (2, 2));
         assert_eq!(r.data[1], Value::Empty);
     }
 
     #[test]
     fn errors_and_empties_round_trip() {
-        let h = host("function id(x) return x end function na() return xl.NA end function chk(x) return x == xl.DIV0 end");
-        assert_eq!(h.call("id", &[Value::Err(ErrorCode::Ref)]).unwrap(), Value::Err(ErrorCode::Ref));
+        let h = host(
+            "function id(x) return x end function na() return xl.NA end function chk(x) return x == xl.DIV0 end",
+        );
+        assert_eq!(
+            h.call("id", &[Value::Err(ErrorCode::Ref)]).unwrap(),
+            Value::Err(ErrorCode::Ref)
+        );
         assert_eq!(h.call("na", &[]).unwrap(), Value::Err(ErrorCode::NA));
-        assert_eq!(h.call("chk", &[Value::Err(ErrorCode::Div0)]).unwrap(), Value::Bool(true));
+        assert_eq!(
+            h.call("chk", &[Value::Err(ErrorCode::Div0)]).unwrap(),
+            Value::Bool(true)
+        );
         assert_eq!(h.call("id", &[Value::Empty]).unwrap(), Value::Empty);
     }
 
     #[test]
     fn eval_accepts_expressions_and_statements() {
         let h = host("");
-        assert_eq!(h.eval("1 + ...", &[Value::Num(1.0)]).unwrap(), Value::Num(2.0));
-        assert_eq!(h.eval("local s = 0 for i=1,4 do s = s + i end return s", &[]).unwrap(), Value::Num(10.0));
+        assert_eq!(
+            h.eval("1 + ...", &[Value::Num(1.0)]).unwrap(),
+            Value::Num(2.0)
+        );
+        assert_eq!(
+            h.eval("local s = 0 for i=1,4 do s = s + i end return s", &[])
+                .unwrap(),
+            Value::Num(10.0)
+        );
     }
 
     #[test]
     fn lua_errors_surface_as_one_line() {
         let h = host("function boom() error('bad thing') end");
-        let Err(HostError::Lua(m)) = h.call("boom", &[]) else { panic!() };
+        let Err(HostError::Lua(m)) = h.call("boom", &[]) else {
+            panic!()
+        };
         assert!(m.contains("bad thing") && !m.contains('\n'));
     }
 
@@ -302,7 +364,9 @@ mod tests {
         if cfg!(windows) {
             return;
         }
-        let h = host("function sh() local p = io.popen('echo hi') local s = p:read('*l') p:close() return s end");
+        let h = host(
+            "function sh() local p = io.popen('echo hi') local s = p:read('*l') p:close() return s end",
+        );
         assert_eq!(h.call("sh", &[]).unwrap(), Value::Str("hi".into()));
     }
 }

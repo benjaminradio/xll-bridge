@@ -16,8 +16,8 @@
 use std::io::{Read, Seek, Write};
 use std::path::Path;
 
-use quick_xml::{Reader, XmlVersion};
 use quick_xml::events::Event;
+use quick_xml::{Reader, XmlVersion};
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
@@ -113,7 +113,10 @@ pub fn scripts_to_xml(set: &ScriptSet) -> String {
 fn script_name(e: &quick_xml::events::BytesStart<'_>) -> Result<String, PackageError> {
     for a in e.attributes().flatten() {
         if a.key.as_ref() == "name" {
-            return Ok(a.normalized_value(XmlVersion::Implicit1_0).map_err(|e| PackageError::Xml(e.to_string()))?.into_owned());
+            return Ok(a
+                .normalized_value(XmlVersion::Implicit1_0)
+                .map_err(|e| PackageError::Xml(e.to_string()))?
+                .into_owned());
         }
     }
     Ok(String::new())
@@ -127,7 +130,9 @@ pub fn scripts_from_xml(xml: &str) -> Result<Option<ScriptSet>, PackageError> {
     let mut current: Option<(String, String)> = None;
 
     loop {
-        let event = reader.read_event().map_err(|e| PackageError::Xml(e.to_string()))?;
+        let event = reader
+            .read_event()
+            .map_err(|e| PackageError::Xml(e.to_string()))?;
         match event {
             Event::Start(e) => {
                 let local = e.local_name();
@@ -156,7 +161,10 @@ pub fn scripts_from_xml(xml: &str) -> Result<Option<ScriptSet>, PackageError> {
                             .any(|a| a.key.as_ref() == "xmlns" && a.value.as_ref() == SCRIPTS_NS);
                     return Ok(ours.then(ScriptSet::default));
                 } else if e.local_name().as_ref() == "script" {
-                    set.scripts.push(Script { name: script_name(&e)?, code: String::new() });
+                    set.scripts.push(Script {
+                        name: script_name(&e)?,
+                        code: String::new(),
+                    });
                 }
             }
             Event::Text(t) => {
@@ -187,10 +195,10 @@ pub fn scripts_from_xml(xml: &str) -> Result<Option<ScriptSet>, PackageError> {
                 }
             }
             Event::End(e) => {
-                if e.local_name().as_ref() == "script" {
-                    if let Some((name, code)) = current.take() {
-                        set.scripts.push(Script { name, code });
-                    }
+                if e.local_name().as_ref() == "script"
+                    && let Some((name, code)) = current.take()
+                {
+                    set.scripts.push(Script { name, code });
                 }
             }
             Event::Eof => break,
@@ -225,21 +233,28 @@ fn is_item_part(name: &str) -> Option<u32> {
 fn find_scripts<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
 ) -> Result<(Option<(u32, ScriptSet)>, u32), PackageError> {
-    let names: Vec<String> = zip.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .filter_map(|n| n.ok().map(|n| n.into_owned()))
+        .collect();
     let mut max_item = 0;
     let mut found = None;
     for name in names {
-        let Some(n) = is_item_part(&name) else { continue };
+        let Some(n) = is_item_part(&name) else {
+            continue;
+        };
         max_item = max_item.max(n);
         if found.is_some() {
             continue;
         }
-        let Some(bytes) = read_part(zip, &name)? else { continue };
+        let Some(bytes) = read_part(zip, &name)? else {
+            continue;
+        };
         // Foreign custom XML parts may be anything; only ours matters, so ignore parse failures.
-        if let Ok(xml) = std::str::from_utf8(&bytes) {
-            if let Ok(Some(set)) = scripts_from_xml(xml) {
-                found = Some((n, set));
-            }
+        if let Ok(xml) = std::str::from_utf8(&bytes)
+            && let Ok(Some(set)) = scripts_from_xml(xml)
+        {
+            found = Some((n, set));
         }
     }
     Ok((found, max_item))
@@ -263,7 +278,9 @@ fn insert_before(xml: &str, closing_tag: &str, snippet: &str) -> Result<String, 
 /// in place; otherwise a new one is wired into the package. `src` and `dst` may not be equal.
 pub fn embed_scripts(src: &Path, dst: &Path, scripts: &ScriptSet) -> Result<(), PackageError> {
     if src == dst {
-        return Err(PackageError::Invalid("source and destination must differ".into()));
+        return Err(PackageError::Invalid(
+            "source and destination must differ".into(),
+        ));
     }
     let mut zip = ZipArchive::new(std::fs::File::open(src)?)?;
     let (existing, max_item) = find_scripts(&mut zip)?;
@@ -307,7 +324,9 @@ pub fn embed_scripts(src: &Path, dst: &Path, scripts: &ScriptSet) -> Result<(), 
                 )?;
                 for i in 0..zip.len() {
                     let f = zip.by_index_raw(i)?;
-                    if f.name().is_ok_and(|n| n == CONTENT_TYPES || n == WORKBOOK_RELS) {
+                    if f.name()
+                        .is_ok_and(|n| n == CONTENT_TYPES || n == WORKBOOK_RELS)
+                    {
                         continue;
                     }
                     out.raw_copy_file(f)?;
@@ -386,8 +405,14 @@ mod tests {
     fn sample() -> ScriptSet {
         ScriptSet {
             scripts: vec![
-                Script { name: "main".into(), code: "function f(a) return a < 2 and \"x&y\" end".into() },
-                Script { name: "util".into(), code: "-- ]]> tricky\nx = 1\n".into() },
+                Script {
+                    name: "main".into(),
+                    code: "function f(a) return a < 2 and \"x&y\" end".into(),
+                },
+                Script {
+                    name: "util".into(),
+                    code: "-- ]]> tricky\nx = 1\n".into(),
+                },
             ],
         }
     }
@@ -404,7 +429,10 @@ mod tests {
     #[test]
     fn foreign_xml_is_ignored() {
         assert_eq!(scripts_from_xml("<other xmlns=\"urn:x\"/>").unwrap(), None);
-        assert_eq!(scripts_from_xml("<scripts xmlns=\"urn:other\"/>").unwrap(), None);
+        assert_eq!(
+            scripts_from_xml("<scripts xmlns=\"urn:other\"/>").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -425,15 +453,26 @@ mod tests {
         assert!(read_scripts(&src).unwrap().is_none());
 
         embed_scripts(&src, &one, &sample()).unwrap();
-        assert_eq!(read_scripts(&one).unwrap().unwrap().digest(), sample().digest());
+        assert_eq!(
+            read_scripts(&one).unwrap().unwrap().digest(),
+            sample().digest()
+        );
 
-        let replacement = ScriptSet { scripts: vec![Script { name: "n".into(), code: "x=2".into() }] };
+        let replacement = ScriptSet {
+            scripts: vec![Script {
+                name: "n".into(),
+                code: "x=2".into(),
+            }],
+        };
         embed_scripts(&one, &two, &replacement).unwrap();
         assert_eq!(read_scripts(&two).unwrap().unwrap(), replacement);
 
         // Replacing must not duplicate parts.
         let zip = ZipArchive::new(std::fs::File::open(&two).unwrap()).unwrap();
-        let items = zip.file_names().filter(|n| n.as_ref().is_ok_and(|n| is_item_part(n).is_some())).count();
+        let items = zip
+            .file_names()
+            .filter(|n| n.as_ref().is_ok_and(|n| is_item_part(n).is_some()))
+            .count();
         assert_eq!(items, 1);
     }
 }

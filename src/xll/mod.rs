@@ -55,7 +55,8 @@ fn error_text(e: &CallError) -> Value {
 
 /// Runs `f`, converting panics to a cell-sized error: unwinding into Excel would crash it.
 fn guarded(f: impl FnOnce() -> Value) -> *mut Xloper12 {
-    let v = catch_unwind(AssertUnwindSafe(f)).unwrap_or_else(|_| Value::Str("#LUA: internal error".into()));
+    let v = catch_unwind(AssertUnwindSafe(f))
+        .unwrap_or_else(|_| Value::Str("#LUA: internal error".into()));
     oper::into_result(&v)
 }
 
@@ -71,11 +72,11 @@ fn dispatch(
     let wb = caller_workbook();
     let result = with_runtime(|rt| {
         let r = run(rt, wb.as_deref(), &first, &vals[1..]);
-        if matches!(r, Err(CallError::Blocked)) {
-            if let Some((_, n)) = wb.as_deref().and_then(|p| rt.is_blocked(p)) {
-                // Raise the banner from the same call that was refused.
-                banner::show(wb.as_deref().unwrap(), n);
-            }
+        // Raise the banner from the same call that was refused.
+        if let (Err(CallError::Blocked), Some(path)) = (&r, wb.as_deref())
+            && let Some((_, n)) = rt.is_blocked(path)
+        {
+            banner::show(path, n);
         }
         r
     });
@@ -86,9 +87,17 @@ macro_rules! udf {
     ($name:ident, $run:expr) => {
         #[unsafe(no_mangle)]
         pub extern "system" fn $name(
-            f: *const Xloper12, a1: *const Xloper12, a2: *const Xloper12, a3: *const Xloper12,
-            a4: *const Xloper12, a5: *const Xloper12, a6: *const Xloper12, a7: *const Xloper12,
-            a8: *const Xloper12, a9: *const Xloper12, a10: *const Xloper12,
+            f: *const Xloper12,
+            a1: *const Xloper12,
+            a2: *const Xloper12,
+            a3: *const Xloper12,
+            a4: *const Xloper12,
+            a5: *const Xloper12,
+            a6: *const Xloper12,
+            a7: *const Xloper12,
+            a8: *const Xloper12,
+            a9: *const Xloper12,
+            a10: *const Xloper12,
         ) -> *mut Xloper12 {
             guarded(|| dispatch(&[f, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10], $run))
         }
@@ -106,7 +115,9 @@ pub extern "system" fn LuaStatus() -> *mut Xloper12 {
         };
         let s = with_runtime(|rt| match rt.state(&wb) {
             Book::NoScripts => "no Lua scripts".to_owned(),
-            Book::Blocked { scripts, .. } => format!("{scripts} script(s) DISABLED - click Enable Lua"),
+            Book::Blocked { scripts, .. } => {
+                format!("{scripts} script(s) DISABLED - click Enable Lua")
+            }
             Book::Active { .. } => "Lua enabled".to_owned(),
             Book::Failed { message, .. } => format!("Lua failed to load: {message}"),
         });
@@ -154,18 +165,40 @@ fn register_all() -> bool {
         return false;
     }
     for f in &FUNCTIONS {
-        let bufs: Vec<Vec<u16>> =
-            [f.proc_name, f.type_text, f.excel_name, f.arg_text, "Lua", f.help].iter().map(|s| counted_utf16(s)).collect();
+        let bufs: Vec<Vec<u16>> = [
+            f.proc_name,
+            f.type_text,
+            f.excel_name,
+            f.arg_text,
+            "Lua",
+            f.help,
+        ]
+        .iter()
+        .map(|s| counted_utf16(s))
+        .collect();
         let mut s: Vec<Xloper12> = bufs.iter().map(|b| Xloper12::borrowed_str(b)).collect();
         // xlfRegister(dll, procedure, type, name, args, macroType=1, category, shortcut, helpTopic, help)
         let mut macro_type = Xloper12::int(1);
         let (mut shortcut, mut topic) = (Xloper12::missing(), Xloper12::missing());
-        let [proc_, ty, name, args, cat, help] = &mut s[..] else { unreachable!() };
+        let [proc_, ty, name, args, cat, help] = &mut s[..] else {
+            unreachable!()
+        };
         let mut res = Xloper12::nil();
         let rc = excel12(
             xlfRegister,
             Some(&mut res),
-            &mut [&mut dll, proc_, ty, name, args, &mut macro_type, cat, &mut shortcut, &mut topic, help],
+            &mut [
+                &mut dll,
+                proc_,
+                ty,
+                name,
+                args,
+                &mut macro_type,
+                cat,
+                &mut shortcut,
+                &mut topic,
+                help,
+            ],
         );
         free(&mut res);
         if rc != xlretSuccess {

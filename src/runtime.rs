@@ -54,7 +54,10 @@ pub struct Runtime {
 
 impl Runtime {
     pub fn new(trust: TrustStore) -> Self {
-        Runtime { trust, books: HashMap::new() }
+        Runtime {
+            trust,
+            books: HashMap::new(),
+        }
     }
 
     /// Current state for a workbook, (re)reading it from disk if the file changed.
@@ -79,13 +82,16 @@ impl Runtime {
         };
         let digest = scripts.digest();
         // A save by Excel changes the mtime but not the scripts: keep the live Lua state.
-        if let Some(Book::Active { digest: d, host }) = previous {
-            if d == digest {
-                return Book::Active { digest, host };
-            }
+        if let Some(Book::Active { digest: d, host }) = previous
+            && d == digest
+        {
+            return Book::Active { digest, host };
         }
         if !self.trust.is_trusted(workbook, &digest) {
-            return Book::Blocked { digest, scripts: scripts.scripts.len() };
+            return Book::Blocked {
+                digest,
+                scripts: scripts.scripts.len(),
+            };
         }
         activate(workbook, &scripts, digest)
     }
@@ -99,15 +105,31 @@ impl Runtime {
         };
         self.trust.trust(workbook, &digest)?;
         let mtime = std::fs::metadata(workbook).and_then(|m| m.modified()).ok();
-        self.books.insert(key, Entry { mtime, book: activate(workbook, &scripts, digest) });
+        self.books.insert(
+            key,
+            Entry {
+                mtime,
+                book: activate(workbook, &scripts, digest),
+            },
+        );
         Ok(())
     }
 
-    pub fn call(&mut self, workbook: Option<&Path>, func: &str, args: &[Value]) -> Result<Value, CallError> {
+    pub fn call(
+        &mut self,
+        workbook: Option<&Path>,
+        func: &str,
+        args: &[Value],
+    ) -> Result<Value, CallError> {
         Ok(self.active(workbook)?.call(func, args)?)
     }
 
-    pub fn eval(&mut self, workbook: Option<&Path>, code: &str, args: &[Value]) -> Result<Value, CallError> {
+    pub fn eval(
+        &mut self,
+        workbook: Option<&Path>,
+        code: &str,
+        args: &[Value],
+    ) -> Result<Value, CallError> {
         Ok(self.active(workbook)?.eval(code, args)?)
     }
 
@@ -132,7 +154,10 @@ impl Runtime {
 fn activate(workbook: &Path, scripts: &ScriptSet, digest: String) -> Book {
     match LuaHost::new(scripts, &HostContext { workbook }) {
         Ok(host) => Book::Active { digest, host },
-        Err(e) => Book::Failed { digest, message: e.to_string() },
+        Err(e) => Book::Failed {
+            digest,
+            message: e.to_string(),
+        },
     }
 }
 
@@ -157,7 +182,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (base, wb) = (dir.path().join("base.xlsx"), dir.path().join("book.xlsx"));
         minimal_xlsx(&base);
-        let set = ScriptSet { scripts: vec![Script { name: "main".into(), code: code.into() }] };
+        let set = ScriptSet {
+            scripts: vec![Script {
+                name: "main".into(),
+                code: code.into(),
+            }],
+        };
         embed_scripts(&base, &wb, &set).unwrap();
         (dir, wb)
     }
@@ -173,7 +203,10 @@ mod tests {
         let (_d, wb) = workbook_with(&code);
         let mut rt = Runtime::new(TrustStore::ephemeral());
 
-        assert!(matches!(rt.call(Some(&wb), "one", &[]), Err(CallError::Blocked)));
+        assert!(matches!(
+            rt.call(Some(&wb), "one", &[]),
+            Err(CallError::Blocked)
+        ));
         assert!(rt.is_blocked(&wb).is_some());
         assert!(!marker.exists(), "Lua ran while the workbook was untrusted");
 
@@ -190,12 +223,20 @@ mod tests {
         assert!(rt.call(Some(&wb), "one", &[]).is_ok());
 
         let edited = d.path().join("edited.xlsx");
-        let set = ScriptSet { scripts: vec![Script { name: "main".into(), code: "function one() return 2 end".into() }] };
+        let set = ScriptSet {
+            scripts: vec![Script {
+                name: "main".into(),
+                code: "function one() return 2 end".into(),
+            }],
+        };
         embed_scripts(&wb, &edited, &set).unwrap();
         std::fs::copy(&edited, &wb).unwrap();
         // mtime granularity can hide the change on fast filesystems; force a fresh read.
         rt.books.clear();
-        assert!(matches!(rt.call(Some(&wb), "one", &[]), Err(CallError::Blocked)));
+        assert!(matches!(
+            rt.call(Some(&wb), "one", &[]),
+            Err(CallError::Blocked)
+        ));
     }
 
     #[test]
@@ -204,7 +245,10 @@ mod tests {
         let wb = dir.path().join("plain.xlsx");
         minimal_xlsx(&wb);
         let mut rt = Runtime::new(TrustStore::ephemeral());
-        assert!(matches!(rt.call(Some(&wb), "f", &[]), Err(CallError::NoScripts)));
+        assert!(matches!(
+            rt.call(Some(&wb), "f", &[]),
+            Err(CallError::NoScripts)
+        ));
         assert!(matches!(rt.call(None, "f", &[]), Err(CallError::NoPath)));
     }
 
@@ -215,6 +259,9 @@ mod tests {
             Some(PathBuf::from(r"C:\Users\me\Book1.xlsx"))
         );
         assert_eq!(workbook_path_from_cell_filename(""), None);
-        assert_eq!(workbook_path_from_cell_filename("https://x/y/[a.xlsx]S"), None);
+        assert_eq!(
+            workbook_path_from_cell_filename("https://x/y/[a.xlsx]S"),
+            None
+        );
     }
 }

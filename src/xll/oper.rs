@@ -21,11 +21,15 @@ pub unsafe fn to_value(p: *const Xloper12) -> Value {
         xltypeInt => Value::Num(unsafe { x.val.w } as f64),
         xltypeStr => Value::Str(unsafe { read_counted(x.val.str_) }),
         xltypeBool => Value::Bool(unsafe { x.val.xbool } != 0),
-        xltypeErr => Value::Err(ErrorCode::from_xl_code(unsafe { x.val.err }).unwrap_or(ErrorCode::Value)),
+        xltypeErr => {
+            Value::Err(ErrorCode::from_xl_code(unsafe { x.val.err }).unwrap_or(ErrorCode::Value))
+        }
         xltypeMulti => {
             let a = unsafe { x.val.array };
             let (rows, cols) = (a.rows.max(0) as usize, a.columns.max(0) as usize);
-            let data = (0..rows * cols).map(|i| unsafe { to_value(a.lparray.add(i)) }).collect();
+            let data = (0..rows * cols)
+                .map(|i| unsafe { to_value(a.lparray.add(i)) })
+                .collect();
             Value::Array(Array::new(rows, cols, data))
         }
         xltypeSRef | xltypeRef => {
@@ -90,7 +94,11 @@ fn fill(v: &Value) -> Xloper12 {
                 })
                 .collect();
             let ptr = Box::into_raw(cells.into_boxed_slice()) as *mut Xloper12;
-            out.val.array = MultiArray { lparray: ptr, rows: a.rows as i32, columns: a.cols as i32 };
+            out.val.array = MultiArray {
+                lparray: ptr,
+                rows: a.rows as i32,
+                columns: a.cols as i32,
+            };
             out.xltype = xltypeMulti;
         }
     }

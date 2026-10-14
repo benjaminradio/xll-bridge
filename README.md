@@ -63,3 +63,15 @@ cells are `nil` (`xl.EMPTY` inside arrays), errors are `xl.NA`, `xl.VALUE`, `xl.
 * x64 only.
 
 [mlua]: https://github.com/mlua-rs/mlua
+
+## CI and releases
+
+* `.github/workflows/ci.yml` — on every push/PR: fmt, clippy (`-D warnings`) and tests on Linux; clippy,
+  tests and a release build on Windows x64 (MSVC). The Windows job uploads an artifact
+  **`xll-bridge-windows-x64`** containing `xll-bridge.xll`, `xllb-pack.exe`, a ready-to-open
+  `demo.xlsx` with embedded Lua, `demo.lua`, and `SHA256SUMS.txt`.
+* `.github/workflows/release.yml` — pushing a tag like `v0.1.0` runs the same build and publishes a
+  GitHub release with a zip of that artifact.
+
+To test: download the artifact, open Excel, load `xll-bridge.xll` (File ▸ Options ▸ Add-ins ▸ Go ▸
+Browse; you may need to right-click the file ▸ Properties ▸ Unblock), then open `demo.xlsx`.

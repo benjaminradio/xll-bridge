@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+    tags-ignore: ["v*"] # release.yml calls this workflow for tags
+  pull_request:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Lint and test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  windows:
+    name: Build and test (Windows x64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (includes the Excel/Win32 layer)
+        run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release --locked
+      - name: Assemble package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp target/release/xll_bridge.dll dist/xll-bridge.xll
+          cp target/release/xllb-pack.exe dist/
+          cp examples/demo.lua dist/
+          python -m pip install --quiet openpyxl
+          python examples/make_demo_workbook.py dist/demo-plain.xlsx
+          ./dist/xllb-pack.exe embed dist/demo-plain.xlsx dist/demo.xlsx examples/demo.lua
+          rm dist/demo-plain.xlsx
+          cp README.md dist/
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+          ls -l dist
+      - name: Check exports
+        shell: pwsh
+        run: |
+          # Export names are stored as plain ASCII in the PE export table.
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("dist/xll-bridge.xll"))
+          foreach ($n in 'xlAutoOpen','xlAutoClose','xlAutoFree12','xlAddInManagerInfo12','LuaCall','LuaEval','LuaStatus') {
+            if (-not $text.Contains($n)) { throw "missing export $n" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: xll-bridge-windows-x64
+          path: dist/
+          if-no-files-found: error

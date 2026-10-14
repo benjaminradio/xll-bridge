@@ -32,7 +32,10 @@ pub fn normalize_path(p: &Path) -> String {
 impl TrustStore {
     /// In-memory only; nothing persists. Used by tests.
     pub fn ephemeral() -> Self {
-        TrustStore { path: None, entries: Vec::new() }
+        TrustStore {
+            path: None,
+            entries: Vec::new(),
+        }
     }
 
     /// `%APPDATA%\xll-bridge\trust.json` (or `$XDG_CONFIG_HOME`/`~/.config` off Windows).
@@ -51,29 +54,41 @@ impl TrustStore {
             .and_then(|b| serde_json::from_slice::<Disk>(&b).ok())
             .map(|d| d.trusted)
             .unwrap_or_default();
-        TrustStore { path: Some(path), entries }
+        TrustStore {
+            path: Some(path),
+            entries,
+        }
     }
 
     pub fn is_trusted(&self, workbook: &Path, digest: &str) -> bool {
         let key = normalize_path(workbook);
-        self.entries.iter().any(|e| e.workbook == key && e.digest == digest)
+        self.entries
+            .iter()
+            .any(|e| e.workbook == key && e.digest == digest)
     }
 
     /// Trusts this exact script set, replacing any earlier digest for the same workbook.
     pub fn trust(&mut self, workbook: &Path, digest: &str) -> std::io::Result<()> {
         let key = normalize_path(workbook);
         self.entries.retain(|e| e.workbook != key);
-        self.entries.push(Entry { workbook: key, digest: digest.to_owned() });
+        self.entries.push(Entry {
+            workbook: key,
+            digest: digest.to_owned(),
+        });
         self.save()
     }
 
     fn save(&self) -> std::io::Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let json = serde_json::to_vec_pretty(&Disk { trusted: self.entries.clone() })
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_vec_pretty(&Disk {
+            trusted: self.entries.clone(),
+        })
+        .map_err(std::io::Error::other)?;
         // Write-then-rename so a crash can't leave a truncated (hence empty = untrusted) file.
         let tmp = path.with_extension("json.tmp");
         std::fs::write(&tmp, json)?;
@@ -92,7 +107,10 @@ mod tests {
         assert!(!t.is_trusted(wb, "aa"));
         t.trust(wb, "aa").unwrap();
         assert!(t.is_trusted(Path::new(r"c:/work/book.XLSX"), "aa"));
-        assert!(!t.is_trusted(wb, "bb"), "edited scripts must not stay trusted");
+        assert!(
+            !t.is_trusted(wb, "bb"),
+            "edited scripts must not stay trusted"
+        );
         assert!(!t.is_trusted(Path::new(r"C:\Other\Book.xlsx"), "aa"));
         t.trust(wb, "bb").unwrap();
         assert!(!t.is_trusted(wb, "aa"), "new digest replaces the old one");

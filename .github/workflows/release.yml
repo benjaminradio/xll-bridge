@@ -1,0 +1,34 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: xll-bridge-windows-x64
+          path: dist
+      - name: Zip and release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          zip -j "xll-bridge-${TAG}-windows-x64.zip" dist/*
+          sha256sum "xll-bridge-${TAG}-windows-x64.zip" > "xll-bridge-${TAG}-windows-x64.zip.sha256"
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --generate-notes \
+            "xll-bridge-${TAG}-windows-x64.zip" "xll-bridge-${TAG}-windows-x64.zip.sha256"

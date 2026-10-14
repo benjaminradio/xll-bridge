@@ -11,7 +11,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Gdi::{
-    ClientToScreen, CreateSolidBrush, DEFAULT_GUI_FONT, GetStockObject, HBRUSH, HDC, SetBkColor, SetTextColor,
+    ClientToScreen, CreateSolidBrush, DEFAULT_GUI_FONT, GetStockObject, HBRUSH, HDC, SetBkColor,
+    SetTextColor,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
@@ -50,13 +51,20 @@ fn wide(s: &str) -> Vec<u16> {
 
 fn excel_hwnd() -> Option<HWND> {
     let mut out = Xloper12::nil();
-    (excel12(xlGetHwnd, Some(&mut out), &mut []) == xlretSuccess)
-        .then(|| unsafe { out.val.w } as u32 as usize as HWND)
+    if excel12(xlGetHwnd, Some(&mut out), &mut []) != xlretSuccess {
+        return None;
+    }
+    // Excel returns the HWND as a 32-bit integer.
+    Some(unsafe { out.val.w } as u32 as usize as HWND)
 }
 
 /// Shows (or keeps) the bar for `workbook`. No-op if it is already showing for it.
 pub fn show(workbook: &Path, scripts: usize) {
-    if STATE.with(|s| s.borrow().as_ref().is_some_and(|st| st.workbook == workbook)) {
+    if STATE.with(|s| {
+        s.borrow()
+            .as_ref()
+            .is_some_and(|st| st.workbook == workbook)
+    }) {
         return;
     }
     dismiss();
@@ -102,12 +110,33 @@ pub fn show(workbook: &Path, scripts: usize) {
             "SECURITY WARNING   {scripts} Lua script(s) in this workbook have been disabled."
         );
         let label = child(bar, "STATIC", &text, SS_CENTERIMAGE, 0, hinst);
-        let enable = child(bar, "BUTTON", "Enable Lua", BS_PUSHBUTTON as u32, ID_ENABLE, hinst);
-        let dismiss = child(bar, "BUTTON", "\u{2715}", BS_PUSHBUTTON as u32, ID_DISMISS, hinst);
+        let enable = child(
+            bar,
+            "BUTTON",
+            "Enable Lua",
+            BS_PUSHBUTTON as u32,
+            ID_ENABLE,
+            hinst,
+        );
+        let dismiss = child(
+            bar,
+            "BUTTON",
+            "\u{2715}",
+            BS_PUSHBUTTON as u32,
+            ID_DISMISS,
+            hinst,
+        );
         for h in [label, enable, dismiss] {
             SendMessageW(h, WM_SETFONT, font as WPARAM, 1);
         }
-        STATE.with(|s| *s.borrow_mut() = Some(State { bar, label, owner, workbook: workbook.to_path_buf() }));
+        STATE.with(|s| {
+            *s.borrow_mut() = Some(State {
+                bar,
+                label,
+                owner,
+                workbook: workbook.to_path_buf(),
+            })
+        });
         SetTimer(bar, TIMER_TRACK, 250, None);
         reposition();
     }
@@ -123,7 +152,14 @@ pub fn dismiss() {
     }
 }
 
-unsafe fn child(parent: HWND, class: &str, text: &str, style: u32, id: isize, hinst: *mut core::ffi::c_void) -> HWND {
+unsafe fn child(
+    parent: HWND,
+    class: &str,
+    text: &str,
+    style: u32,
+    id: isize,
+    hinst: *mut core::ffi::c_void,
+) -> HWND {
     let (c, t) = (wide(class), wide(text));
     unsafe {
         CreateWindowExW(
@@ -165,20 +201,54 @@ fn reposition() {
             }
             let dpi = GetDpiForWindow(st.owner).max(96) as i32;
             let scale = |v: i32| v * dpi / 96;
-            let mut client = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut client = RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
             GetClientRect(st.owner, &mut client);
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(st.owner, &mut origin);
             let (w, h) = (client.right - client.left, scale(BAR_HEIGHT));
-            SetWindowPos(st.bar, std::ptr::null_mut(), origin.x, origin.y + scale(BELOW_RIBBON), w, h, SWP_NOACTIVATE | SWP_NOZORDER);
+            SetWindowPos(
+                st.bar,
+                std::ptr::null_mut(),
+                origin.x,
+                origin.y + scale(BELOW_RIBBON),
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            );
 
             let (btn_w, pad) = (scale(100), scale(8));
             let enable = GetDlgItem(st.bar, ID_ENABLE as i32);
             let dismiss = GetDlgItem(st.bar, ID_DISMISS as i32);
             let dismiss_w = scale(30);
-            MoveWindow(dismiss, w - dismiss_w - pad, scale(4), dismiss_w, h - scale(8), 1);
-            MoveWindow(enable, w - dismiss_w - btn_w - 2 * pad, scale(4), btn_w, h - scale(8), 1);
-            MoveWindow(st.label, pad, 0, (w - dismiss_w - btn_w - 4 * pad).max(0), h, 1);
+            MoveWindow(
+                dismiss,
+                w - dismiss_w - pad,
+                scale(4),
+                dismiss_w,
+                h - scale(8),
+                1,
+            );
+            MoveWindow(
+                enable,
+                w - dismiss_w - btn_w - 2 * pad,
+                scale(4),
+                btn_w,
+                h - scale(8),
+                1,
+            );
+            MoveWindow(
+                st.label,
+                pad,
+                0,
+                (w - dismiss_w - btn_w - 4 * pad).max(0),
+                h,
+                1,
+            );
         }
     });
 }
@@ -219,7 +289,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
 
 fn on_enable() {
     let Some((wb, label, enable)) = STATE.with(|s| {
-        s.borrow().as_ref().map(|st| (st.workbook.clone(), st.label, unsafe { GetDlgItem(st.bar, ID_ENABLE as i32) }))
+        s.borrow().as_ref().map(|st| {
+            (st.workbook.clone(), st.label, unsafe {
+                GetDlgItem(st.bar, ID_ENABLE as i32)
+            })
+        })
     }) else {
         return;
     };

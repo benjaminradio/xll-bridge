@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
 
 pub type RW = i32;
+#[allow(clippy::upper_case_acronyms)]
 pub type COL = i32;
 
 #[repr(C)]
@@ -96,8 +97,12 @@ pub const xlcCalculateDocument: i32 = 167 | xlCommand;
 
 pub const xlerrNA: i32 = 42;
 
-type MdCallBack12 =
-    unsafe extern "system" fn(xlfn: i32, coper: i32, args: *const *mut Xloper12, res: *mut Xloper12) -> i32;
+type MdCallBack12 = unsafe extern "system" fn(
+    xlfn: i32,
+    coper: i32,
+    args: *const *mut Xloper12,
+    res: *mut Xloper12,
+) -> i32;
 
 static ENTRY: AtomicUsize = AtomicUsize::new(0);
 
@@ -118,17 +123,26 @@ fn entry() -> Option<MdCallBack12> {
 
 impl Xloper12 {
     pub fn nil() -> Self {
-        Xloper12 { val: XlVal { _pad: [0; 3] }, xltype: xltypeNil }
+        Xloper12 {
+            val: XlVal { _pad: [0; 3] },
+            xltype: xltypeNil,
+        }
     }
 
     pub fn missing() -> Self {
-        Xloper12 { val: XlVal { _pad: [0; 3] }, xltype: xltypeMissing }
+        Xloper12 {
+            val: XlVal { _pad: [0; 3] },
+            xltype: xltypeMissing,
+        }
     }
 
     pub fn int(w: i32) -> Self {
         let mut v = XlVal { _pad: [0; 3] };
         v.w = w;
-        Xloper12 { val: v, xltype: xltypeInt }
+        Xloper12 {
+            val: v,
+            xltype: xltypeInt,
+        }
     }
 
     pub fn base_type(&self) -> u32 {
@@ -140,7 +154,10 @@ impl Xloper12 {
     pub fn borrowed_str(buf: &[u16]) -> Self {
         let mut v = XlVal { _pad: [0; 3] };
         v.str_ = buf.as_ptr() as *mut u16;
-        Xloper12 { val: v, xltype: xltypeStr }
+        Xloper12 {
+            val: v,
+            xltype: xltypeStr,
+        }
     }
 }
 
