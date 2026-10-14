@@ -1,0 +1,40 @@
+[package]
+name = "xll-bridge"
+version = "0.1.0"
+edition = "2024"
+description = "Excel XLL add-in exposing Lua for UDFs and data manipulation"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# cdylib is the .xll (a renamed DLL); rlib lets the packer CLI and tests link the core.
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "xllb-pack"
+path = "src/bin/xllb-pack.rs"
+
+[dependencies]
+mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
+quick-xml = "0.42.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+thiserror = "2.0.21"
+zip = { version = "9.0.3", default-features = false, features = ["deflate"] }
+
+[target."cfg(windows)".dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "unwind" # panics are caught at the FFI boundary; abort would take Excel down
