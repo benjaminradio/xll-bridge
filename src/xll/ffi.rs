@@ -39,6 +39,20 @@ pub struct MultiArray {
     pub columns: COL,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct XlmRef12 {
+    pub count: u16,
+    pub reftbl: [XlRef12; 1],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct MRef {
+    pub lpmref: *mut XlmRef12,
+    pub id_sheet: usize,
+}
+
 /// `val` union. `_pad` pins the size/alignment to the SDK's 24 bytes (its `flow` and
 /// `bigdata` members are never read here).
 #[repr(C)]
@@ -50,6 +64,7 @@ pub union XlVal {
     pub err: i32,
     pub w: i32,
     pub sref: SRef,
+    pub mref: MRef,
     pub array: MultiArray,
     _pad: [u64; 3],
 }
@@ -123,6 +138,28 @@ fn entry() -> Option<MdCallBack12> {
 }
 
 impl Xloper12 {
+    /// Top-left cell (0-based row, column) of a reference operand such as `xlfCaller`'s result.
+    pub fn first_cell(&self) -> Option<(u32, u32)> {
+        // SAFETY: the union member read matches the operand's type tag.
+        unsafe {
+            match self.base_type() {
+                xltypeSRef => {
+                    let r = self.val.sref.reference;
+                    Some((r.rw_first.max(0) as u32, r.col_first.max(0) as u32))
+                }
+                xltypeRef => {
+                    let m = self.val.mref.lpmref;
+                    if m.is_null() || (*m).count == 0 {
+                        return None;
+                    }
+                    let r = (*m).reftbl[0];
+                    Some((r.rw_first.max(0) as u32, r.col_first.max(0) as u32))
+                }
+                _ => None,
+            }
+        }
+    }
+
     pub fn nil() -> Self {
         Xloper12 {
             val: XlVal { _pad: [0; 3] },

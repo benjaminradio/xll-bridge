@@ -63,7 +63,36 @@ Open the `.xll` in Excel (File ▸ Options ▸ Add-ins ▸ Go ▸ Browse), open 
 =LUA.CALL("add", A1, B1)         calls global function add(a, b) from the embedded scripts
 =LUA.EVAL("... * 2", A1)         evaluates an expression/chunk; args arrive as ...
 =LUA.STATUS()                    none / disabled / enabled
+=LUA.ASYNC("slow", A1)           like LUA.CALL, but in the background (see below)
 ```
+
+### Slow calls: `LUA.ASYNC`
+
+`LUA.CALL` runs on Excel's UI thread, so a slow function (a web request, an external program) freezes
+Excel while it runs. `=LUA.ASYNC("name", args…)` runs it on a background worker instead: the cell shows
+`#GETTING_DATA` (what Excel's own async functions show) and fills in when the result arrives, with only
+the waiting cells recalculated. Excel stays usable throughout.
+
+* Each worker has its **own Lua state**, built from the workbook's enabled files: globals set by one call
+  are not visible to `LUA.CALL` or to other workers. Pass what a function needs as arguments.
+* Results are **cached** per function, arguments and script version, so recalculating does not re-run a
+  slow call. They are re-run when the arguments or scripts change, or with **Re-run async** on the Lua tab.
+* Every call has a 120 s limit and is cancelled when re-run or when the workbook closes (a Lua loop is
+  interrupted; an external program started with `xl.run` is killed at its own timeout).
+* In manual calculation mode finished cells are marked dirty and appear on the next F9.
+* Blocked/untrusted workbooks behave as for `LUA.CALL`: nothing runs.
+
+### Running programs from Lua
+
+```lua
+local r = xl.run{ "git", "status", "--short", cwd = "C:\\work\\repo", timeout = 10 }
+-- r = { code, stdout, stderr, ok, timed_out, truncated } ; or nil, "message" if it could not start
+local s = xl.shell("dir /b | find \".lua\"", { timeout = 5 })   -- through cmd /C (sh -c elsewhere)
+```
+
+Output is captured (32 MB cap per stream), `stdin = "text"` is supported, and `timeout` (seconds, default 60)
+really kills the process (and its children on Windows). No console window appears. These exist only in
+enabled workbooks; the sandbox used by `LUA.EVAL` in other workbooks has no way to start programs.
 
 ### The embedded file tree
 
@@ -158,8 +187,8 @@ Nothing is written at start-up; the `%APPDATA%\xll-bridge` folder appears only w
   ActiveX host). Keystrokes typed into it (rename, new folder) depend on Excel passing them through; if
   that misbehaves on your Excel, use **Float**. There is no in-panel text editor yet: export, edit, and
   add the file again.
-* Not yet implemented: reading arbitrary ranges/cells from Lua (`xl.range`), writing back, async/RTD
-  for long-running external programs, a process-spawn helper with timeouts, a "revoke trust" action.
+* Not yet implemented: reading arbitrary ranges/cells from Lua (`xl.range`), writing back, streaming
+  (RTD) results, a "revoke trust" action.
 * x64 only.
 
 [mlua]: https://github.com/mlua-rs/mlua

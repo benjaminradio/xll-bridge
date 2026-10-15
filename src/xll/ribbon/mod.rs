@@ -51,6 +51,9 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
                   getLabel="GetLabel" getImage="GetImage"
                   getScreentip="GetScreentip" getSupertip="GetSupertip"
                   onAction="OnStatusClick"/>
+          <button id="btnLuaRefresh" size="large" label="Re-run async" imageMso="RefreshAll"
+                  screentip="Re-run async functions" supertip="Throw away the cached results of LUA.ASYNC in the active workbook and run those calls again."
+                  onAction="OnRefreshClick"/>
           <button id="btnLuaFiles" size="large" label="Files" imageMso="FileOpen"
                   screentip="Lua files" supertip="Show or hide the panel that lists the files embedded in this workbook, with add, delete, rename, import and export."
                   onAction="OnFilesClick"/>
@@ -61,7 +64,7 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
 </customUI>"#;
 
 // IDispatch ids for the ribbon callbacks (names must match RIBBON_XML).
-const CALLBACKS: [(&str, i32); 7] = [
+const CALLBACKS: [(&str, i32); 8] = [
     ("OnRibbonLoad", 1),
     ("GetLabel", 2),
     ("GetScreentip", 3),
@@ -69,6 +72,7 @@ const CALLBACKS: [(&str, i32); 7] = [
     ("GetImage", 5),
     ("OnStatusClick", 6),
     ("OnFilesClick", 7),
+    ("OnRefreshClick", 8),
 ];
 
 #[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
@@ -110,6 +114,87 @@ struct Books {
     /// Cells of a newly seen workbook with embedded files may have been calculated before we
     /// could tell them where it lives; recalculate once when it appears.
     recalc_pending: bool,
+}
+
+// Cells waiting to be marked dirty and recalculated because a background call finished, with
+// the number of failed attempts (Excel refuses COM calls while it is busy or editing a cell).
+thread_local! {
+    static DIRTY: RefCell<Vec<(crate::jobs::CellRef, u8)>> = const { RefCell::new(Vec::new()) };
+}
+
+const MAX_DIRTY_ATTEMPTS: u8 = 50;
+const XL_CALCULATION_AUTOMATIC: i32 = -4105;
+
+fn dirty_cell(app: &IDispatch, c: &crate::jobs::CellRef) -> bool {
+    let attempt = || -> Result<()> {
+        let books = IDispatch::try_from(&dispatch::get(app, "Workbooks")?)?;
+        let wb = IDispatch::try_from(&dispatch::get_with(
+            &books,
+            "Item",
+            &[VARIANT::from(c.book.as_str())],
+        )?)?;
+        let sheets = IDispatch::try_from(&dispatch::get(&wb, "Worksheets")?)?;
+        let ws = IDispatch::try_from(&dispatch::get_with(
+            &sheets,
+            "Item",
+            &[VARIANT::from(c.sheet.as_str())],
+        )?)?;
+        let range = IDispatch::try_from(&dispatch::get_with(
+            &ws,
+            "Range",
+            &[VARIANT::from(c.a1().as_str())],
+        )?)?;
+        dispatch::call(&range, "Dirty", &[]).map(drop)
+    };
+    attempt().is_ok()
+}
+
+/// Recalculates the cells whose background calls have finished (or were asked to re-run).
+fn pump_async(app: &IDispatch) {
+    let fresh = crate::jobs::global().take_completed();
+    DIRTY.with(|d| d.borrow_mut().extend(fresh.into_iter().map(|c| (c, 0))));
+    let waiting = DIRTY.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    if waiting.is_empty() {
+        return;
+    }
+    let mut retry = Vec::new();
+    let mut marked = false;
+    for (cell, attempts) in waiting {
+        if dirty_cell(app, &cell) {
+            marked = true;
+        } else if attempts < MAX_DIRTY_ATTEMPTS {
+            retry.push((cell, attempts + 1));
+        }
+    }
+    DIRTY.with(|d| d.borrow_mut().extend(retry));
+    // In manual calculation mode the cells are only marked; F9 picks them up.
+    let automatic = dispatch::get(app, "Calculation")
+        .ok()
+        .and_then(|v| i32::try_from(&v).ok())
+        == Some(XL_CALCULATION_AUTOMATIC);
+    if marked && automatic {
+        let _ = dispatch::call(app, "Calculate", &[]);
+    }
+}
+
+/// The "Re-run async" button: forget this workbook's cached background results and run them again.
+fn refresh_async(app: &IDispatch) {
+    let (path, _) = current();
+    let cells = path
+        .as_deref()
+        .map(|p| crate::jobs::global().refresh_workbook(p))
+        .unwrap_or_default();
+    if cells.is_empty() {
+        message(
+            excel_hwnd(app),
+            "This workbook has no background (LUA.ASYNC) results to re-run.",
+            "Lua",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    }
+    DIRTY.with(|d| d.borrow_mut().extend(cells.into_iter().map(|c| (c, 0))));
+    pump_async(app);
 }
 
 const BOOKS_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
@@ -172,6 +257,18 @@ fn refresh_books(app: &IDispatch) {
                 .map(|(_, p)| p.clone())
                 .collect()
         });
+        // Workbooks that were closed: their background results are of no use any more.
+        let vanished: Vec<PathBuf> = BOOKS.with(|b| {
+            let b = b.borrow();
+            b.by_name
+                .iter()
+                .filter(|(k, _)| !map.contains_key(*k))
+                .map(|(_, p)| p.clone())
+                .collect()
+        });
+        for gone in &vanished {
+            crate::jobs::global().forget_workbook(gone);
+        }
         let has_files = appeared
             .iter()
             .any(|p| with_runtime(|rt| !matches!(rt.status(p), Status::NoScripts)));
@@ -249,6 +346,7 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
         }
         if let Some(app) = app() {
             refresh_books(&app);
+            pump_async(&app);
             pane::tick(&app);
         }
     }));
@@ -441,6 +539,12 @@ impl IDispatch_Impl for Addin_Impl {
                     let pic = icon::picture(current().1.light)?;
                     ret(VARIANT::from(pic), result, params);
                 }
+                8 => {
+                    crate::log::note("ribbon: Re-run async clicked");
+                    if let Some(app) = app() {
+                        refresh_async(&app);
+                    }
+                }
                 6 => {
                     crate::log::note("ribbon: status button clicked");
                     on_click()
@@ -591,7 +695,7 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 7,
+            checked, 8,
             "onLoad + 5 on the status button + 1 on the files button"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));

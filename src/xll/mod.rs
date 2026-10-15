@@ -17,6 +17,7 @@ use std::path::PathBuf;
 
 use ffi::*;
 
+use crate::jobs::{self, CellRef, JobSpec, Poll};
 use crate::runtime::{
     CallError, Runtime, Status, workbook_name_from_sheet_name, workbook_path_from_cell_filename,
 };
@@ -43,17 +44,27 @@ pub(crate) fn with_runtime<R>(f: impl FnOnce(&mut Runtime) -> R) -> R {
 ///
 /// On failure the `Err` explains what was seen, for the cell and for `addin.log`.
 fn locate_caller() -> Result<PathBuf, String> {
+    locate_caller_cell().0
+}
+
+/// [`locate_caller`] plus the calling cell itself, which background calls need in order to be
+/// recalculated when they finish.
+fn locate_caller_cell() -> (Result<PathBuf, String>, Option<CellRef>) {
     let mut caller = Xloper12::nil();
     let rc = excel12(xlfCaller, Some(&mut caller), &mut []);
     if rc != xlretSuccess {
-        return Err(format!("not called from a cell (xlfCaller returned {rc})"));
+        return (
+            Err(format!("not called from a cell (xlfCaller returned {rc})")),
+            None,
+        );
     }
-    let result = locate_from(&mut caller);
+    let mut cell = None;
+    let result = locate_from(&mut caller, &mut cell);
     free(&mut caller);
-    result
+    (result, cell)
 }
 
-fn locate_from(caller: &mut Xloper12) -> Result<PathBuf, String> {
+fn locate_from(caller: &mut Xloper12, cell_out: &mut Option<CellRef>) -> Result<PathBuf, String> {
     let string_result = |rc: i32, out: &Xloper12| {
         (rc == xlretSuccess && out.base_type() == xltypeStr)
             .then(|| unsafe { read_counted(out.val.str_) })
@@ -66,6 +77,20 @@ fn locate_from(caller: &mut Xloper12) -> Result<PathBuf, String> {
     let book = sheet_name
         .as_deref()
         .and_then(workbook_name_from_sheet_name);
+    if let (Some(book), Some(sheet), Some((row, col))) = (
+        book.as_deref(),
+        sheet_name
+            .as_deref()
+            .and_then(|s| s.split_once(']').map(|(_, sh)| sh)),
+        caller.first_cell(),
+    ) {
+        *cell_out = Some(CellRef {
+            book: book.to_owned(),
+            sheet: sheet.to_owned(),
+            row,
+            col,
+        });
+    }
     if let Some(path) = book.as_deref().and_then(ribbon::workbook_path_by_name) {
         return Ok(path);
     }
@@ -153,6 +178,56 @@ macro_rules! udf {
 udf!(LuaCall, |rt, wb, name, args| rt.call(wb, name, args));
 udf!(LuaEval, |rt, wb, code, args| rt.eval(wb, code, args));
 
+/// `LUA.ASYNC(function, args...)`: runs the function on a background worker. The cell shows
+/// `#GETTING_DATA` until the result arrives; Excel is never blocked.
+fn async_dispatch(args: &[*const Xloper12]) -> Value {
+    // SAFETY: Excel passes valid operands (or null/missing) for every registered argument.
+    let vals = unsafe { oper::collect_args(args) };
+    let Some(Value::Str(func)) = vals.first().cloned() else {
+        return Value::Str("#LUA: first argument must be text".into());
+    };
+    let (located, cell) = locate_caller_cell();
+    let workbook = located.as_deref().ok();
+    let files = with_runtime(|rt| rt.enabled_files(workbook));
+    let (bundle, digest) = match (files, &located) {
+        (Ok(f), _) => f,
+        (Err(CallError::NoPath), Err(detail)) => return Value::Str(format!("#NOPATH: {detail}")),
+        (Err(e), _) => return error_text(&e),
+    };
+    let spec = JobSpec {
+        workbook: located.expect("enabled_files succeeded, so the path is known"),
+        digest,
+        bundle,
+        func,
+        args: vals[1..].to_vec(),
+        caller: cell,
+        timeout: jobs::DEFAULT_JOB_TIMEOUT,
+    };
+    match jobs::global().poll_or_start(spec) {
+        Poll::Pending => Value::Err(crate::value::ErrorCode::GettingData),
+        Poll::Ready(Ok(v)) => v,
+        Poll::Ready(Err(m)) => Value::Str(format!("#LUA: {m}")),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn LuaAsync(
+    f: *const Xloper12,
+    a1: *const Xloper12,
+    a2: *const Xloper12,
+    a3: *const Xloper12,
+    a4: *const Xloper12,
+    a5: *const Xloper12,
+    a6: *const Xloper12,
+    a7: *const Xloper12,
+    a8: *const Xloper12,
+    a9: *const Xloper12,
+    a10: *const Xloper12,
+) -> *mut Xloper12 {
+    let all: [*const Xloper12; UDF_PARAMS] = [f, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10];
+    guarded(|| async_dispatch(&all))
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn LuaStatus() -> *mut Xloper12 {
     guarded(|| {
@@ -186,7 +261,7 @@ struct FnDef {
     help: &'static str,
 }
 
-const FUNCTIONS: [FnDef; 3] = [
+const FUNCTIONS: [FnDef; 4] = [
     FnDef {
         proc_name: "LuaCall",
         params: UDF_PARAMS,
@@ -200,6 +275,13 @@ const FUNCTIONS: [FnDef; 3] = [
         excel_name: "LUA.EVAL",
         arg_text: "code,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
         help: "Evaluates a Lua expression or chunk; arguments are available as ...",
+    },
+    FnDef {
+        proc_name: "LuaAsync",
+        params: UDF_PARAMS,
+        excel_name: "LUA.ASYNC",
+        arg_text: "function,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
+        help: "Runs a Lua function in the background so Excel is not blocked; shows #GETTING_DATA until it finishes",
     },
     FnDef {
         proc_name: "LuaStatus",

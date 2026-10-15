@@ -8,15 +8,19 @@
 //! * errors are `xl.NA`, `xl.VALUE`, `xl.DIV0`, ... and may be returned or compared with `==`
 //! * a range is a table of rows (`{{1,2},{3,4}}`); returning a flat list yields one column
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use mlua::chunk::ChunkMode;
 use mlua::{
     Function, HookTriggers, Lua, LuaOptions, MultiValue, StdLib, UserData, Value as LV, VmState,
 };
 
+use crate::procrun::{self, RunSpec};
 use crate::value::{Array, ErrorCode, Value};
 use crate::vfs::Bundle;
 
@@ -72,10 +76,22 @@ const SANDBOX_INSTRUCTION_LIMIT: u64 = 200_000_000;
 const SANDBOX_HOOK_STEP: u32 = 100_000;
 const SANDBOX_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 
+/// Bounds for one background call: a deadline, and a flag that aborts it from outside.
+#[derive(Clone)]
+pub struct Limits {
+    pub deadline: Instant,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Instructions between checks of [`Limits`] in a worker state.
+const LIMIT_CHECK_STEP: u32 = 10_000;
+
 pub struct LuaHost {
     lua: Lua,
     /// Present for sandboxed states: instructions executed in the current call.
     budget: Option<Rc<Cell<u64>>>,
+    /// Consulted by the hook of worker states; empty outside [`LuaHost::call_limited`].
+    limits: Rc<RefCell<Option<Limits>>>,
 }
 
 impl LuaHost {
@@ -85,12 +101,41 @@ impl LuaHost {
     /// The full standard library is available (io, os, package, ...) and C modules may be
     /// loaded: once a workbook is trusted its files are treated as the user's own code.
     pub fn new(bundle: &Bundle, ctx: &HostContext<'_>) -> Result<Self, HostError> {
+        Self::new_with(bundle, ctx, false)
+    }
+
+    /// Like [`LuaHost::new`] for a background worker: the state also honours the [`Limits`] given
+    /// to [`LuaHost::call_limited`], so a runaway or cancelled call is aborted.
+    pub fn new_worker(bundle: &Bundle, ctx: &HostContext<'_>) -> Result<Self, HostError> {
+        Self::new_with(bundle, ctx, true)
+    }
+
+    fn new_with(bundle: &Bundle, ctx: &HostContext<'_>, worker: bool) -> Result<Self, HostError> {
         // SAFETY: enables loading C modules via `require`/`package.loadlib`. Reachable only
         // after the user explicitly trusted this exact file set (see trust.rs).
         let lua = unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE, LuaOptions::default()) };
         install_xl_table(&lua, Some(ctx.workbook))?;
         let shared = Rc::new(bundle.clone());
         install_embedded_fs(&lua, &shared)?;
+        install_process_api(&lua)?;
+        let limits: Rc<RefCell<Option<Limits>>> = Rc::new(RefCell::new(None));
+        if worker {
+            let hook_limits = Rc::clone(&limits);
+            lua.set_hook(
+                HookTriggers::new().every_nth_instruction(LIMIT_CHECK_STEP),
+                move |_, _| {
+                    if let Some(l) = hook_limits.borrow().as_ref() {
+                        if l.cancel.load(Ordering::Relaxed) {
+                            return Err(mlua::Error::runtime("cancelled"));
+                        }
+                        if Instant::now() >= l.deadline {
+                            return Err(mlua::Error::runtime("timed out"));
+                        }
+                    }
+                    Ok(VmState::Continue)
+                },
+            )?;
+        }
         let native = match ctx.cache_dir {
             Some(dir) => extract_native(bundle, dir)
                 .map_err(|e| HostError::Lua(format!("cannot extract native modules: {e}")))?,
@@ -103,7 +148,11 @@ impl LuaHost {
                 .set_mode(ChunkMode::Text)
                 .exec()?;
         }
-        Ok(LuaHost { lua, budget: None })
+        Ok(LuaHost {
+            lua,
+            budget: None,
+            limits,
+        })
     }
 
     /// A state for expressions typed into cells (`LUA.EVAL`) in workbooks that carry no trusted
@@ -137,6 +186,7 @@ impl LuaHost {
         Ok(LuaHost {
             lua,
             budget: Some(budget),
+            limits: Rc::new(RefCell::new(None)),
         })
     }
 
@@ -146,6 +196,19 @@ impl LuaHost {
             return Err(HostError::Undefined(func.to_owned()));
         };
         self.invoke(&f, args)
+    }
+
+    /// [`LuaHost::call`] under `limits` (a worker state; see [`LuaHost::new_worker`]).
+    pub fn call_limited(
+        &self,
+        func: &str,
+        args: &[Value],
+        limits: &Limits,
+    ) -> Result<Value, HostError> {
+        *self.limits.borrow_mut() = Some(limits.clone());
+        let result = self.call(func, args);
+        *self.limits.borrow_mut() = None;
+        result
     }
 
     /// Runs a chunk with the arguments available as `...`. A bare expression is accepted too.
@@ -280,6 +343,103 @@ fn install_embedded_fs(lua: &Lua, bundle: &Rc<Bundle>) -> mlua::Result<()> {
     let searchers: mlua::Table = package.get("searchers")?;
     let insert: Function = lua.globals().get::<mlua::Table>("table")?.get("insert")?;
     insert.call::<()>((searchers, 2, searcher))
+}
+
+/// `xl.run(program | {program, args..., cwd=, timeout=, stdin=}, [opts])` and
+/// `xl.shell(line, [opts])`: run an external program with captured output and a real timeout.
+/// Returns `{code, stdout, stderr, ok, timed_out, truncated}`, or `nil, message` if it could not
+/// be started. No console window appears.
+fn install_process_api(lua: &Lua) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    xl.set(
+        "run",
+        lua.create_function(|lua, (spec, opts): (LV, Option<mlua::Table>)| {
+            run_from_lua(lua, spec, opts, false)
+        })?,
+    )?;
+    xl.set(
+        "shell",
+        lua.create_function(|lua, (line, opts): (String, Option<mlua::Table>)| {
+            run_from_lua(lua, LV::String(lua.create_string(&line)?), opts, true)
+        })?,
+    )
+}
+
+fn word(v: &LV) -> Option<String> {
+    match v {
+        LV::String(s) => Some(s.to_string_lossy()),
+        LV::Integer(i) => Some(i.to_string()),
+        LV::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+fn run_from_lua(
+    lua: &Lua,
+    spec: LV,
+    opts: Option<mlua::Table>,
+    shell: bool,
+) -> mlua::Result<MultiValue> {
+    let mut run = match (&spec, shell) {
+        (LV::String(line), true) => RunSpec::shell(&line.to_string_lossy()),
+        (LV::String(program), false) => RunSpec::new(program.to_string_lossy(), Vec::new()),
+        (LV::Table(t), false) => {
+            let mut words: Vec<String> = Vec::new();
+            for i in 1..=t.raw_len() {
+                let v: LV = t.raw_get(i)?;
+                words.push(word(&v).ok_or_else(|| {
+                    mlua::Error::runtime("xl.run: arguments must be strings or numbers")
+                })?);
+            }
+            if words.is_empty() {
+                return Err(mlua::Error::runtime("xl.run: missing program"));
+            }
+            let program = words.remove(0);
+            RunSpec::new(program, words)
+        }
+        _ => {
+            return Err(mlua::Error::runtime(
+                "xl.run: expected a program name or a list {program, args...}",
+            ));
+        }
+    };
+    // Options live in the spec table itself, or in the second argument.
+    let options = opts.or_else(|| match &spec {
+        LV::Table(t) => Some(t.clone()),
+        _ => None,
+    });
+    if let Some(o) = options {
+        if let LV::String(cwd) = o.get::<LV>("cwd")? {
+            run.cwd = Some(PathBuf::from(cwd.to_string_lossy()));
+        }
+        match o.get::<LV>("timeout")? {
+            LV::Integer(n) => run.timeout = Duration::from_secs_f64((n as f64).max(0.01)),
+            LV::Number(n) => run.timeout = Duration::from_secs_f64(n.max(0.01)),
+            _ => {}
+        }
+        if let LV::String(input) = o.get::<LV>("stdin")? {
+            run.stdin = Some(input.as_bytes().to_vec());
+        }
+    }
+    match procrun::run(&run) {
+        Err(e) => Ok(MultiValue::from_iter([
+            LV::Nil,
+            LV::String(lua.create_string(format!("cannot run '{}': {e}", run.program))?),
+        ])),
+        Ok(r) => {
+            let t = lua.create_table()?;
+            match r.code {
+                Some(c) => t.set("code", c)?,
+                None => t.set("code", LV::Nil)?,
+            }
+            t.set("stdout", lua.create_string(&r.stdout)?)?;
+            t.set("stderr", lua.create_string(&r.stderr)?)?;
+            t.set("ok", r.ok())?;
+            t.set("timed_out", r.timed_out)?;
+            t.set("truncated", r.truncated)?;
+            Ok(MultiValue::from_iter([LV::Table(t)]))
+        }
+    }
 }
 
 /// `require` finds modules next to the workbook, then in `%APPDATA%\xll-bridge\lua`.
@@ -663,5 +823,84 @@ mod tests {
             host_of(&b, None).eval("x + 1", &[]).unwrap(),
             Value::Num(42.0)
         );
+    }
+
+    fn quick_shell(line: &str) -> String {
+        line.to_owned()
+    }
+
+    #[test]
+    fn lua_can_run_programs_with_captured_output_and_a_timeout() {
+        let h = host(
+            "function out() local r = xl.shell('echo hi') return (r.stdout:gsub('%s+$', '')) end
+             function missing() local r, err = xl.run{'definitely-not-a-real-program-xyz'} return r == nil and err ~= nil end
+             function code() return xl.shell('exit 3').code end
+             function slow(line) local r = xl.shell(line, { timeout = 0.3 }) return r.timed_out end",
+        );
+        assert_eq!(h.call("out", &[]).unwrap(), Value::Str("hi".into()));
+        assert_eq!(h.call("missing", &[]).unwrap(), Value::Bool(true));
+        assert_eq!(h.call("code", &[]).unwrap(), Value::Num(3.0));
+        let sleeper = quick_shell(if cfg!(windows) {
+            "ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        });
+        assert_eq!(
+            h.call("slow", &[Value::Str(sleeper)]).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn the_sandbox_has_no_way_to_start_programs() {
+        let h = LuaHost::sandboxed().unwrap();
+        assert_eq!(
+            h.eval("xl.run == nil and xl.shell == nil", &[]).unwrap(),
+            Value::Bool(true)
+        );
+    }
+
+    #[test]
+    fn a_worker_call_is_stopped_by_its_deadline_and_by_cancellation() {
+        let b = bundle_of(&[(
+            "t.lua",
+            "function spin() while true do end end function quick() return 7 end",
+        )]);
+        let h = LuaHost::new_worker(
+            &b,
+            &HostContext {
+                workbook: Path::new("/tmp/book.xlsx"),
+                cache_dir: None,
+            },
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let soon = Limits {
+            deadline: Instant::now() + Duration::from_millis(200),
+            cancel: Arc::clone(&cancel),
+        };
+        let Err(HostError::Lua(m)) = h.call_limited("spin", &[], &soon) else {
+            panic!("must time out")
+        };
+        assert!(m.contains("timed out"), "{m}");
+
+        // The state is reusable afterwards, and a pre-set cancel flag aborts immediately.
+        let fine = Limits {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(
+            h.call_limited("quick", &[], &fine).unwrap(),
+            Value::Num(7.0)
+        );
+        cancel.store(true, Ordering::Relaxed);
+        let cancelled = Limits {
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancel,
+        };
+        let Err(HostError::Lua(m)) = h.call_limited("spin", &[], &cancelled) else {
+            panic!("must cancel")
+        };
+        assert!(m.contains("cancelled"), "{m}");
     }
 }

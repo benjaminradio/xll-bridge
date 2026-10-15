@@ -9,10 +9,12 @@ pub enum ErrorCode {
     Name,
     Num,
     NA,
+    /// What Excel shows for an asynchronous result that has not arrived yet.
+    GettingData,
 }
 
 impl ErrorCode {
-    pub const ALL: [ErrorCode; 7] = [
+    pub const ALL: [ErrorCode; 8] = [
         ErrorCode::Null,
         ErrorCode::Div0,
         ErrorCode::Value,
@@ -20,6 +22,7 @@ impl ErrorCode {
         ErrorCode::Name,
         ErrorCode::Num,
         ErrorCode::NA,
+        ErrorCode::GettingData,
     ];
 
     /// The `xlerr*` constant from XLCALL.H.
@@ -32,6 +35,7 @@ impl ErrorCode {
             ErrorCode::Name => 29,
             ErrorCode::Num => 36,
             ErrorCode::NA => 42,
+            ErrorCode::GettingData => 43,
         }
     }
 
@@ -49,6 +53,7 @@ impl ErrorCode {
             ErrorCode::Name => "NAME",
             ErrorCode::Num => "NUM",
             ErrorCode::NA => "NA",
+            ErrorCode::GettingData => "GETTING_DATA",
         }
     }
 }

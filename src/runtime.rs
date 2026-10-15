@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::lua_host::{HostContext, HostError, LuaHost};
+use std::sync::Arc;
+
 use crate::package;
 use crate::trust::{TrustStore, normalize_path};
 use crate::value::Value;
@@ -26,6 +28,7 @@ pub enum Book {
     Active {
         digest: String,
         names: Vec<String>,
+        bundle: Arc<Bundle>,
         host: LuaHost,
     },
     Failed {
@@ -111,13 +114,17 @@ impl Runtime {
         let names = script_names(&scripts);
         // A save by Excel changes the mtime but not the scripts: keep the live Lua state.
         if let Some(Book::Active {
-            digest: d, host, ..
+            digest: d,
+            host,
+            bundle,
+            ..
         }) = previous
             && d == digest
         {
             return Book::Active {
                 digest,
                 names,
+                bundle,
                 host,
             };
         }
@@ -181,6 +188,21 @@ impl Runtime {
         let wb = workbook.ok_or(CallError::NoPath)?;
         match self.state(wb) {
             Book::Active { host, .. } => Ok(host),
+            Book::Blocked { .. } => Err(CallError::Blocked),
+            Book::NoScripts => Err(CallError::NoScripts),
+            Book::Failed { message, .. } => Err(CallError::Lua(message.clone())),
+        }
+    }
+
+    /// The files and digest of an enabled workbook, for background workers (which build their own
+    /// Lua state from them). Errors exactly like a synchronous call would.
+    pub fn enabled_files(
+        &mut self,
+        workbook: Option<&Path>,
+    ) -> Result<(Arc<Bundle>, String), CallError> {
+        let wb = workbook.ok_or(CallError::NoPath)?;
+        match self.state(wb) {
+            Book::Active { bundle, digest, .. } => Ok((Arc::clone(bundle), digest.clone())),
             Book::Blocked { .. } => Err(CallError::Blocked),
             Book::NoScripts => Err(CallError::NoScripts),
             Book::Failed { message, .. } => Err(CallError::Lua(message.clone())),
@@ -273,6 +295,7 @@ fn activate(workbook: &Path, bundle: &Bundle, digest: String) -> Book {
         Ok(host) => Book::Active {
             digest,
             names: script_names(bundle),
+            bundle: Arc::new(bundle.clone()),
             host,
         },
         Err(e) => Book::Failed {
@@ -447,6 +470,42 @@ mod tests {
         let args = [Value::Num(3.0), Value::Num(4.0)];
         assert_eq!(rt.call(Some(&wb), "hypot", &args).unwrap(), Value::Num(5.0));
         assert_eq!(rt.call(Some(&wb), "add", &args).unwrap(), Value::Num(7.0));
+    }
+
+    #[test]
+    fn workers_get_the_files_of_an_enabled_workbook_only() {
+        let (_d, wb) = workbook_with("function one() return 1 end");
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        assert!(matches!(
+            rt.enabled_files(Some(&wb)),
+            Err(CallError::Blocked)
+        ));
+        rt.enable(&wb).unwrap();
+        let (files, digest) = rt.enabled_files(Some(&wb)).unwrap();
+        assert_eq!(files.digest(), digest);
+        assert!(files.get("main.lua").is_some());
+        assert!(matches!(rt.enabled_files(None), Err(CallError::NoPath)));
+
+        // The files handed over really run in a background worker, with a module from a folder.
+        let jobs = crate::jobs::Jobs::new(1, None);
+        let spec = || crate::jobs::JobSpec {
+            workbook: wb.clone(),
+            digest: digest.clone(),
+            bundle: Arc::clone(&files),
+            func: "one".into(),
+            args: vec![],
+            caller: None,
+            timeout: std::time::Duration::from_secs(20),
+        };
+        let start = std::time::Instant::now();
+        let result = loop {
+            if let crate::jobs::Poll::Ready(r) = jobs.poll_or_start(spec()) {
+                break r;
+            }
+            assert!(start.elapsed().as_secs() < 20, "job never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(result, Ok(Value::Num(1.0)));
     }
 
     #[test]

@@ -20,12 +20,19 @@ function safe_div(a, b)
   return a / b
 end
 
--- Runs an external program (Windows) and returns its first output line.
+-- Runs an external program (no shell, no console window) and returns its first output line.
 function hostname()
-  local p = io.popen("hostname")
-  local s = p:read("*l")
-  p:close()
-  return s
+  local r = xl.run{ "hostname", timeout = 10 }
+  if not r then return xl.NA end
+  return (r.stdout:gsub("%s+$", ""))
+end
+
+-- Slow on purpose (about 3 seconds). Call it as =LUA.ASYNC("slow_hostname") and Excel stays
+-- responsive while the cell shows #GETTING_DATA; =LUA.CALL("slow_hostname") would freeze Excel.
+function slow_hostname()
+  local r = xl.shell("ping -n 4 127.0.0.1 > nul & hostname", { timeout = 30 })
+  if not r then return xl.NA end
+  return (r.stdout:gsub("%s+$", ""))
 end
 
 -- Uses a module stored in the lib/ folder of the embedded file tree.
