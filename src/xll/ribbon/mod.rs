@@ -802,6 +802,7 @@ mod tests {
             "getScreentip",
             "getSupertip",
             "onAction",
+            "getContent",
         ] {
             let needle = format!("{attr}=\"");
             for (at, _) in xml.match_indices(&needle) {
