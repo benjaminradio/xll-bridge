@@ -50,7 +50,7 @@ impl IClassFactory_Impl for Factory_Impl {
         }
         let unknown: IUnknown = match self.0 {
             Kind::Addin => Addin.into(),
-            Kind::Rtd => super::rtd::Rtd.into(),
+            Kind::Rtd => super::rtd::Rtd::new().into(),
         };
         // SAFETY: `iid`/`object` come straight from the COM caller.
         unsafe { unknown.query(iid, object).ok() }

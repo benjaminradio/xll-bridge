@@ -12,6 +12,8 @@
 use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -59,6 +61,35 @@ pub(super) unsafe trait IRTDUpdateEvent: IDispatch {
     unsafe fn Disconnect(&self) -> HRESULT;
 }
 
+static CREATED: AtomicU32 = AtomicU32::new(0);
+static STARTED: AtomicU32 = AtomicU32::new(0);
+static CONNECTS: AtomicU32 = AtomicU32::new(0);
+static LAST_PROBLEM: Mutex<String> = Mutex::new(String::new());
+
+fn problem(msg: &str) {
+    crate::log::line(&format!("rtd: {msg}"));
+    if let Ok(mut p) = LAST_PROBLEM.lock() {
+        *p = msg.to_owned();
+    }
+}
+
+/// What has happened so far, for `LUA.STATUS`: did Excel create the server, start it, and
+/// connect any stream to it?
+pub(crate) fn summary() -> String {
+    let last = LAST_PROBLEM.lock().map(|p| p.clone()).unwrap_or_default();
+    format!(
+        "rtd: created {}, started {}, connected {}{}",
+        CREATED.load(Ordering::Relaxed),
+        STARTED.load(Ordering::Relaxed),
+        CONNECTS.load(Ordering::Relaxed),
+        if last.is_empty() {
+            String::new()
+        } else {
+            format!(", last problem: {last}")
+        }
+    )
+}
+
 thread_local! {
     static CALLBACK: RefCell<Option<IRTDUpdateEvent>> = const { RefCell::new(None) };
     static NOTIFIED: Cell<Option<Instant>> = const { Cell::new(None) };
@@ -84,6 +115,13 @@ pub(super) fn tick() {
 
 #[implement(IRtdServer)]
 pub(super) struct Rtd;
+
+impl Rtd {
+    pub(super) fn new() -> Self {
+        CREATED.fetch_add(1, Ordering::Relaxed);
+        Rtd
+    }
+}
 
 impl IDispatch_Impl for Rtd_Impl {
     fn GetTypeInfoCount(&self) -> Result<u32> {
@@ -154,7 +192,10 @@ impl IRtdServer_Impl for Rtd_Impl {
             let ok = cb.is_some();
             CALLBACK.with(|c| *c.borrow_mut() = cb);
             NOTIFIED.set(None);
-            crate::log::note("rtd: server started");
+            STARTED.fetch_add(1, Ordering::Relaxed);
+            if !ok {
+                problem("ServerStart got no callback object");
+            }
             // SAFETY: caller-provided out pointer.
             unsafe { result.write(i32::from(ok)) };
             S_OK
@@ -178,10 +219,11 @@ impl IRtdServer_Impl for Rtd_Impl {
                 Some(key) => crate::streams::global().connect(topic_id, &key),
                 None => Err("no stream name".to_owned()),
             };
+            CONNECTS.fetch_add(1, Ordering::Relaxed);
             let initial = match outcome {
                 Ok(()) => Value::Err(ErrorCode::GettingData),
                 Err(m) => {
-                    crate::log::note(&format!("rtd: connect failed: {m}"));
+                    problem(&format!("connect failed: {m}"));
                     Value::Str(format!("#LUA: {m}"))
                 }
             };
@@ -273,7 +315,7 @@ mod tests {
     fn the_server_answers_the_interface_excel_asks_for() {
         // SAFETY: standard COM bootstrap on the test thread.
         let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
-        let unknown: IUnknown = Rtd.into();
+        let unknown: IUnknown = Rtd::new().into();
         let server: IRtdServer = unknown.cast().unwrap();
         let mut ignored = 0;
         // SAFETY: valid out pointer.

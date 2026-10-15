@@ -17,7 +17,7 @@ mod dispatch;
 mod icon;
 mod live;
 mod pane;
-pub(super) mod rtd;
+pub(crate) mod rtd;
 
 use std::cell::RefCell;
 use std::ffi::c_void;

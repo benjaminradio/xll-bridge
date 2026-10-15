@@ -246,6 +246,13 @@ fn stream_dispatch(args: &[*const Xloper12]) -> Value {
         (Err(CallError::NoPath), Err(detail)) => return Value::Str(format!("#NOPATH: {detail}")),
         (Err(e), _) => return error_text(&e),
     };
+    // Excel can only start the stream server if its COM registration is in place.
+    // SAFETY: plain registry lookup with a static, NUL-terminated name.
+    if let Err(e) =
+        unsafe { windows::Win32::System::Com::CLSIDFromProgID(windows::core::w!("XllBridge.Rtd")) }
+    {
+        return Value::Str(format!("#RTD: XllBridge.Rtd is not registered ({e})"));
+    }
     let workbook = located.expect("enabled_files succeeded, so the path is known");
     let fn_args = &vals[1..];
     let key = crate::streams::key_of(&workbook, &digest, &func, fn_args);
@@ -271,7 +278,9 @@ fn stream_dispatch(args: &[*const Xloper12]) -> Value {
     let value = if rc == xlretSuccess {
         unsafe { oper::to_value(&res) }
     } else {
-        Value::Err(crate::value::ErrorCode::NA)
+        Value::Str(format!(
+            "#RTD: Excel refused the real-time data call (code {rc})"
+        ))
     };
     free(&mut res);
     value
@@ -310,7 +319,7 @@ pub extern "system" fn LuaStatus() -> *mut Xloper12 {
                     names.len()
                 )
             }
-            Status::Active { .. } => "Lua enabled".to_owned(),
+            Status::Active { .. } => format!("Lua enabled; {}", ribbon::rtd::summary()),
             Status::Failed { message } => format!("Lua failed to load: {message}"),
         });
         Value::Str(s)

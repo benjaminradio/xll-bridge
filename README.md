@@ -132,7 +132,7 @@ RTD mechanism (the DLL is also registered as the COM server `XllBridge.Rtd`, und
 ribbon add-in). Only the latest value counts, so a fast stream cannot build a backlog; Excel is
 told about new values by a timer, so updates arrive within about 200 ms. The stream stops when no
 cell uses it, when the workbook's scripts are disabled, or when Excel exits. An error ends it and
-shows `#LUA: ...`. Streams can read and write cells with `xl.range` like `LUA.ASYNC` calls.
+shows `#LUA: ...`. If a stream cell never shows a value, `=LUA.STATUS()` reports how far the RTD server got (created / started / connected, and the last problem). Streams can read and write cells with `xl.range` like `LUA.ASYNC` calls.
 
 ### Macros
 
