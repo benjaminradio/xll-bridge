@@ -82,6 +82,35 @@ the waiting cells recalculated. Excel stays usable throughout.
 * In manual calculation mode finished cells are marked dirty and appear on the next F9.
 * Blocked/untrusted workbooks behave as for `LUA.CALL`: nothing runs.
 
+### Reading and writing cells from Lua
+
+```lua
+local r = xl.range("Sheet1!A1:C10")   -- resolved once; "A1:C10" alone means the active sheet
+r:value()          -- a bare value for one cell, otherwise a table of rows
+r:values()         -- always a table of rows
+r:formulas()       -- formulas (constants come back as their values)
+r:set(42)          -- a scalar fills the whole range
+r:set({{1,2},{3,4}})   -- a table is written from the top-left cell, at its own size
+r:set_formulas({{"=A1+1"}})
+r:clear()          -- ClearContents
+r:size()           -- rows, cols          r:address()   -- "Sheet1!$A$1:$C$10"
+xl.sheets()  xl.used_range("Sheet1")  xl.selection()
+```
+
+Addresses may be `Sheet!A1`, `'My Sheet'!A1`, `[Other.xlsx]Sheet!A1` or a defined name. Empty cells
+read as `xl.EMPTY` inside tables; errors read as `xl.NA`, `xl.DIV0`, ... Multi-area ranges are
+not supported and a single operation is limited to 5,000,000 cells.
+
+* **`LUA.CALL` can read but not write** (Excel does not let a worksheet function change cells).
+  Reads inside a function are not dependency-tracked: pass the range as an argument if the result
+  must recalculate when it changes.
+* **`LUA.ASYNC` can read and write.** The Lua code runs on a worker thread; each range operation is
+  handed to Excel's UI thread and the worker waits for the answer, so batch your reads and writes
+  (one `values()`/`set()` of a block, not one call per cell). If Excel is busy (editing a cell,
+  a dialog) the operation is retried for a while, then fails with an error.
+* There is deliberately no script editor in the panel: edit your `.lua` files in your own editor
+  and use *Import* (or drag them onto the panel).
+
 ### Running programs from Lua
 
 ```lua

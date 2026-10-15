@@ -316,6 +316,7 @@ fn host_for(job: &Job) -> Result<Rc<LuaHost>, String> {
     let ctx = HostContext {
         workbook: &job.workbook,
         cache_dir: job.cache_dir.as_deref(),
+        xl: crate::xlapi::global(),
     };
     let host = Rc::new(LuaHost::new_worker(&job.bundle, &ctx).map_err(|e| e.to_string())?);
     HOSTS.with(|hs| {

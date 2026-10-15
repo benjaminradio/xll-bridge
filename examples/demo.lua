@@ -40,3 +40,22 @@ local mathx = require("lib.mathx")
 function hypot(a, b)
   return mathx.hypot(a, b)
 end
+
+-- Reading cells. Unqualified addresses mean the active sheet of this workbook; a range passed
+-- as an argument (=LUA.CALL("total", A1:A10)) is better because Excel then tracks the dependency.
+function total_of(address)
+  local sum = 0
+  for _, row in ipairs(xl.range(address):values()) do
+    for _, v in ipairs(row) do
+      if type(v) == "number" then sum = sum + v end
+    end
+  end
+  return sum
+end
+
+-- Writing cells is only allowed from background calls and macros, never from LUA.CALL (Excel
+-- forbids a worksheet function from changing the sheet). =LUA.ASYNC("stamp", "Sheet1!E1")
+function stamp(address)
+  xl.range(address):set({ { "written by Lua", os.date("%Y-%m-%d %H:%M:%S") } })
+  return "ok"
+end

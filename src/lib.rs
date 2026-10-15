@@ -17,6 +17,7 @@ pub mod trust;
 pub mod ui;
 pub mod value;
 pub mod vfs;
+pub mod xlapi;
 
 #[cfg(windows)]
 mod xll;

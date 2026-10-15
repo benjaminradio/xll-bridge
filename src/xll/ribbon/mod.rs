@@ -10,6 +10,7 @@
 
 #![allow(non_snake_case)] // COM method names
 
+mod cells;
 mod com;
 mod dialogs;
 mod dispatch;
@@ -209,6 +210,18 @@ pub(super) fn workbook_path_by_name(name: &str) -> Option<PathBuf> {
     BOOKS.with(|b| b.borrow().by_name.get(&name.to_lowercase()).cloned())
 }
 
+/// The name (e.g. `demo.xlsx`) under which Excel has the workbook at `path` open.
+pub(super) fn workbook_name_by_path(path: &std::path::Path) -> Option<String> {
+    let want = path.to_string_lossy().to_lowercase();
+    BOOKS.with(|b| {
+        b.borrow()
+            .by_name
+            .iter()
+            .find(|(_, p)| p.to_string_lossy().to_lowercase() == want)
+            .map(|(name, _)| name.clone())
+    })
+}
+
 fn local_path_of(wb: &IDispatch) -> Option<PathBuf> {
     ["LocalFullName", "FullName"]
         .into_iter()
@@ -347,6 +360,7 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
         if let Some(app) = app() {
             refresh_books(&app);
             pump_async(&app);
+            crate::xlapi::pump_global();
             pane::tick(&app);
         }
     }));
@@ -576,6 +590,7 @@ impl IDTExtensibility2_Impl for Addin_Impl {
         // SAFETY: plain thread timer on Excel's UI thread; `timer_proc` has the TIMERPROC ABI.
         let timer = unsafe { SetTimer(None, 0, POLL_MS, Some(timer_proc)) };
         crate::log::note("ribbon: connected to Excel");
+        cells::install();
         SHARED.with(|s| {
             let mut s = s.borrow_mut();
             s.app = app;

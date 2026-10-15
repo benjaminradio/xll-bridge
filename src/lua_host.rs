@@ -23,6 +23,7 @@ use mlua::{
 use crate::procrun::{self, RunSpec};
 use crate::value::{Array, ErrorCode, Value};
 use crate::vfs::Bundle;
+use crate::xlapi::{self, MAX_CELLS, Op, Reply, XlApi};
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -69,6 +70,9 @@ pub struct HostContext<'a> {
     /// Where native modules (`.dll`/`.so`) from the embedded tree are extracted so `require` can
     /// load them. `None` disables extraction.
     pub cache_dir: Option<&'a Path>,
+    /// Access to worksheet cells for `xl.range` and friends; `None` when Excel is not attached
+    /// (tests, `xllb-pack`), in which case those functions raise an error.
+    pub xl: Option<Arc<dyn XlApi>>,
 }
 
 /// VM instructions a sandboxed call may run before it is aborted (a few seconds of work).
@@ -118,6 +122,7 @@ impl LuaHost {
         let shared = Rc::new(bundle.clone());
         install_embedded_fs(&lua, &shared)?;
         install_process_api(&lua)?;
+        install_range_api(&lua, ctx.workbook, ctx.xl.clone())?;
         let limits: Rc<RefCell<Option<Limits>>> = Rc::new(RefCell::new(None));
         if worker {
             let hook_limits = Rc::clone(&limits);
@@ -252,6 +257,185 @@ fn install_xl_table(lua: &Lua, workbook: Option<&Path>) -> mlua::Result<()> {
         xl.set("workbook", wb.to_string_lossy().into_owned())?;
     }
     lua.globals().set("xl", xl)
+}
+
+/// A worksheet range as seen from Lua: `xl.range("Data!A1:C10")`. The address is resolved once,
+/// when the object is made, so later calls cannot silently move to another sheet.
+struct LuaRange {
+    api: Arc<dyn XlApi>,
+    workbook: PathBuf,
+    address: String,
+    rows: u32,
+    cols: u32,
+}
+
+fn api_err(e: xlapi::XlError) -> mlua::Error {
+    mlua::Error::runtime(e.message)
+}
+
+impl LuaRange {
+    fn read(&self, lua: &Lua, formulas: bool, always_table: bool) -> mlua::Result<LV> {
+        let reply = self
+            .api
+            .call(Op::Read {
+                workbook: self.workbook.clone(),
+                address: self.address.clone(),
+                formulas,
+            })
+            .map_err(api_err)?;
+        let Reply::Data(v) = reply else {
+            return Err(mlua::Error::runtime("unexpected reply from Excel"));
+        };
+        if !always_table
+            && let Value::Array(a) = &v
+            && a.data.len() == 1
+        {
+            return to_lua(lua, &a.data[0]);
+        }
+        to_lua(lua, &v)
+    }
+
+    fn write(&self, v: &LV, formulas: bool) -> mlua::Result<()> {
+        let data = from_lua(v)?;
+        let cells = match &data {
+            Value::Array(a) => (a.rows as u64) * (a.cols as u64),
+            _ => 1,
+        };
+        if cells > MAX_CELLS {
+            return Err(mlua::Error::runtime(format!(
+                "too many cells to write at once ({cells}; the limit is {MAX_CELLS})"
+            )));
+        }
+        self.api
+            .call(Op::Write {
+                workbook: self.workbook.clone(),
+                address: self.address.clone(),
+                formulas,
+                data,
+            })
+            .map_err(api_err)?;
+        Ok(())
+    }
+}
+
+impl UserData for LuaRange {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // A single cell gives a bare value, anything larger a table of rows.
+        methods.add_method("value", |lua, this, ()| this.read(lua, false, false));
+        // Always a table of rows, even for one cell.
+        methods.add_method("values", |lua, this, ()| this.read(lua, false, true));
+        methods.add_method("formulas", |lua, this, ()| this.read(lua, true, true));
+        methods.add_method("set", |_, this, v: LV| this.write(&v, false));
+        methods.add_method("set_formulas", |_, this, v: LV| this.write(&v, true));
+        methods.add_method("clear", |_, this, ()| {
+            this.api
+                .call(Op::Clear {
+                    workbook: this.workbook.clone(),
+                    address: this.address.clone(),
+                })
+                .map_err(api_err)?;
+            Ok(())
+        });
+        methods.add_method("size", |_, this, ()| Ok((this.rows, this.cols)));
+        methods.add_method("address", |_, this, ()| Ok(this.address.clone()));
+        methods.add_meta_method("__tostring", |_, this, ()| {
+            Ok(format!("range({})", this.address))
+        });
+    }
+}
+
+fn make_range(api: &Arc<dyn XlApi>, workbook: &Path, op: Op) -> mlua::Result<LuaRange> {
+    let Reply::Info(info) = api.call(op).map_err(api_err)? else {
+        return Err(mlua::Error::runtime("unexpected reply from Excel"));
+    };
+    if u64::from(info.rows) * u64::from(info.cols) > MAX_CELLS {
+        return Err(mlua::Error::runtime(format!(
+            "{} is too large ({} x {} cells; the limit is {MAX_CELLS} cells)",
+            info.address, info.rows, info.cols
+        )));
+    }
+    Ok(LuaRange {
+        api: Arc::clone(api),
+        workbook: workbook.to_owned(),
+        address: info.address,
+        rows: info.rows,
+        cols: info.cols,
+    })
+}
+
+/// `xl.range`, `xl.sheets`, `xl.used_range`, `xl.selection`.
+fn install_range_api(lua: &Lua, workbook: &Path, api: Option<Arc<dyn XlApi>>) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    let api = api.unwrap_or_else(|| Arc::new(Detached));
+    let wb = workbook.to_owned();
+
+    let (a, w) = (Arc::clone(&api), wb.clone());
+    xl.set(
+        "range",
+        lua.create_function(move |_, address: String| {
+            make_range(
+                &a,
+                &w,
+                Op::Info {
+                    workbook: w.clone(),
+                    address,
+                },
+            )
+        })?,
+    )?;
+
+    let (a, w) = (Arc::clone(&api), wb.clone());
+    xl.set(
+        "sheets",
+        lua.create_function(move |lua, ()| {
+            let Reply::Names(names) = a
+                .call(Op::Sheets {
+                    workbook: w.clone(),
+                })
+                .map_err(api_err)?
+            else {
+                return Err(mlua::Error::runtime("unexpected reply from Excel"));
+            };
+            lua.create_sequence_from(names)
+        })?,
+    )?;
+
+    let (a, w) = (Arc::clone(&api), wb.clone());
+    xl.set(
+        "used_range",
+        lua.create_function(move |_, sheet: String| {
+            make_range(
+                &a,
+                &w,
+                Op::UsedRange {
+                    workbook: w.clone(),
+                    sheet,
+                },
+            )
+        })?,
+    )?;
+
+    let (a, w) = (api, wb);
+    xl.set(
+        "selection",
+        lua.create_function(move |_, ()| {
+            make_range(
+                &a,
+                &w,
+                Op::Selection {
+                    workbook: w.clone(),
+                },
+            )
+        })?,
+    )
+}
+
+/// Stands in when no Excel is attached.
+struct Detached;
+impl XlApi for Detached {
+    fn call(&self, _: Op) -> Result<Reply, xlapi::XlError> {
+        Err(xlapi::XlError::new("Excel is not available here"))
+    }
 }
 
 fn strip_bom(data: &[u8]) -> &[u8] {
@@ -586,9 +770,99 @@ mod tests {
             &HostContext {
                 workbook: Path::new("/tmp/book.xlsx"),
                 cache_dir: cache,
+                xl: None,
             },
         )
         .unwrap()
+    }
+
+    fn grid_host(code: &str, grid: Arc<crate::xlapi::fake::MemGrid>) -> LuaHost {
+        LuaHost::new(
+            &bundle_of(&[("t.lua", code)]),
+            &HostContext {
+                workbook: Path::new("/tmp/book.xlsx"),
+                cache_dir: None,
+                xl: Some(grid),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ranges_read_and_write() {
+        use crate::xlapi::fake::MemGrid;
+        let g = MemGrid::new();
+        g.put("Data", "A1", Value::Num(1.0));
+        g.put("Data", "B1", Value::Num(2.0));
+        g.put("Data", "A2", Value::Str("x".into()));
+        g.put("Other", "A1", Value::Num(9.0));
+        let h = grid_host(
+            r#"
+            function one() return xl.range("A1"):value() end
+            function other() return xl.range("Other!A1"):value() end
+            function sum()
+              local t, s = xl.range("A1:B1"):values(), 0
+              for _, v in ipairs(t[1]) do s = s + v end
+              return s
+            end
+            function put() xl.range("D1"):set({{1, 2}, {3, 4}}) return xl.range("D1:E2"):values() end
+            function fill() xl.range("G1:G3"):set(7) return xl.range("G1:G3"):values() end
+            function col() xl.range("H1"):set({5, 6, 7}) return xl.range("H1:H3"):values() end
+            function dims() local r, c = xl.range("A1:C4"):size() return r * 10 + c end
+            function sheets() return xl.sheets() end
+            function addr() return xl.range("Other!B2:C3"):address() end
+            function bad() return xl.range("Nope!A1") end
+            "#,
+            Arc::clone(&g),
+        );
+        assert_eq!(h.call("one", &[]).unwrap(), Value::Num(1.0));
+        assert_eq!(h.call("other", &[]).unwrap(), Value::Num(9.0));
+        assert_eq!(h.call("sum", &[]).unwrap(), Value::Num(3.0));
+        assert!(
+            matches!(h.call("put", &[]).unwrap(), Value::Array(a) if a.rows == 2 && a.cols == 2)
+        );
+        assert_eq!(g.get("Data", "E2"), Value::Num(4.0));
+        h.call("fill", &[]).unwrap();
+        assert_eq!(g.get("Data", "G3"), Value::Num(7.0));
+        h.call("col", &[]).unwrap();
+        assert_eq!(g.get("Data", "H3"), Value::Num(7.0));
+        assert_eq!(h.call("dims", &[]).unwrap(), Value::Num(43.0));
+        assert!(matches!(h.call("sheets", &[]).unwrap(), Value::Array(a) if a.rows == 2));
+        assert_eq!(
+            h.call("addr", &[]).unwrap(),
+            Value::Str("Other!$B$2:$C$3".into())
+        );
+        let e = h.call("bad", &[]).unwrap_err().to_string();
+        assert!(e.contains("no sheet named"), "{e}");
+    }
+
+    #[test]
+    fn ranges_are_read_only_for_lua_call_and_absent_without_excel() {
+        use crate::xlapi::{ReadOnly, fake::MemGrid};
+        let g = MemGrid::new();
+        let h = LuaHost::new(
+            &bundle_of(&[("t.lua", "function w() xl.range('A1'):set(1) end function r() return xl.range('A1'):value() end")]),
+            &HostContext {
+                workbook: Path::new("/tmp/book.xlsx"),
+                cache_dir: None,
+                xl: Some(Arc::new(ReadOnly(g))),
+            },
+        )
+        .unwrap();
+        assert_eq!(h.call("r", &[]).unwrap(), Value::Empty);
+        assert!(
+            h.call("w", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("LUA.ASYNC")
+        );
+        let h = host("function r() return xl.range('A1'):value() end");
+        assert!(
+            h.call("r", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("not available")
+        );
     }
 
     #[test]
@@ -871,6 +1145,7 @@ mod tests {
             &HostContext {
                 workbook: Path::new("/tmp/book.xlsx"),
                 cache_dir: None,
+                xl: None,
             },
         )
         .unwrap();

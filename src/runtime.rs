@@ -290,6 +290,10 @@ fn activate(workbook: &Path, bundle: &Bundle, digest: String) -> Book {
         &HostContext {
             workbook,
             cache_dir: cache.as_deref(),
+            xl: crate::xlapi::global().map(|a| {
+                std::sync::Arc::new(crate::xlapi::ReadOnly(a))
+                    as std::sync::Arc<dyn crate::xlapi::XlApi>
+            }),
         },
     ) {
         Ok(host) => Book::Active {
