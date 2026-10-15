@@ -113,6 +113,17 @@ impl TrustStore {
         self.save()
     }
 
+    /// Forgets every trusted file set of this workbook; its scripts are blocked again.
+    pub fn revoke(&mut self, workbook: &Path) -> std::io::Result<()> {
+        let key = normalize_path(workbook);
+        let before = self.entries.len();
+        self.entries.retain(|e| e.workbook != key);
+        if self.entries.len() == before {
+            return Ok(());
+        }
+        self.save()
+    }
+
     fn save(&self) -> std::io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
@@ -149,6 +160,19 @@ mod tests {
         assert!(!t.is_trusted(Path::new(r"C:\Other\Book.xlsx"), "aa"));
         t.trust(wb, "bb").unwrap();
         assert!(!t.is_trusted(wb, "aa"), "new digest replaces the old one");
+    }
+
+    #[test]
+    fn revoke_forgets_only_that_workbook() {
+        let mut t = TrustStore::ephemeral();
+        let (a, b) = (Path::new("/w/a.xlsx"), Path::new("/w/b.xlsx"));
+        t.trust(a, "d1").unwrap();
+        t.pretrust(a, "d2").unwrap();
+        t.trust(b, "d3").unwrap();
+        t.revoke(a).unwrap();
+        assert!(!t.is_trusted(a, "d1") && !t.is_trusted(a, "d2"));
+        assert!(t.is_trusted(b, "d3"));
+        t.revoke(a).unwrap(); // nothing left: fine
     }
 
     #[test]

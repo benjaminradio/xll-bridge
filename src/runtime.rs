@@ -153,6 +153,15 @@ impl Runtime {
         Ok(())
     }
 
+    /// Takes back the user's permission: the workbook's scripts stop running and are blocked
+    /// again until enabled anew.
+    pub fn revoke(&mut self, workbook: &Path) -> std::io::Result<()> {
+        self.trust.revoke(workbook)?;
+        // Dropping the cached state drops the live Lua state; the reload finds no trust.
+        self.books.remove(&normalize_path(workbook));
+        Ok(())
+    }
+
     pub fn call(
         &mut self,
         workbook: Option<&Path>,
@@ -518,6 +527,22 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         };
         assert_eq!(result, Ok(Value::Num(1.0)));
+    }
+
+    #[test]
+    fn revoking_blocks_a_trusted_workbook_again() {
+        let (_d, wb) = workbook_with("function one() return 1 end");
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        rt.enable(&wb).unwrap();
+        assert_eq!(rt.call(Some(&wb), "one", &[]).unwrap(), Value::Num(1.0));
+        rt.revoke(&wb).unwrap();
+        assert!(matches!(
+            rt.call(Some(&wb), "one", &[]),
+            Err(CallError::Blocked)
+        ));
+        assert!(matches!(rt.status(&wb), Status::Blocked { .. }));
+        rt.enable(&wb).unwrap();
+        assert_eq!(rt.call(Some(&wb), "one", &[]).unwrap(), Value::Num(1.0));
     }
 
     #[test]

@@ -29,8 +29,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BYREF, VT_VARIANT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDYES, KillTimer, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
-    MB_SETFOREGROUND, MB_YESNO, MessageBoxW, SetTimer,
+    IDYES, KillTimer, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONQUESTION,
+    MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_YESNO, MessageBoxW, SetTimer,
 };
 use windows::core::{BSTR, Error, GUID, HRESULT, Interface, PCWSTR, Result, implement, interface};
 
@@ -535,6 +535,35 @@ fn on_click() {
                     message(
                         owner,
                         &format!("Could not enable Lua: {e}"),
+                        "Lua",
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+            }
+        }
+        Status::Active { .. } => {
+            let text = format!(
+                "{}\n\n{}\n\nDisable these scripts for this workbook? \
+                 They will be blocked again until you enable them.",
+                view.screentip, view.supertip
+            );
+            if !message(
+                owner,
+                &text,
+                "Lua scripts are enabled",
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+            ) {
+                return;
+            }
+            match with_runtime(|rt| rt.revoke(&path)) {
+                Ok(()) => {
+                    crate::jobs::global().forget_workbook(&path);
+                    drop(dispatch::call(&app, "CalculateFull", &[]));
+                }
+                Err(e) => {
+                    message(
+                        owner,
+                        &format!("Could not disable Lua: {e}"),
                         "Lua",
                         MB_OK | MB_ICONWARNING,
                     );

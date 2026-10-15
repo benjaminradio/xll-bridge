@@ -40,7 +40,10 @@ like VBA macros. A ribbon button shows the state at a glance.
   | red    | scripts present but **blocked** (or failed to load) — nothing has run |
 
   Clicking the red button lists the scripts and asks for confirmation; **Yes** trusts them and
-  recalculates every open workbook so the `#BLOCKED` cells fill in.
+  recalculates every open workbook so the `#BLOCKED` cells fill in. Clicking the yellow button
+  offers to **disable** the scripts again: the workbook's trust entries are deleted, its Lua state
+  is dropped and its cached background results are discarded. (A macro already running is not
+  interrupted; it stops at its 5 minute limit.)
 * `LUA.EVAL` in an unsaved workbook, or one with no scripts, runs in a **sandbox**: no `io`/`os`/`package`/
   `debug`/`load`/`dofile`, 64 MB memory cap and an instruction limit. In a workbook whose scripts are
   blocked it stays blocked.
