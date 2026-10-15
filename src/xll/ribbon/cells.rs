@@ -42,7 +42,7 @@ fn error_from_scode(scode: i32) -> ErrorCode {
     ErrorCode::from_xl_code(scode.wrapping_sub(XL_ERROR_BASE)).unwrap_or(ErrorCode::Value)
 }
 
-fn variant_of(v: &Value) -> VARIANT {
+pub(super) fn variant_of(v: &Value) -> VARIANT {
     match v {
         Value::Empty => VARIANT::default(),
         Value::Num(n) => VARIANT::from(*n),

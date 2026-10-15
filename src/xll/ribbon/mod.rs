@@ -17,6 +17,7 @@ mod dispatch;
 mod icon;
 mod live;
 mod pane;
+pub(super) mod rtd;
 
 use std::cell::RefCell;
 use std::ffi::c_void;
@@ -367,6 +368,7 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
             pump_async(&app);
             crate::xlapi::pump_global();
             pump_macros(&app);
+            rtd::tick();
             pane::tick(&app);
         }
     }));
@@ -558,6 +560,7 @@ fn on_click() {
             match with_runtime(|rt| rt.revoke(&path)) {
                 Ok(()) => {
                     crate::jobs::global().forget_workbook(&path);
+                    crate::streams::global().cancel_workbook(&path);
                     drop(dispatch::call(&app, "CalculateFull", &[]));
                 }
                 Err(e) => {

@@ -62,7 +62,7 @@ jobs:
         run: |
           # Export names are stored as plain ASCII in the PE export table.
           $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes("dist/xll-bridge.xll"))
-          foreach ($n in 'xlAutoOpen','xlAutoClose','xlAutoRemove','xlAutoFree12','xlAddInManagerInfo12','LuaCall','LuaEval','LuaAsync','LuaStatus','DllGetClassObject','DllCanUnloadNow','DllRegisterServer','DllUnregisterServer') {
+          foreach ($n in 'xlAutoOpen','xlAutoClose','xlAutoRemove','xlAutoFree12','xlAddInManagerInfo12','LuaCall','LuaEval','LuaAsync','LuaStream','LuaStatus','DllGetClassObject','DllCanUnloadNow','DllRegisterServer','DllUnregisterServer') {
             if (-not $text.Contains($n)) { throw "missing export $n" }
           }
       - uses: actions/upload-artifact@v4

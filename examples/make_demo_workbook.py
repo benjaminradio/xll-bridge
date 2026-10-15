@@ -27,6 +27,8 @@ ws["A8"] = "hypot(3, 4) via require('lib.mathx')"
 ws["B8"] = '=_xll.LUA.CALL("hypot", 3, 4)'
 ws["A9"] = "slow_hostname (async, ~3 s)"
 ws["B9"] = '=_xll.LUA.ASYNC("slow_hostname")'
+ws["A10"] = "clock (live stream)"
+ws["B10"] = '=_xll.LUA.STREAM("clock")'
 ws["A6"] = "status"
 ws["B6"] = "=_xll.LUA.STATUS()"
 for r, (x, y) in enumerate([(1, 2), (3, 4), (5, 6)], start=11):

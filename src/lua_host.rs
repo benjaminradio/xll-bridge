@@ -142,6 +142,9 @@ impl LuaHost {
                 },
             )?;
         }
+        if worker {
+            install_sleep(&lua, Rc::clone(&limits))?;
+        }
         let native = match ctx.cache_dir {
             Some(dir) => extract_native(bundle, dir)
                 .map_err(|e| HostError::Lua(format!("cannot extract native modules: {e}")))?,
@@ -244,6 +247,40 @@ impl LuaHost {
         let result = f.call::<MultiValue>(()).map(drop);
         *self.limits.borrow_mut() = None;
         Ok(result?)
+    }
+
+    /// Runs a streaming function (a worker state): the function pushes values with `xl.emit(v)`
+    /// for as long as it runs, and a value it returns at the end is pushed too. Only scalars
+    /// can be pushed.
+    pub fn run_stream(
+        &self,
+        func: &str,
+        args: &[Value],
+        sink: Arc<dyn Fn(Value) + Send + Sync>,
+        limits: &Limits,
+    ) -> Result<(), HostError> {
+        let xl: mlua::Table = self.lua.globals().get("xl")?;
+        let emit_sink = Arc::clone(&sink);
+        let emit = self.lua.create_function(move |_, v: LV| {
+            let value = from_lua(&v)?;
+            if matches!(value, Value::Array(_)) {
+                return Err(mlua::Error::runtime(
+                    "a stream can only emit single values, not tables",
+                ));
+            }
+            emit_sink(value);
+            Ok(())
+        })?;
+        xl.set("emit", emit)?;
+        *self.limits.borrow_mut() = Some(limits.clone());
+        let result = self.call(func, args);
+        *self.limits.borrow_mut() = None;
+        xl.set("emit", LV::Nil)?;
+        match result? {
+            Value::Empty => {}
+            last => sink(last),
+        }
+        Ok(())
     }
 
     /// Runs a chunk with the arguments available as `...`. A bare expression is accepted too.
@@ -456,6 +493,33 @@ fn install_range_api(lua: &Lua, workbook: &Path, api: Option<Arc<dyn XlApi>>) ->
                     workbook: w.clone(),
                 },
             )
+        })?,
+    )
+}
+
+/// `xl.sleep(seconds)` for background states: sleeps in short slices so that cancelling or the
+/// deadline end it promptly.
+fn install_sleep(lua: &Lua, limits: Rc<RefCell<Option<Limits>>>) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    xl.set(
+        "sleep",
+        lua.create_function(move |_, seconds: f64| {
+            let end = Instant::now() + Duration::from_secs_f64(seconds.clamp(0.0, 86_400.0));
+            loop {
+                if let Some(l) = limits.borrow().as_ref() {
+                    if l.cancel.load(Ordering::Relaxed) {
+                        return Err(mlua::Error::runtime("cancelled"));
+                    }
+                    if Instant::now() >= l.deadline {
+                        return Err(mlua::Error::runtime("timed out"));
+                    }
+                }
+                let now = Instant::now();
+                if now >= end {
+                    return Ok(());
+                }
+                std::thread::sleep((end - now).min(Duration::from_millis(50)));
+            }
         })?,
     )
 }

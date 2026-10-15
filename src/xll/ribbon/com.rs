@@ -29,8 +29,14 @@ const OBJID_NATIVEOM: u32 = 0xFFFF_FFF0;
 
 // ------------------------------------------------------------------ class factory
 
+#[derive(Clone, Copy)]
+enum Kind {
+    Addin,
+    Rtd,
+}
+
 #[implement(IClassFactory)]
-struct Factory;
+struct Factory(Kind);
 
 impl IClassFactory_Impl for Factory_Impl {
     fn CreateInstance(
@@ -42,7 +48,10 @@ impl IClassFactory_Impl for Factory_Impl {
         if outer.is_some() {
             return Err(CLASS_E_NOAGGREGATION.into());
         }
-        let unknown: IUnknown = Addin.into();
+        let unknown: IUnknown = match self.0 {
+            Kind::Addin => Addin.into(),
+            Kind::Rtd => super::rtd::Rtd.into(),
+        };
         // SAFETY: `iid`/`object` come straight from the COM caller.
         unsafe { unknown.query(iid, object).ok() }
     }
@@ -63,13 +72,17 @@ pub extern "system" fn DllGetClassObject(
             return E_POINTER;
         }
         // SAFETY: non-null pointers from the COM runtime.
-        unsafe {
+        let kind = unsafe {
             *object = std::ptr::null_mut();
-            if *clsid != CLSID_ADDIN {
+            if *clsid == CLSID_ADDIN {
+                Kind::Addin
+            } else if *clsid == super::rtd::CLSID_RTD {
+                Kind::Rtd
+            } else {
                 return windows::Win32::Foundation::CLASS_E_CLASSNOTAVAILABLE;
             }
-        }
-        let factory: IClassFactory = Factory.into();
+        };
+        let factory: IClassFactory = Factory(kind).into();
         // SAFETY: as above.
         unsafe { factory.query(iid, object) }
     })
@@ -188,6 +201,35 @@ pub fn register() -> Result<()> {
         Value::Str(CLSID_STR),
     )?;
 
+    // The real-time data server behind LUA.STREAM.
+    let rtd_class = format!("Software\\Classes\\CLSID\\{}", super::rtd::CLSID_RTD_STR);
+    set_value(&rtd_class, None, Value::Str("xll-bridge Lua streams"))?;
+    set_value(
+        &format!("{rtd_class}\\InprocServer32"),
+        None,
+        Value::Str(&dll),
+    )?;
+    set_value(
+        &format!("{rtd_class}\\InprocServer32"),
+        Some("ThreadingModel"),
+        Value::Str("Apartment"),
+    )?;
+    set_value(
+        &format!("{rtd_class}\\ProgID"),
+        None,
+        Value::Str(super::rtd::PROGID_RTD),
+    )?;
+    set_value(
+        &format!("Software\\Classes\\{}", super::rtd::PROGID_RTD),
+        None,
+        Value::Str("xll-bridge Lua streams"),
+    )?;
+    set_value(
+        &format!("Software\\Classes\\{}\\CLSID", super::rtd::PROGID_RTD),
+        None,
+        Value::Str(super::rtd::CLSID_RTD_STR),
+    )?;
+
     let addin = format!("Software\\Microsoft\\Office\\Excel\\Addins\\{PROGID}");
     set_value(&addin, Some("FriendlyName"), Value::Str("xll-bridge Lua"))?;
     set_value(
@@ -206,6 +248,8 @@ pub fn unregister() -> Result<()> {
         format!("Software\\Microsoft\\Office\\Excel\\Addins\\{PROGID}"),
         format!("Software\\Classes\\CLSID\\{CLSID_STR}"),
         format!("Software\\Classes\\{PROGID}"),
+        format!("Software\\Classes\\CLSID\\{}", super::rtd::CLSID_RTD_STR),
+        format!("Software\\Classes\\{}", super::rtd::PROGID_RTD),
     ] {
         let k = wide(&key);
         // SAFETY: NUL-terminated key name; a missing key is not an error we care about.

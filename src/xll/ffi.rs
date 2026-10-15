@@ -107,6 +107,7 @@ pub const xlGetName: i32 = 9 | xlSpecial;
 pub const xlfCaller: i32 = 89;
 pub const xlfCell: i32 = 125;
 pub const xlfRegister: i32 = 149;
+pub const xlfRtd: i32 = 379;
 pub const xlfUnregister: i32 = 201;
 pub const xlcCalculateNow: i32 = 141 | xlCommand;
 pub const xlcCalculateDocument: i32 = 167 | xlCommand;

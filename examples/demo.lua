@@ -68,3 +68,12 @@ xl.macro("Copy selection to 'Copy' sheet", function()
   local cells = sel:address():match("!(.*)$")
   xl.range("Copy!" .. cells):set(sel:values())
 end)
+
+-- A live stream: =LUA.STREAM("clock") shows the time and keeps updating. A stream function pushes
+-- values with xl.emit(); xl.sleep() waits without blocking Excel. It stops when no cell uses it.
+function clock()
+  while true do
+    xl.emit(os.date("%H:%M:%S"))
+    xl.sleep(1)
+  end
+end

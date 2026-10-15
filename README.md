@@ -114,6 +114,26 @@ not supported and a single operation is limited to 5,000,000 cells.
 * There is deliberately no script editor in the panel: edit your `.lua` files in your own editor
   and use *Import* (or drag them onto the panel).
 
+### Live data: `LUA.STREAM`
+
+```lua
+function clock()                 -- =LUA.STREAM("clock")
+  while true do
+    xl.emit(os.date("%H:%M:%S")) -- push a value; the cell updates
+    xl.sleep(1)                  -- wait without blocking Excel (ends promptly when cancelled)
+  end
+end
+```
+
+A stream function runs on its own thread for as long as some cell shows it, and calls
+`xl.emit(value)` to update the cells (single values only; a value *returned* at the end is pushed
+too). Cells with the same function and arguments share one stream. It is implemented with Excel's
+RTD mechanism (the DLL is also registered as the COM server `XllBridge.Rtd`, under HKCU like the
+ribbon add-in). Only the latest value counts, so a fast stream cannot build a backlog; Excel is
+told about new values by a timer, so updates arrive within about 200 ms. The stream stops when no
+cell uses it, when the workbook's scripts are disabled, or when Excel exits. An error ends it and
+shows `#LUA: ...`. Streams can read and write cells with `xl.range` like `LUA.ASYNC` calls.
+
 ### Macros
 
 `xl.macro("Name", function() ... end)` registers a function that appears in the ribbon's

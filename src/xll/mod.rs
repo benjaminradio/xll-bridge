@@ -5,6 +5,7 @@
 //!
 //! * `LUA.CALL(name, [a1..a10])` — call a global Lua function defined by the workbook's scripts
 //! * `LUA.EVAL(code, [a1..a10])` — evaluate a chunk/expression; arguments are `...`
+//! * `LUA.STREAM(name, [a1..a10])` — a Lua function that pushes values over time (RTD)
 //! * `LUA.STATUS()`              — scripts status for this workbook (none / blocked / enabled)
 
 mod ffi;
@@ -228,6 +229,72 @@ pub extern "system" fn LuaAsync(
     guarded(|| async_dispatch(&all))
 }
 
+/// `LUA.STREAM(function, args...)`: a Lua function that keeps running and pushes values with
+/// `xl.emit(value)`; the cell updates whenever it does. Implemented with Excel's RTD mechanism:
+/// this function only announces the stream and asks Excel for the RTD value of its topic.
+fn stream_dispatch(args: &[*const Xloper12]) -> Value {
+    // SAFETY: Excel passes valid operands (or null/missing) for every registered argument.
+    let vals = unsafe { oper::collect_args(args) };
+    let Some(Value::Str(func)) = vals.first().cloned() else {
+        return Value::Str("#LUA: first argument must be text".into());
+    };
+    let (located, _) = locate_caller_cell();
+    let workbook = located.as_deref().ok();
+    let files = with_runtime(|rt| rt.enabled_files(workbook));
+    let (bundle, digest) = match (files, &located) {
+        (Ok(f), _) => f,
+        (Err(CallError::NoPath), Err(detail)) => return Value::Str(format!("#NOPATH: {detail}")),
+        (Err(e), _) => return error_text(&e),
+    };
+    let workbook = located.expect("enabled_files succeeded, so the path is known");
+    let fn_args = &vals[1..];
+    let key = crate::streams::key_of(&workbook, &digest, &func, fn_args);
+    crate::streams::global().announce(&key, || crate::streams::StreamSpec {
+        workbook,
+        bundle,
+        func,
+        args: fn_args.to_vec(),
+        cache_dir: crate::runtime::native_cache_dir(),
+    });
+
+    let bufs: Vec<Vec<u16>> = [ribbon::rtd::PROGID_RTD, "", key.as_str()]
+        .iter()
+        .map(|s| counted_utf16(s))
+        .collect();
+    let mut ops: Vec<Xloper12> = bufs.iter().map(|b| Xloper12::borrowed_str(b)).collect();
+    let [progid, server, topic] = &mut ops[..] else {
+        unreachable!()
+    };
+    let mut res = Xloper12::nil();
+    let rc = excel12(xlfRtd, Some(&mut res), &mut [progid, server, topic]);
+    // SAFETY: `res` was filled by Excel on success; it is only read before being freed.
+    let value = if rc == xlretSuccess {
+        unsafe { oper::to_value(&res) }
+    } else {
+        Value::Err(crate::value::ErrorCode::NA)
+    };
+    free(&mut res);
+    value
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn LuaStream(
+    f: *const Xloper12,
+    a1: *const Xloper12,
+    a2: *const Xloper12,
+    a3: *const Xloper12,
+    a4: *const Xloper12,
+    a5: *const Xloper12,
+    a6: *const Xloper12,
+    a7: *const Xloper12,
+    a8: *const Xloper12,
+    a9: *const Xloper12,
+    a10: *const Xloper12,
+) -> *mut Xloper12 {
+    let all: [*const Xloper12; UDF_PARAMS] = [f, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10];
+    guarded(|| stream_dispatch(&all))
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn LuaStatus() -> *mut Xloper12 {
     guarded(|| {
@@ -261,7 +328,7 @@ struct FnDef {
     help: &'static str,
 }
 
-const FUNCTIONS: [FnDef; 4] = [
+const FUNCTIONS: [FnDef; 5] = [
     FnDef {
         proc_name: "LuaCall",
         params: UDF_PARAMS,
@@ -282,6 +349,13 @@ const FUNCTIONS: [FnDef; 4] = [
         excel_name: "LUA.ASYNC",
         arg_text: "function,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
         help: "Runs a Lua function in the background so Excel is not blocked; shows #GETTING_DATA until it finishes",
+    },
+    FnDef {
+        proc_name: "LuaStream",
+        params: UDF_PARAMS,
+        excel_name: "LUA.STREAM",
+        arg_text: "function,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
+        help: "Runs a Lua function that keeps pushing values with xl.emit(value); the cell updates live",
     },
     FnDef {
         proc_name: "LuaStatus",
