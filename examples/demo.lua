@@ -59,3 +59,12 @@ function stamp(address)
   xl.range(address):set({ { "written by Lua", os.date("%Y-%m-%d %H:%M:%S") } })
   return "ok"
 end
+
+-- A macro: shows up in the ribbon's Lua > Macros menu. It runs in the background and may change
+-- cells (unlike LUA.CALL). This one writes the selection's values into a "Copy" sheet if there
+-- is one, at the same address.
+xl.macro("Copy selection to 'Copy' sheet", function()
+  local sel = xl.selection()
+  local cells = sel:address():match("!(.*)$")
+  xl.range("Copy!" .. cells):set(sel:values())
+end)

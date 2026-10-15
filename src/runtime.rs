@@ -209,6 +209,14 @@ impl Runtime {
         }
     }
 
+    /// Macros (`xl.macro`) defined by an enabled workbook; empty when it is not enabled.
+    pub fn macro_names(&mut self, workbook: &Path) -> Vec<String> {
+        match self.state(workbook) {
+            Book::Active { host, .. } => host.macro_names(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Digest of the file set on disk for this workbook (None when there are no files).
     pub fn disk_digest(&mut self, workbook: &Path) -> Option<String> {
         match self.state(workbook) {

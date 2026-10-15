@@ -111,6 +111,15 @@ not supported and a single operation is limited to 5,000,000 cells.
 * There is deliberately no script editor in the panel: edit your `.lua` files in your own editor
   and use *Import* (or drag them onto the panel).
 
+### Macros
+
+`xl.macro("Name", function() ... end)` registers a function that appears in the ribbon's
+**Lua > Macros** menu (rebuilt each time the menu opens). Clicking it runs the function in the
+background, in a fresh Lua state built from the workbook's trusted files, so Excel stays
+responsive. Unlike `LUA.CALL`, a macro may change cells. The status bar shows progress and the
+result; a failure opens a message box. A macro is stopped after 5 minutes and the same macro
+cannot run twice at once in a workbook.
+
 ### Running programs from Lua
 
 ```lua

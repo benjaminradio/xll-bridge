@@ -29,8 +29,8 @@ use windows::Win32::System::Com::{
 };
 use windows::Win32::System::Variant::{VARIANT, VT_BYREF, VT_VARIANT};
 use windows::Win32::UI::WindowsAndMessaging::{
-    IDYES, KillTimer, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
-    MB_YESNO, MessageBoxW, SetTimer,
+    IDYES, KillTimer, MB_DEFBUTTON2, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK,
+    MB_SETFOREGROUND, MB_YESNO, MessageBoxW, SetTimer,
 };
 use windows::core::{BSTR, Error, GUID, HRESULT, Interface, PCWSTR, Result, implement, interface};
 
@@ -55,6 +55,9 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
           <button id="btnLuaRefresh" size="large" label="Re-run async" imageMso="RefreshAll"
                   screentip="Re-run async functions" supertip="Throw away the cached results of LUA.ASYNC in the active workbook and run those calls again."
                   onAction="OnRefreshClick"/>
+          <dynamicMenu id="menuLuaMacros" size="large" label="Macros" imageMso="MacroPlay"
+                       screentip="Lua macros" supertip="Run a macro defined with xl.macro(name, fn) in this workbook's scripts. Macros run in the background and may change cells."
+                       getContent="GetMacros" invalidateContentOnDrop="true"/>
           <button id="btnLuaFiles" size="large" label="Files" imageMso="FileOpen"
                   screentip="Lua files" supertip="Show or hide the panel that lists the files embedded in this workbook, with add, delete, rename, import and export."
                   onAction="OnFilesClick"/>
@@ -65,7 +68,7 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
 </customUI>"#;
 
 // IDispatch ids for the ribbon callbacks (names must match RIBBON_XML).
-const CALLBACKS: [(&str, i32); 8] = [
+const CALLBACKS: [(&str, i32); 10] = [
     ("OnRibbonLoad", 1),
     ("GetLabel", 2),
     ("GetScreentip", 3),
@@ -74,6 +77,8 @@ const CALLBACKS: [(&str, i32); 8] = [
     ("OnStatusClick", 6),
     ("OnFilesClick", 7),
     ("OnRefreshClick", 8),
+    ("OnMacroClick", 9),
+    ("GetMacros", 10),
 ];
 
 #[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
@@ -361,9 +366,104 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
             refresh_books(&app);
             pump_async(&app);
             crate::xlapi::pump_global();
+            pump_macros(&app);
             pane::tick(&app);
         }
     }));
+}
+
+// ------------------------------------------------------------------ macros
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// Menu items for the macros of the active workbook (rebuilt each time the menu opens).
+fn macro_menu_xml() -> String {
+    let (path, _) = current();
+    let names = path
+        .as_deref()
+        .map(|p| with_runtime(|rt| rt.macro_names(p)))
+        .unwrap_or_default();
+    let mut xml =
+        String::from(r#"<menu xmlns="http://schemas.microsoft.com/office/2006/01/customui">"#);
+    if names.is_empty() {
+        xml.push_str(r#"<button id="luaMacroNone" label="No macros (define them with xl.macro)" enabled="false"/>"#);
+    }
+    for (i, n) in names.iter().enumerate() {
+        let n = xml_escape(n);
+        xml.push_str(&format!(
+            r#"<button id="luaMacro{i}" label="{n}" tag="{n}" onAction="OnMacroClick"/>"#
+        ));
+    }
+    xml.push_str("</menu>");
+    xml
+}
+
+fn set_status_bar(app: &IDispatch, text: &str) {
+    let _ = dispatch::put(app, "StatusBar", VARIANT::from(text));
+}
+
+fn run_macro(app: &IDispatch, name: &str) {
+    let owner = excel_hwnd(app);
+    let Some(path) = active_workbook_path(app) else {
+        message(
+            owner,
+            "Save the workbook first.",
+            "Lua",
+            MB_OK | MB_ICONINFORMATION,
+        );
+        return;
+    };
+    let files = with_runtime(|rt| rt.enabled_files(Some(&path)));
+    let started = files.map_err(|e| e.to_string()).and_then(|(bundle, _)| {
+        crate::macros::global().start(
+            &path,
+            bundle,
+            name,
+            crate::runtime::native_cache_dir(),
+            crate::macros::MACRO_TIMEOUT,
+        )
+    });
+    match started {
+        Ok(()) => set_status_bar(app, &format!("Lua: running {name} ...")),
+        Err(e) => {
+            message(
+                owner,
+                &format!("Cannot run '{name}': {e}"),
+                "Lua",
+                MB_OK | MB_ICONERROR,
+            );
+        }
+    }
+}
+
+/// Reports macros that have finished: status bar on success, a message on failure.
+fn pump_macros(app: &IDispatch) {
+    for f in crate::macros::global().take_finished() {
+        match f.result {
+            Ok(()) => set_status_bar(
+                app,
+                &format!(
+                    "Lua: {} finished in {:.1} s",
+                    f.name,
+                    f.elapsed.as_secs_f64()
+                ),
+            ),
+            Err(e) => {
+                set_status_bar(app, &format!("Lua: {} failed", f.name));
+                message(
+                    excel_hwnd(app),
+                    &format!("The macro '{}' failed:\n\n{e}", f.name),
+                    "Lua",
+                    MB_OK | MB_ICONERROR,
+                );
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ button click
@@ -553,6 +653,20 @@ impl IDispatch_Impl for Addin_Impl {
                     let pic = icon::picture(current().1.light)?;
                     ret(VARIANT::from(pic), result, params);
                 }
+                9 => {
+                    // onAction(control): the macro name travels in the button's tag.
+                    if params.cArgs >= 1 && !params.rgvarg.is_null() {
+                        // SAFETY: at least one argument present.
+                        let tag = IDispatch::try_from(unsafe { &*params.rgvarg })
+                            .ok()
+                            .and_then(|c| dispatch::get(&c, "Tag").ok())
+                            .and_then(|v| bstr_of(&v));
+                        if let (Some(tag), Some(app)) = (tag, app()) {
+                            run_macro(&app, &tag);
+                        }
+                    }
+                }
+                10 => ret(VARIANT::from(macro_menu_xml().as_str()), result, params),
                 8 => {
                     crate::log::note("ribbon: Re-run async clicked");
                     if let Some(app) = app() {
@@ -710,8 +824,8 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 8,
-            "onLoad + 5 on the status button + 1 on the files button"
+            checked, 9,
+            "onLoad + 5 on the status button + refresh + files + the macro menu"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));
     }

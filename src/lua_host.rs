@@ -123,6 +123,7 @@ impl LuaHost {
         install_embedded_fs(&lua, &shared)?;
         install_process_api(&lua)?;
         install_range_api(&lua, ctx.workbook, ctx.xl.clone())?;
+        install_macro_api(&lua)?;
         let limits: Rc<RefCell<Option<Limits>>> = Rc::new(RefCell::new(None));
         if worker {
             let hook_limits = Rc::clone(&limits);
@@ -214,6 +215,35 @@ impl LuaHost {
         let result = self.call(func, args);
         *self.limits.borrow_mut() = None;
         result
+    }
+
+    /// Names registered with `xl.macro(name, fn)`, sorted.
+    pub fn macro_names(&self) -> Vec<String> {
+        let Ok(xl) = self.lua.globals().get::<mlua::Table>("xl") else {
+            return Vec::new();
+        };
+        let Ok(macros) = xl.get::<mlua::Table>("macros") else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = macros
+            .pairs::<String, LV>()
+            .filter_map(|p| p.ok().map(|(k, _)| k))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Runs the macro `name` (a worker state; see [`LuaHost::new_worker`]) under `limits`.
+    pub fn call_macro(&self, name: &str, limits: &Limits) -> Result<(), HostError> {
+        let xl: mlua::Table = self.lua.globals().get("xl")?;
+        let macros: mlua::Table = xl.get("macros")?;
+        let LV::Function(f) = macros.get::<LV>(name)? else {
+            return Err(HostError::Undefined(name.to_owned()));
+        };
+        *self.limits.borrow_mut() = Some(limits.clone());
+        let result = f.call::<MultiValue>(()).map(drop);
+        *self.limits.borrow_mut() = None;
+        Ok(result?)
     }
 
     /// Runs a chunk with the arguments available as `...`. A bare expression is accepted too.
@@ -426,6 +456,23 @@ fn install_range_api(lua: &Lua, workbook: &Path, api: Option<Arc<dyn XlApi>>) ->
                     workbook: w.clone(),
                 },
             )
+        })?,
+    )
+}
+
+/// `xl.macro(name, fn)`: registers a function that the ribbon's Macros menu can run. Macros run
+/// in the background like `LUA.ASYNC` calls but may change cells.
+fn install_macro_api(lua: &Lua) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    let macros = lua.create_table()?;
+    xl.set("macros", macros.clone())?;
+    xl.set(
+        "macro",
+        lua.create_function(move |_, (name, f): (String, Function)| {
+            if name.trim().is_empty() {
+                return Err(mlua::Error::runtime("a macro needs a name"));
+            }
+            macros.set(name, f)
         })?,
     )
 }
@@ -863,6 +910,42 @@ mod tests {
                 .to_string()
                 .contains("not available")
         );
+    }
+
+    #[test]
+    fn macros_are_listed_and_run_with_limits() {
+        let b = bundle_of(&[(
+            "t.lua",
+            "xl.macro('zeta', function() end) xl.macro('alpha', function() xl.range('A1'):set(5) end) \
+             xl.macro('boom', function() error('kaput') end)",
+        )]);
+        let g = crate::xlapi::fake::MemGrid::new();
+        let h = LuaHost::new_worker(
+            &b,
+            &HostContext {
+                workbook: Path::new("/tmp/book.xlsx"),
+                cache_dir: None,
+                xl: Some(Arc::clone(&g) as Arc<dyn XlApi>),
+            },
+        )
+        .unwrap();
+        assert_eq!(h.macro_names(), ["alpha", "boom", "zeta"]);
+        let limits = Limits {
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        h.call_macro("alpha", &limits).unwrap();
+        assert_eq!(g.get("Data", "A1"), Value::Num(5.0));
+        assert!(
+            h.call_macro("boom", &limits)
+                .unwrap_err()
+                .to_string()
+                .contains("kaput")
+        );
+        assert!(matches!(
+            h.call_macro("nope", &limits),
+            Err(HostError::Undefined(_))
+        ));
     }
 
     #[test]
