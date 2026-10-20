@@ -24,7 +24,10 @@ use windows::Win32::System::Com::{
     SAFEARRAY, SAFEARRAYBOUND,
 };
 use windows::Win32::System::Ole::{SafeArrayAccessData, SafeArrayCreate, SafeArrayUnaccessData};
-use windows::Win32::System::Variant::{VARIANT, VT_VARIANT};
+use windows::Win32::System::Variant::{
+    VARENUM, VARIANT, VT_ARRAY, VT_BOOL, VT_BYREF, VT_DISPATCH, VT_I2, VT_I4, VT_UNKNOWN,
+    VT_VARIANT,
+};
 use windows::core::{BSTR, Error, GUID, HRESULT, Interface, PCWSTR, Result, implement, interface};
 
 use super::cells::variant_of;
@@ -150,26 +153,221 @@ impl IDispatch_Impl for Rtd_Impl {
     fn GetIDsOfNames(
         &self,
         _: *const GUID,
-        _: *const PCWSTR,
+        names: *const PCWSTR,
+        count: u32,
         _: u32,
-        _: u32,
-        _: *mut i32,
+        ids: *mut i32,
     ) -> Result<()> {
-        // Excel uses the vtable; late binding is not offered.
-        Err(Error::from_hresult(HRESULT(0x8002_0006u32 as i32))) // DISP_E_UNKNOWNNAME
+        // Excel may call the server late-bound (by name) instead of through the vtable.
+        let mut missing = false;
+        for i in 0..count as usize {
+            // SAFETY: the caller provides `count` names and `count` id slots.
+            let (name, slot) =
+                unsafe { ((*names.add(i)).to_string().unwrap_or_default(), ids.add(i)) };
+            let id = (i == 0).then(|| dispid_of(&name)).flatten();
+            if id.is_none() && i == 0 {
+                problem(&format!("Excel asked for an unknown member '{name}'"));
+                missing = true;
+            }
+            // SAFETY: see above.
+            unsafe { *slot = id.unwrap_or(-1) };
+        }
+        if missing {
+            Err(Error::from_hresult(HRESULT(0x8002_0006u32 as i32))) // DISP_E_UNKNOWNNAME
+        } else {
+            Ok(())
+        }
     }
+
     fn Invoke(
         &self,
-        _: i32,
+        id: i32,
         _: *const GUID,
         _: u32,
         _: DISPATCH_FLAGS,
-        _: *const DISPPARAMS,
-        _: *mut VARIANT,
+        params: *const DISPPARAMS,
+        result: *mut VARIANT,
         _: *mut EXCEPINFO,
         _: *mut u32,
     ) -> Result<()> {
-        Err(Error::from_hresult(DISP_E_MEMBERNOTFOUND))
+        if params.is_null() {
+            return Err(Error::from_hresult(E_POINTER));
+        }
+        // SAFETY: non-null, supplied by the caller for this call.
+        let params = unsafe { &*params };
+        let hr = guarded(|| invoke(self, id, params, result));
+        hr.ok()
+    }
+}
+
+// ------------------------------------------------------------------ late-bound calls
+
+// DISPIDs of IRtdServer in Excel's type library.
+const ID_SERVER_START: i32 = 10;
+const ID_CONNECT_DATA: i32 = 11;
+const ID_REFRESH_DATA: i32 = 12;
+const ID_DISCONNECT_DATA: i32 = 13;
+const ID_HEARTBEAT: i32 = 14;
+const ID_SERVER_TERMINATE: i32 = 15;
+
+fn dispid_of(name: &str) -> Option<i32> {
+    [
+        ("ServerStart", ID_SERVER_START),
+        ("ConnectData", ID_CONNECT_DATA),
+        ("RefreshData", ID_REFRESH_DATA),
+        ("DisconnectData", ID_DISCONNECT_DATA),
+        ("Heartbeat", ID_HEARTBEAT),
+        ("ServerTerminate", ID_SERVER_TERMINATE),
+    ]
+    .into_iter()
+    .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    .map(|(_, id)| id)
+}
+
+/// The `i`th argument counted from the left (IDispatch passes them right to left).
+fn arg(params: &DISPPARAMS, i: usize) -> Option<&VARIANT> {
+    let n = params.cArgs as usize;
+    if i >= n || params.rgvarg.is_null() {
+        return None;
+    }
+    // SAFETY: rgvarg holds cArgs entries.
+    Some(unsafe { &*params.rgvarg.add(n - 1 - i) })
+}
+
+/// A by-value or by-reference integer argument, and where it lives if it was by reference.
+fn int_arg(v: &VARIANT) -> Option<(i32, Option<*mut i32>)> {
+    let raw = v.vt().0;
+    let by_ref = raw & VT_BYREF.0 != 0;
+    // SAFETY: each branch reads the union member that the type tag says is active.
+    unsafe {
+        let a = &*v.Anonymous.Anonymous;
+        match (raw & !VT_BYREF.0, by_ref) {
+            (t, false) if t == VT_I4.0 => Some((a.Anonymous.lVal, None)),
+            (t, true) if t == VT_I4.0 => {
+                let p = a.Anonymous.plVal;
+                (!p.is_null()).then(|| (*p, Some(p)))
+            }
+            (t, false) if t == VT_I2.0 => Some((i32::from(a.Anonymous.iVal), None)),
+            _ => None,
+        }
+    }
+}
+
+fn set_int(result: *mut VARIANT, value: i32) {
+    if !result.is_null() {
+        // SAFETY: caller-provided result slot, holding no valid VARIANT yet.
+        unsafe { result.write(VARIANT::from(value)) };
+    }
+}
+
+fn invoke(this: &Rtd_Impl, id: i32, params: &DISPPARAMS, result: *mut VARIANT) -> HRESULT {
+    let bad_args = HRESULT(0x8002_0005u32 as i32); // DISP_E_TYPEMISMATCH
+    match id {
+        ID_SERVER_START => {
+            let Some(cb) = arg(params, 0) else {
+                return bad_args;
+            };
+            // SAFETY: the VARIANT holds a COM pointer when its tag says so; we only borrow it.
+            let raw = unsafe {
+                let a = &*cb.Anonymous.Anonymous;
+                match cb.vt() {
+                    t if t == VT_DISPATCH => a.Anonymous.pdispVal.as_ref().map(|d| d.as_raw()),
+                    t if t == VT_UNKNOWN => a.Anonymous.punkVal.as_ref().map(|d| d.as_raw()),
+                    _ => None,
+                }
+            };
+            let mut started = 0;
+            // SAFETY: `raw` is a live interface pointer for the duration of the call.
+            let hr = unsafe {
+                IRtdServer_Impl::ServerStart(
+                    this,
+                    raw.unwrap_or(std::ptr::null_mut()),
+                    &mut started,
+                )
+            };
+            set_int(result, started);
+            hr
+        }
+        ID_CONNECT_DATA => {
+            let (Some(topic), Some(strings), gnv) =
+                (arg(params, 0), arg(params, 1), arg(params, 2))
+            else {
+                return bad_args;
+            };
+            let Some((topic, _)) = int_arg(topic) else {
+                return bad_args;
+            };
+            // The array arrives by reference (SAFEARRAY**) or by value (SAFEARRAY*).
+            // SAFETY: reads the member the type tag says is active.
+            let mut sa: *mut SAFEARRAY = unsafe {
+                let a = &*strings.Anonymous.Anonymous;
+                if strings.vt().0 & VT_BYREF.0 != 0 {
+                    let pp = a.Anonymous.pparray;
+                    if pp.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        *pp
+                    }
+                } else {
+                    a.Anonymous.parray
+                }
+            };
+            let mut flag = VARIANT_BOOL(0);
+            // SAFETY: as above; a by-reference VT_BOOL points at the caller's flag.
+            let flag_ptr: *mut VARIANT_BOOL = gnv
+                .and_then(|g| unsafe {
+                    let a = &*g.Anonymous.Anonymous;
+                    (g.vt().0 == VT_BYREF.0 | VT_BOOL.0).then_some(a.Anonymous.pboolVal)
+                })
+                .filter(|p| !p.is_null())
+                .unwrap_or(&mut flag);
+            let mut local = VARIANT::default();
+            let out = if result.is_null() {
+                &mut local as *mut VARIANT
+            } else {
+                result
+            };
+            // SAFETY: all pointers are valid for the call.
+            unsafe { IRtdServer_Impl::ConnectData(this, topic, &mut sa, flag_ptr, out) }
+        }
+        ID_REFRESH_DATA => {
+            let count = arg(params, 0).and_then(int_arg).and_then(|(_, p)| p);
+            let mut local = 0;
+            let mut sa: *mut SAFEARRAY = std::ptr::null_mut();
+            // SAFETY: valid out pointers.
+            let hr =
+                unsafe { IRtdServer_Impl::RefreshData(this, count.unwrap_or(&mut local), &mut sa) };
+            if hr.is_ok() && !result.is_null() {
+                let mut out = VARIANT::default();
+                // SAFETY: filling a fresh VARIANT with the array we own; it takes ownership.
+                unsafe {
+                    let inner = &mut *out.Anonymous.Anonymous;
+                    inner.vt = VARENUM(VT_ARRAY.0 | VT_VARIANT.0);
+                    inner.Anonymous.parray = sa;
+                    result.write(out);
+                }
+            }
+            hr
+        }
+        ID_DISCONNECT_DATA => {
+            let Some((topic, _)) = arg(params, 0).and_then(int_arg) else {
+                return bad_args;
+            };
+            // SAFETY: plain call.
+            unsafe { IRtdServer_Impl::DisconnectData(this, topic) }
+        }
+        ID_HEARTBEAT => {
+            let mut beat = 0;
+            // SAFETY: valid out pointer.
+            let hr = unsafe { IRtdServer_Impl::Heartbeat(this, &mut beat) };
+            set_int(result, beat);
+            hr
+        }
+        ID_SERVER_TERMINATE => {
+            // SAFETY: plain call.
+            unsafe { IRtdServer_Impl::ServerTerminate(this) }
+        }
+        _ => DISP_E_MEMBERNOTFOUND,
     }
 }
 
@@ -344,5 +542,19 @@ mod tests {
         assert!(unsafe { server.RefreshData(&mut count, &mut sa) }.is_ok());
         assert_eq!(count, 0);
         assert!(!sa.is_null());
+    }
+
+    #[test]
+    fn late_bound_calls_reach_the_same_methods() {
+        // SAFETY: standard COM bootstrap on the test thread.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        let unknown: IUnknown = Rtd::new().into();
+        let disp: IDispatch = unknown.cast().unwrap();
+        let beat = crate::xll::ribbon::dispatch::call(&disp, "Heartbeat", &[]).unwrap();
+        assert_eq!(i32::try_from(&beat).unwrap(), 1);
+        let refreshed = crate::xll::ribbon::dispatch::call(&disp, "RefreshData", &[]).unwrap();
+        assert_eq!(refreshed.vt().0, VT_ARRAY.0 | VT_VARIANT.0);
+        assert!(crate::xll::ribbon::dispatch::call(&disp, "NoSuchThing", &[]).is_err());
+        crate::xll::ribbon::dispatch::call(&disp, "ServerTerminate", &[]).unwrap();
     }
 }
