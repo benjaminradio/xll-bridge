@@ -212,6 +212,23 @@ Add-ins dialog (`xlAutoRemove`) deletes those keys; `regsvr32`-style `DllRegiste
 `DllUnregisterServer` are exported too. A 500 ms timer on Excel's UI thread notices workbook switches and
 refreshes the button. If the COM side fails for any reason the worksheet functions keep working.
 
+## Testing builds quickly
+
+Run `dev-run.ps1` (in the downloaded package) instead of using the Add-ins dialog:
+
+```powershell
+.\dev-run.ps1                 # unblocks + copies the .xll and demo.xlsx to a fresh folder, opens Excel
+.\dev-run.ps1 -ResetTrust     # also forget trusted workbooks and the extracted-DLL cache
+.\dev-run.ps1 -Clean          # only remove leftovers
+```
+
+The `.xll` is opened directly (like File > Open), so it is loaded for that session only and never
+appears in the Add-ins list. Each run first removes what the previous one left behind: the add-in's
+per-user COM registrations (ribbon and stream server) and Excel's remembered "open this add-in at
+startup" entries, which are what produce the "missing add-in" message after the file is deleted.
+Close Excel normally when you are finished. `-ResetResiliency` re-enables add-ins Excel disabled
+after a crash, and `-TrustFolder` adds the test folder as an Excel Trusted Location.
+
 ## Troubleshooting
 
 * **How a formula finds its workbook:** a worksheet function cannot call back into Excel while it is
