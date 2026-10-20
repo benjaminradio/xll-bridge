@@ -264,16 +264,18 @@ fn stream_dispatch(args: &[*const Xloper12]) -> Value {
         cache_dir: crate::runtime::native_cache_dir(),
     });
 
-    let bufs: Vec<Vec<u16>> = [ribbon::rtd::PROGID_RTD, "", key.as_str()]
+    // RTD(progid, , topic): the server argument is omitted, meaning this machine.
+    let bufs: Vec<Vec<u16>> = [ribbon::rtd::PROGID_RTD, key.as_str()]
         .iter()
         .map(|s| counted_utf16(s))
         .collect();
     let mut ops: Vec<Xloper12> = bufs.iter().map(|b| Xloper12::borrowed_str(b)).collect();
-    let [progid, server, topic] = &mut ops[..] else {
+    let [progid, topic] = &mut ops[..] else {
         unreachable!()
     };
+    let mut server = Xloper12::missing();
     let mut res = Xloper12::nil();
-    let rc = excel12(xlfRtd, Some(&mut res), &mut [progid, server, topic]);
+    let rc = excel12(xlfRtd, Some(&mut res), &mut [progid, &mut server, topic]);
     // SAFETY: `res` was filled by Excel on success; it is only read before being freed.
     let value = if rc == xlretSuccess {
         unsafe { oper::to_value(&res) }
@@ -319,7 +321,11 @@ pub extern "system" fn LuaStatus() -> *mut Xloper12 {
                     names.len()
                 )
             }
-            Status::Active { .. } => format!("Lua enabled; {}", ribbon::rtd::summary()),
+            Status::Active { .. } => format!(
+                "Lua enabled; {}; {}",
+                ribbon::rtd::summary(),
+                ribbon::rtd::self_test()
+            ),
             Status::Failed { message } => format!("Lua failed to load: {message}"),
         });
         Value::Str(s)
