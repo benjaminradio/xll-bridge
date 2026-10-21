@@ -130,9 +130,9 @@ A stream function runs on its own thread for as long as some cell shows it, and 
 too). Cells with the same function and arguments share one stream. It is implemented with Excel's
 RTD mechanism (the DLL is also registered as the COM server `XllBridge.Rtd`, under HKCU like the
 ribbon add-in). Only the latest value counts, so a fast stream cannot build a backlog; Excel is
-told about new values by a timer, so updates arrive within about 200 ms. The stream stops when no
+told about new values by a timer, but Excel itself batches real-time updates to its *throttle interval* (2 seconds by default, so a stream that emits every second shows a new value every 2 seconds; lower it with `Application.RTD.ThrottleInterval = 500` in the VBA immediate window, a per-user Excel setting). The stream stops when no
 cell uses it, when the workbook's scripts are disabled, or when Excel exits. An error ends it and
-shows `#LUA: ...`. If a stream cell never shows a value, `=LUA.STATUS()` reports how far the RTD server got (created / started / connected, and the last problem). Streams can read and write cells with `xl.range` like `LUA.ASYNC` calls.
+shows `#LUA: ...`. If a stream cell never shows a value, `=LUA.STATUS()` reports how far the RTD server got (created / started / connected / disconnected, streams running now, and the last problem). Streams can read and write cells with `xl.range` like `LUA.ASYNC` calls.
 
 ### Macros
 

@@ -67,6 +67,7 @@ pub(super) unsafe trait IRTDUpdateEvent: IDispatch {
 static CREATED: AtomicU32 = AtomicU32::new(0);
 static STARTED: AtomicU32 = AtomicU32::new(0);
 static CONNECTS: AtomicU32 = AtomicU32::new(0);
+static DISCONNECTS: AtomicU32 = AtomicU32::new(0);
 static LAST_PROBLEM: Mutex<String> = Mutex::new(String::new());
 
 fn problem(msg: &str) {
@@ -98,10 +99,12 @@ pub(crate) fn self_test() -> String {
 pub(crate) fn summary() -> String {
     let last = LAST_PROBLEM.lock().map(|p| p.clone()).unwrap_or_default();
     format!(
-        "rtd: created {}, started {}, connected {}{}",
+        "rtd: created {}, started {}, connected {}, disconnected {}, streams running {}{}",
         CREATED.load(Ordering::Relaxed),
         STARTED.load(Ordering::Relaxed),
         CONNECTS.load(Ordering::Relaxed),
+        DISCONNECTS.load(Ordering::Relaxed),
+        crate::streams::global().running(),
         if last.is_empty() {
             String::new()
         } else {
@@ -498,6 +501,7 @@ impl IRtdServer_Impl for Rtd_Impl {
     unsafe fn DisconnectData(&self, topic_id: i32) -> HRESULT {
         guarded(|| {
             crate::streams::global().disconnect(topic_id);
+            DISCONNECTS.fetch_add(1, Ordering::Relaxed);
             S_OK
         })
     }
