@@ -18,6 +18,10 @@
   .\dev-run.ps1                      # fresh copy of xll-bridge.xll + demo.xlsx next to this script
   .\dev-run.ps1 -Xll C:\dl\xll-bridge.xll -Workbook C:\dl\demo.xlsx -ResetTrust
   .\dev-run.ps1 -Clean               # only clean up, do not start Excel
+
+  If PowerShell says the script "is not digitally signed", run it once as
+    powershell -ExecutionPolicy Bypass -File .\dev-run.ps1
+  or unblock it first:  Unblock-File .\dev-run.ps1
 #>
 [CmdletBinding()]
 param(
@@ -90,14 +94,19 @@ $stage = Join-Path $root (Get-Date -Format 'yyyyMMdd-HHmmss')
 New-Item $stage -ItemType Directory | Out-Null
 $stagedXll = Join-Path $stage 'xll-bridge.xll'
 Copy-Item $Xll $stagedXll
-$args = @("`"$stagedXll`"")
+$excelArgs = @("`"$stagedXll`"")
 if ($Workbook) {
-    $stagedBook = Join-Path $stage (Split-Path $Workbook -Leaf)
-    Copy-Item $Workbook $stagedBook
-    $args += "`"$stagedBook`""
+    # The workbook goes to a fixed folder: Lua trust is tied to the workbook's path, so a new
+    # folder every run would ask you to enable the scripts every time.
+    $work = Join-Path $root 'work'
+    New-Item $work -ItemType Directory -Force | Out-Null
+    $stagedBook = Join-Path $work (Split-Path $Workbook -Leaf)
+    Copy-Item $Workbook $stagedBook -Force
+    Unblock-File $stagedBook
+    $excelArgs += "`"$stagedBook`""
 }
 Get-ChildItem $stage | Unblock-File   # removes the "downloaded from the internet" mark
-Get-ChildItem $root -Directory | Sort-Object Name -Descending | Select-Object -Skip 3 |
+Get-ChildItem $root -Directory | Where-Object Name -ne 'work' | Sort-Object Name -Descending | Select-Object -Skip 3 |
     ForEach-Object { Remove-Item $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
 
 if ($TrustFolder) {
@@ -114,5 +123,5 @@ if ($TrustFolder) {
 }
 
 Write-Host "Starting Excel with $stagedXll"
-Start-Process excel.exe -ArgumentList $args
+Start-Process excel.exe -ArgumentList $excelArgs
 Write-Host 'When you are done, just close Excel; the next run (or -Clean) removes the leftovers.'
