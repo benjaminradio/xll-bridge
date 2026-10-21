@@ -49,7 +49,6 @@ jobs:
           cp target/release/xll_bridge.dll dist/xll-bridge.xll
           cp target/release/xllb-pack.exe dist/
           cp examples/demo.lua dist/
-          cp scripts/dev-run.ps1 dist/
           python -m pip install --quiet openpyxl
           python examples/make_demo_workbook.py dist/demo-plain.xlsx
           ./dist/xllb-pack.exe embed dist/demo-plain.xlsx dist/demo.xlsx examples/demo.lua examples/lib
