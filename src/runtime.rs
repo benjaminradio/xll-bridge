@@ -245,6 +245,26 @@ impl Runtime {
         allowed && self.trust.pretrust(workbook, new_digest).is_ok()
     }
 
+    /// Makes `bundle` the trusted, running file set of `workbook` right away, without waiting for
+    /// the workbook to be saved. For a folder the user linked on purpose (see `sync`): the files
+    /// are theirs. Saving later keeps the running state, since the saved digest matches.
+    pub fn apply_live(&mut self, workbook: &Path, bundle: &Bundle) -> std::io::Result<()> {
+        if bundle.file_count() == 0 {
+            return Err(std::io::Error::other("there are no files to run"));
+        }
+        let digest = bundle.digest();
+        self.trust.pretrust(workbook, &digest)?;
+        let mtime = std::fs::metadata(workbook).and_then(|m| m.modified()).ok();
+        self.books.insert(
+            normalize_path(workbook),
+            Entry {
+                mtime,
+                book: activate(workbook, bundle, digest),
+            },
+        );
+        Ok(())
+    }
+
     /// A file set the user authored in an unsaved workbook has now been saved to `workbook`:
     /// trust it (if the saved digest is the one they authored) and reload so it activates.
     pub fn adopt_authored(&mut self, workbook: &Path, digest: &str) -> bool {
@@ -543,6 +563,19 @@ mod tests {
         assert!(matches!(rt.status(&wb), Status::Blocked { .. }));
         rt.enable(&wb).unwrap();
         assert_eq!(rt.call(Some(&wb), "one", &[]).unwrap(), Value::Num(1.0));
+    }
+
+    #[test]
+    fn a_live_file_set_runs_before_the_workbook_is_saved() {
+        let (_d, wb) = workbook_with("function one() return 1 end");
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        // Not trusted yet, and the new file set is not on disk.
+        let live =
+            crate::package::testutil::bundle_of(&[("main.lua", "function one() return 2 end")]);
+        rt.apply_live(&wb, &live).unwrap();
+        assert_eq!(rt.call(Some(&wb), "one", &[]).unwrap(), Value::Num(2.0));
+        assert!(matches!(rt.status(&wb), Status::Active { .. }));
+        assert!(rt.apply_live(&wb, &Bundle::new()).is_err());
     }
 
     #[test]

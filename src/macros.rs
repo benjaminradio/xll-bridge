@@ -6,7 +6,7 @@
 //! host to report ([`Macros::take_finished`]).
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ pub struct Finished {
 
 #[derive(Default)]
 pub struct Macros {
-    running: Mutex<Vec<(PathBuf, String)>>,
+    running: Mutex<Vec<(PathBuf, String, Arc<AtomicBool>)>>,
     finished: Mutex<Vec<Finished>>,
 }
 
@@ -40,25 +40,30 @@ impl Macros {
         timeout: Duration,
     ) -> Result<(), String> {
         let id = (workbook.to_owned(), name.to_owned());
+        let cancel = Arc::new(AtomicBool::new(false));
         {
             let mut running = self.running.lock().unwrap();
-            if running.contains(&id) {
+            if running.iter().any(|(w, n, _)| *w == id.0 && *n == id.1) {
                 return Err(format!("'{name}' is already running"));
             }
-            running.push(id.clone());
+            running.push((id.0.clone(), id.1.clone(), Arc::clone(&cancel)));
         }
         let this = Arc::clone(self);
         let spawned = std::thread::Builder::new()
             .name(format!("lua-macro-{name}"))
             .spawn({
                 let id = id.clone();
+                let cancel = Arc::clone(&cancel);
                 move || {
                     let started = Instant::now();
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        run(&id.0, &bundle, &id.1, cache_dir.as_deref(), timeout)
+                        run(&id.0, &bundle, &id.1, cache_dir.as_deref(), timeout, cancel)
                     }))
                     .unwrap_or_else(|_| Err("the macro crashed".to_owned()));
-                    this.running.lock().unwrap().retain(|r| *r != id);
+                    this.running
+                        .lock()
+                        .unwrap()
+                        .retain(|(w, n, _)| !(*w == id.0 && *n == id.1));
                     this.finished.lock().unwrap().push(Finished {
                         name: id.1,
                         workbook: id.0,
@@ -68,7 +73,10 @@ impl Macros {
                 }
             });
         if let Err(e) = spawned {
-            self.running.lock().unwrap().retain(|r| *r != id);
+            self.running
+                .lock()
+                .unwrap()
+                .retain(|(w, n, _)| !(*w == id.0 && *n == id.1));
             return Err(format!("cannot start a thread: {e}"));
         }
         Ok(())
@@ -83,7 +91,19 @@ impl Macros {
             .lock()
             .unwrap()
             .iter()
-            .any(|(w, n)| w == workbook && n == name)
+            .any(|(w, n, _)| w == workbook && n == name)
+    }
+
+    /// Anything running at all?
+    pub fn any_running(&self) -> bool {
+        !self.running.lock().unwrap().is_empty()
+    }
+
+    /// Asks every running macro to stop (also ends the programs they are waiting for).
+    pub fn cancel_all(&self) {
+        for (_, _, c) in self.running.lock().unwrap().iter() {
+            c.store(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -93,6 +113,7 @@ fn run(
     name: &str,
     cache_dir: Option<&Path>,
     timeout: Duration,
+    cancel: Arc<AtomicBool>,
 ) -> Result<(), String> {
     let host = LuaHost::new_worker(
         bundle,
@@ -105,11 +126,13 @@ fn run(
     .map_err(|e| e.to_string())?;
     let limits = Limits {
         deadline: Instant::now() + timeout,
-        cancel: Arc::new(AtomicBool::new(false)),
+        cancel,
     };
     host.call_macro(name, &limits).map_err(|e| {
         let m = e.to_string();
-        if m.contains("timed out") {
+        if m.contains("cancelled") {
+            "stopped".to_owned()
+        } else if m.contains("timed out") {
             format!("timed out after {} s", timeout.as_secs())
         } else {
             m
@@ -161,6 +184,38 @@ mod tests {
             .unwrap();
         assert!(wait(&m).result.unwrap_err().contains("timed out"));
         assert!(!m.is_running(wb, "spin"));
+    }
+
+    #[test]
+    fn running_macros_can_be_stopped() {
+        let m = Arc::new(Macros::default());
+        let b = Arc::new(bundle_of(&[(
+            "t.lua",
+            "xl.macro('spin', function() while true do end end) \
+             xl.macro('wait', function() xl.sleep(60) end)",
+        )]));
+        let wb = Path::new("/w/book.xlsx");
+        m.start(wb, Arc::clone(&b), "spin", None, MACRO_TIMEOUT)
+            .unwrap();
+        m.start(wb, b, "wait", None, MACRO_TIMEOUT).unwrap();
+        assert!(m.any_running());
+        m.cancel_all();
+        let mut done = Vec::new();
+        let start = Instant::now();
+        while done.len() < 2 {
+            done.extend(m.take_finished());
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "macros never stopped"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        done.sort_by(|a, b| a.name.cmp(&b.name));
+        assert!(
+            done.iter().all(|f| f.result == Err("stopped".to_owned())),
+            "{done:?}"
+        );
+        assert!(!m.any_running());
     }
 
     #[test]

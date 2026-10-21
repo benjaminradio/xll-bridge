@@ -14,6 +14,7 @@ mod cells;
 mod com;
 mod dialogs;
 mod dispatch;
+mod folder;
 mod icon;
 mod live;
 mod pane;
@@ -59,6 +60,9 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
           <dynamicMenu id="menuLuaMacros" size="large" label="Macros" imageMso="MacroPlay"
                        screentip="Lua macros" supertip="Run a macro defined with xl.macro(name, fn) in this workbook's scripts. Macros run in the background and may change cells."
                        getContent="GetMacros" invalidateContentOnDrop="true"/>
+          <button id="btnLuaSync" size="large" label="Sync folder" imageMso="ImportMoreMenu"
+                  screentip="Sync scripts from a folder" supertip="Keep this workbook's embedded Lua files in step with a folder on disk, so you can edit them in your own editor. The folder is the source of truth."
+                  onAction="OnSyncClick"/>
           <button id="btnLuaFiles" size="large" label="Files" imageMso="FileOpen"
                   screentip="Lua files" supertip="Show or hide the panel that lists the files embedded in this workbook, with add, delete, rename, import and export."
                   onAction="OnFilesClick"/>
@@ -69,7 +73,7 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
 </customUI>"#;
 
 // IDispatch ids for the ribbon callbacks (names must match RIBBON_XML).
-const CALLBACKS: [(&str, i32); 10] = [
+const CALLBACKS: [(&str, i32); 11] = [
     ("OnRibbonLoad", 1),
     ("GetLabel", 2),
     ("GetScreentip", 3),
@@ -80,6 +84,7 @@ const CALLBACKS: [(&str, i32); 10] = [
     ("OnRefreshClick", 8),
     ("OnMacroClick", 9),
     ("GetMacros", 10),
+    ("OnSyncClick", 11),
 ];
 
 #[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
@@ -214,6 +219,11 @@ thread_local! {
 /// The local path of the open workbook called `name` (e.g. `demo.xlsx`), if known.
 pub(super) fn workbook_path_by_name(name: &str) -> Option<PathBuf> {
     BOOKS.with(|b| b.borrow().by_name.get(&name.to_lowercase()).cloned())
+}
+
+/// Paths of the open workbooks that have one on disk.
+pub(super) fn open_workbook_paths() -> Vec<PathBuf> {
+    BOOKS.with(|b| b.borrow().by_name.values().cloned().collect())
 }
 
 /// The name (e.g. `demo.xlsx`) under which Excel has the workbook at `path` open.
@@ -369,6 +379,7 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
             crate::xlapi::pump_global();
             pump_macros(&app);
             rtd::tick();
+            folder::tick(&app);
             pane::tick(&app);
         }
     }));
@@ -384,6 +395,9 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Menu items for the macros of the active workbook (rebuilt each time the menu opens).
+/// Tag of the menu item that stops running macros (not a possible macro name).
+const STOP_MACROS: &str = "::stop-running-macros::";
+
 fn macro_menu_xml() -> String {
     let (path, _) = current();
     let names = path
@@ -392,6 +406,11 @@ fn macro_menu_xml() -> String {
         .unwrap_or_default();
     let mut xml =
         String::from(r#"<menu xmlns="http://schemas.microsoft.com/office/2006/01/customui">"#);
+    if crate::macros::global().any_running() {
+        xml.push_str(&format!(
+            r#"<button id="luaMacroStop" label="Stop running macros" tag="{STOP_MACROS}" onAction="OnMacroClick"/><menuSeparator id="luaMacroSep"/>"#
+        ));
+    }
     if names.is_empty() {
         xml.push_str(r#"<button id="luaMacroNone" label="No macros (define them with xl.macro)" enabled="false"/>"#);
     }
@@ -403,6 +422,14 @@ fn macro_menu_xml() -> String {
     }
     xml.push_str("</menu>");
     xml
+}
+
+/// Excel is closing (or the add-in is being unloaded): stop all background Lua work, so nothing
+/// keeps running, and no program it started stays behind.
+pub(super) fn stop_everything() {
+    crate::macros::global().cancel_all();
+    crate::streams::global().terminate();
+    crate::jobs::global().cancel_all();
 }
 
 fn set_status_bar(app: &IDispatch, text: &str) {
@@ -694,11 +721,22 @@ impl IDispatch_Impl for Addin_Impl {
                             .and_then(|c| dispatch::get(&c, "Tag").ok())
                             .and_then(|v| bstr_of(&v));
                         if let (Some(tag), Some(app)) = (tag, app()) {
-                            run_macro(&app, &tag);
+                            if tag == STOP_MACROS {
+                                crate::macros::global().cancel_all();
+                                set_status_bar(&app, "Lua: stopping macros ...");
+                            } else {
+                                run_macro(&app, &tag);
+                            }
                         }
                     }
                 }
                 10 => ret(VARIANT::from(macro_menu_xml().as_str()), result, params),
+                11 => {
+                    crate::log::note("ribbon: Sync folder clicked");
+                    if let Some(app) = app() {
+                        folder::on_click(&app);
+                    }
+                }
                 8 => {
                     crate::log::note("ribbon: Re-run async clicked");
                     if let Some(app) = app() {
@@ -748,6 +786,8 @@ impl IDTExtensibility2_Impl for Addin_Impl {
     unsafe fn OnDisconnection(&self, _: i32, _: *mut *mut c_void) -> HRESULT {
         crate::log::note("ribbon: disconnecting");
         pane::shutdown();
+        folder::shutdown();
+        stop_everything();
         SHARED.with(|s| {
             let mut s = s.borrow_mut();
             if s.timer != 0 {
@@ -857,8 +897,8 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 9,
-            "onLoad + 5 on the status button + refresh + files + the macro menu"
+            checked, 10,
+            "onLoad + 5 on the status button + refresh + sync + files + the macro menu"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));
     }

@@ -141,7 +141,7 @@ shows `#LUA: ...`. If a stream cell never shows a value, `=LUA.STATUS()` reports
 background, in a fresh Lua state built from the workbook's trusted files, so Excel stays
 responsive. Unlike `LUA.CALL`, a macro may change cells. The status bar shows progress and the
 result; a failure opens a message box. A macro is stopped after 5 minutes and the same macro
-cannot run twice at once in a workbook.
+cannot run twice at once in a workbook. While any macro is running the menu has a **Stop running macros** item; closing Excel stops macros, streams and background calls, and a program started with `xl.run` is killed with them.
 
 ### Running programs from Lua
 
@@ -167,6 +167,25 @@ enabled workbooks; the sandbox used by `LUA.EVAL` in other workbooks has no way 
   finds `native/thing.dll`.
 * Paths are validated everywhere (no `..`, drive letters, reserved Windows names); text files are stored
   with `\n` line endings; limits are 32 MB per file and 64 MB per workbook.
+
+### Editing scripts in your own editor: Sync folder
+
+Keep your `.lua` files in a normal folder and edit them in VS Code (or anything else). **Lua >
+Sync folder** links the active, saved workbook to that folder:
+
+* The folder is the source of truth: the workbook's embedded files become exactly the folder's files
+  (dot-files such as `.git`, editor temp/backup files and `node_modules` are left out, text files get
+  LF line endings). Edits made in the Files panel are overwritten by the next sync.
+* Every change you save in the folder is copied into the workbook about two seconds later (once the
+  folder has been quiet for a moment, so half-written files are never read), the new code starts
+  running and the workbook recalculates. The status bar says what happened. The workbook is marked
+  modified; save it to keep the files.
+* Because you chose the folder, its files are trusted without asking again. The link lives in
+  `%APPDATA%\xll-bridge\sync.json` (created only when you link a folder), never in the workbook, so
+  a workbook you receive cannot make your machine read a folder. Opening a linked workbook syncs it
+  at once if the folder changed in the meantime.
+* Click the button again to sync immediately or to unlink (the files stay in the workbook).
+* A folder with no files never empties a workbook.
 
 ### The Files panel
 
@@ -238,18 +257,24 @@ Nothing is written at start-up; the `%APPDATA%\xll-bridge` folder appears only w
 * `lua\` — shared Lua/DLL modules for `require`; create it yourself if you want one
 * `%LOCALAPPDATA%\xll-bridge\cache\` — native modules extracted from a workbook, when it is enabled
 
-## Known limitations / next steps
+## Known limitations
 
 * Workbooks must be saved to a local path (OneDrive/SharePoint copies are resolved via `LocalFullName`
-  where Excel provides it). Scripts are read from the file on disk, so re-save after embedding.
+  where Excel provides it). Scripts are read from the file on disk, so re-save after embedding; a
+  folder link (see *Sync folder*) runs the folder's files right away.
 * Functions are registered thread-unsafe, so recalculation is single-threaded.
 * The ribbon is untested against every Excel build; it targets Excel 2010+ (32x32 bitmap icons).
 * The docked panel is a child window of Excel's frame, not an Office task pane (that would need an
   ActiveX host). Keystrokes typed into it (rename, new folder) depend on Excel passing them through; if
-  that misbehaves on your Excel, use **Float**. There is no in-panel text editor yet: export, edit, and
-  add the file again.
-* Not yet implemented: reading arbitrary ranges/cells from Lua (`xl.range`), writing back, streaming
-  (RTD) results, a "revoke trust" action.
+  that misbehaves on your Excel, use **Float**.
+* There is deliberately no script editor in the panel: edit the files in your own editor (use
+  *Sync folder*).
 * x64 only.
+
+## Future considerations (recognised, not on the roadmap)
+
+* Streams that push a whole table (spilling over a range) instead of one value.
+* `xl.http` and `xl.json` helpers, so background calls and streams can fetch and parse data without
+  running an external program.
 
 [mlua]: https://github.com/mlua-rs/mlua

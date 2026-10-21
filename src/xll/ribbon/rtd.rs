@@ -77,21 +77,10 @@ fn problem(msg: &str) {
     }
 }
 
-/// Creates the server the way any COM client would (class lookup, DLL load, class factory,
-/// `IRtdServer`) to tell "the registration is broken" from "Excel never asked". For `LUA.STATUS`.
-pub(crate) fn self_test() -> String {
-    use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
-    // SAFETY: standard in-process creation on Excel's COM-initialised UI thread.
-    let made: Result<IRtdServer> =
-        unsafe { CoCreateInstance(&CLSID_RTD, None, CLSCTX_INPROC_SERVER) };
-    match made {
-        Ok(server) => {
-            CREATED.fetch_sub(1, Ordering::Relaxed); // not Excel's: keep the counter honest
-            drop(server);
-            "self-test ok".to_owned()
-        }
-        Err(e) => format!("self-test FAILED: {e}"),
-    }
+/// Has Excel used the stream server (or has it had trouble)? Keeps `LUA.STATUS` quiet otherwise.
+pub(crate) fn used() -> bool {
+    CREATED.load(Ordering::Relaxed) > 0
+        || LAST_PROBLEM.lock().map(|p| !p.is_empty()).unwrap_or(false)
 }
 
 /// What has happened so far, for `LUA.STATUS`: did Excel create the server, start it, and

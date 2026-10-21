@@ -216,7 +216,7 @@ fn book_name_of(path: &Path) -> Option<String> {
     super::workbook_name_by_path(path)
 }
 
-fn open_book(app: &IDispatch, name: &str) -> Result<IDispatch, XlError> {
+pub(super) fn open_book(app: &IDispatch, name: &str) -> Result<IDispatch, XlError> {
     let books = dispatch_of(dispatch::get(app, "Workbooks"))?;
     dispatch_of(dispatch::get_with(&books, "Item", &[VARIANT::from(name)])).map_err(|e| {
         if e.retryable {

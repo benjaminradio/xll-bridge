@@ -15,6 +15,7 @@ pub mod procrun;
 pub mod runtime;
 pub mod settings;
 pub mod streams;
+pub mod sync;
 pub mod trust;
 pub mod ui;
 pub mod value;

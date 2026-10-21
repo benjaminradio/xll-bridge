@@ -241,6 +241,13 @@ impl Jobs {
         cells
     }
 
+    /// Excel is shutting down: stop every running call.
+    pub fn cancel_all(&self) {
+        for e in self.lock().entries.values() {
+            e.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
     /// The workbook was closed: drop everything that belonged to it.
     pub fn forget_workbook(&self, workbook: &Path) {
         let _ = self.refresh_workbook(workbook);

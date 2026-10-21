@@ -321,11 +321,10 @@ pub extern "system" fn LuaStatus() -> *mut Xloper12 {
                     names.len()
                 )
             }
-            Status::Active { .. } => format!(
-                "Lua enabled; {}; {}",
-                ribbon::rtd::summary(),
-                ribbon::rtd::self_test()
-            ),
+            Status::Active { .. } if ribbon::rtd::used() => {
+                format!("Lua enabled; {}", ribbon::rtd::summary())
+            }
+            Status::Active { .. } => "Lua enabled".to_owned(),
             Status::Failed { message } => format!("Lua failed to load: {message}"),
         });
         Value::Str(s)
@@ -529,6 +528,7 @@ pub extern "system" fn xlAutoOpen() -> i32 {
 /// Excel exiting, or the add-in being unloaded. The ribbon registration is left in place.
 #[unsafe(no_mangle)]
 pub extern "system" fn xlAutoClose() -> i32 {
+    let _ = catch_unwind(ribbon::stop_everything);
     1
 }
 

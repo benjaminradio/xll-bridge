@@ -121,10 +121,10 @@ impl LuaHost {
         install_xl_table(&lua, Some(ctx.workbook))?;
         let shared = Rc::new(bundle.clone());
         install_embedded_fs(&lua, &shared)?;
-        install_process_api(&lua)?;
+        let limits: Rc<RefCell<Option<Limits>>> = Rc::new(RefCell::new(None));
+        install_process_api(&lua, Rc::clone(&limits))?;
         install_range_api(&lua, ctx.workbook, ctx.xl.clone())?;
         install_macro_api(&lua)?;
-        let limits: Rc<RefCell<Option<Limits>>> = Rc::new(RefCell::new(None));
         if worker {
             let hook_limits = Rc::clone(&limits);
             lua.set_hook(
@@ -644,18 +644,27 @@ fn install_embedded_fs(lua: &Lua, bundle: &Rc<Bundle>) -> mlua::Result<()> {
 /// `xl.shell(line, [opts])`: run an external program with captured output and a real timeout.
 /// Returns `{code, stdout, stderr, ok, timed_out, truncated}`, or `nil, message` if it could not
 /// be started. No console window appears.
-fn install_process_api(lua: &Lua) -> mlua::Result<()> {
+fn install_process_api(lua: &Lua, limits: Rc<RefCell<Option<Limits>>>) -> mlua::Result<()> {
     let xl: mlua::Table = lua.globals().get("xl")?;
+    // A background call that is cancelled also kills the program it is waiting for.
+    let cancel_of = move || limits.borrow().as_ref().map(|l| Arc::clone(&l.cancel));
+    let c = cancel_of.clone();
     xl.set(
         "run",
-        lua.create_function(|lua, (spec, opts): (LV, Option<mlua::Table>)| {
-            run_from_lua(lua, spec, opts, false)
+        lua.create_function(move |lua, (spec, opts): (LV, Option<mlua::Table>)| {
+            run_from_lua(lua, spec, opts, false, c())
         })?,
     )?;
     xl.set(
         "shell",
-        lua.create_function(|lua, (line, opts): (String, Option<mlua::Table>)| {
-            run_from_lua(lua, LV::String(lua.create_string(&line)?), opts, true)
+        lua.create_function(move |lua, (line, opts): (String, Option<mlua::Table>)| {
+            run_from_lua(
+                lua,
+                LV::String(lua.create_string(&line)?),
+                opts,
+                true,
+                cancel_of(),
+            )
         })?,
     )
 }
@@ -674,6 +683,7 @@ fn run_from_lua(
     spec: LV,
     opts: Option<mlua::Table>,
     shell: bool,
+    cancel: Option<Arc<AtomicBool>>,
 ) -> mlua::Result<MultiValue> {
     let mut run = match (&spec, shell) {
         (LV::String(line), true) => RunSpec::shell(&line.to_string_lossy()),
@@ -716,11 +726,13 @@ fn run_from_lua(
             run.stdin = Some(input.as_bytes().to_vec());
         }
     }
+    run.cancel = cancel;
     match procrun::run(&run) {
         Err(e) => Ok(MultiValue::from_iter([
             LV::Nil,
             LV::String(lua.create_string(format!("cannot run '{}': {e}", run.program))?),
         ])),
+        Ok(r) if r.cancelled => Err(mlua::Error::runtime("cancelled")),
         Ok(r) => {
             let t = lua.create_table()?;
             match r.code {

@@ -4,7 +4,8 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 /// Output beyond this per stream is dropped (and reported), so a runaway program can't eat memory.
@@ -24,6 +25,8 @@ pub struct RunSpec {
     pub cwd: Option<PathBuf>,
     pub stdin: Option<Vec<u8>>,
     pub timeout: Duration,
+    /// When set from another thread, the process is killed and the run reports `cancelled`.
+    pub cancel: Option<Arc<AtomicBool>>,
 }
 
 impl RunSpec {
@@ -35,6 +38,7 @@ impl RunSpec {
             cwd: None,
             stdin: None,
             timeout: DEFAULT_TIMEOUT,
+            cancel: None,
         }
     }
 
@@ -57,12 +61,14 @@ pub struct RunResult {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub timed_out: bool,
+    /// Killed because the caller asked to stop.
+    pub cancelled: bool,
     pub truncated: bool,
 }
 
 impl RunResult {
     pub fn ok(&self) -> bool {
-        self.code == Some(0) && !self.timed_out
+        self.code == Some(0) && !self.timed_out && !self.cancelled
     }
 }
 
@@ -141,17 +147,22 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunResult> {
             result.code = status.code();
             break;
         }
-        if start.elapsed() >= timeout {
+        let cancelled = spec
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed));
+        if cancelled || start.elapsed() >= timeout {
             let pid = child.id();
             kill_tree(pid);
             let _ = child.kill();
             let _ = child.wait();
-            result.timed_out = true;
+            result.timed_out = !cancelled;
+            result.cancelled = cancelled;
             break;
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    let grace = if result.timed_out {
+    let grace = if result.timed_out || result.cancelled {
         READER_GRACE
     } else {
         Duration::from_secs(30)
@@ -184,6 +195,27 @@ mod tests {
         let r = run(&RunSpec::shell("exit 3")).unwrap();
         assert_eq!(r.code, Some(3));
         assert!(!r.ok() && !r.timed_out);
+    }
+
+    #[test]
+    fn cancelling_kills_the_program_promptly() {
+        let line = if cfg!(windows) {
+            "ping -n 30 127.0.0.1 > nul"
+        } else {
+            "sleep 30"
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut spec = RunSpec::shell(line);
+        spec.cancel = Some(Arc::clone(&cancel));
+        let flag = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let start = Instant::now();
+        let r = run(&spec).unwrap();
+        assert!(r.cancelled && !r.timed_out && !r.ok(), "{r:?}");
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 
     #[test]
