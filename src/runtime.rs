@@ -30,6 +30,10 @@ pub enum Book {
         names: Vec<String>,
         bundle: Arc<Bundle>,
         host: LuaHost,
+        /// Set when this file set was applied live (folder sync) over what was saved in the
+        /// workbook: the digest of the saved set it overrides ("" for none). Touching the file
+        /// without changing that content (autosave, OneDrive) must not bring the old set back.
+        live_over: Option<String>,
     },
     Failed {
         digest: String,
@@ -104,11 +108,26 @@ impl Runtime {
     }
 
     fn load(&mut self, workbook: &Path, previous: Option<Book>) -> Book {
-        let scripts = match package::read_bundle(workbook) {
-            Ok(Some(s)) if s.file_count() > 0 => s,
+        let disk = match package::read_bundle(workbook) {
+            Ok(Some(s)) if s.file_count() > 0 => Some(s),
+            _ => None,
+        };
+        // A live-applied set stays while the saved content is still what it overrode.
+        let disk_digest = disk.as_ref().map(Bundle::digest).unwrap_or_default();
+        if let Some(Book::Active {
+            live_over: Some(over),
+            ..
+        }) = &previous
+            && *over == disk_digest
+            && let Some(kept) = previous
+        {
+            return kept;
+        }
+        let scripts = match disk {
+            Some(s) => s,
             // Unreadable (e.g. mid-save, not yet a zip) is treated like "no scripts"; the next
             // mtime change retries.
-            _ => return Book::NoScripts,
+            None => return Book::NoScripts,
         };
         let digest = scripts.digest();
         let names = script_names(&scripts);
@@ -126,6 +145,7 @@ impl Runtime {
                 names,
                 bundle,
                 host,
+                live_over: None,
             };
         }
         if !self.trust.is_trusted(workbook, &digest) {
@@ -255,13 +275,18 @@ impl Runtime {
         let digest = bundle.digest();
         self.trust.pretrust(workbook, &digest)?;
         let mtime = std::fs::metadata(workbook).and_then(|m| m.modified()).ok();
-        self.books.insert(
-            normalize_path(workbook),
-            Entry {
-                mtime,
-                book: activate(workbook, bundle, digest),
-            },
-        );
+        let saved = package::read_bundle(workbook)
+            .ok()
+            .flatten()
+            .filter(|b| b.file_count() > 0)
+            .map(|b| b.digest())
+            .unwrap_or_default();
+        let mut book = activate(workbook, bundle, digest);
+        if let Book::Active { live_over, .. } = &mut book {
+            *live_over = Some(saved);
+        }
+        self.books
+            .insert(normalize_path(workbook), Entry { mtime, book });
         Ok(())
     }
 
@@ -338,6 +363,7 @@ fn activate(workbook: &Path, bundle: &Bundle, digest: String) -> Book {
             names: script_names(bundle),
             bundle: Arc::new(bundle.clone()),
             host,
+            live_over: None,
         },
         Err(e) => Book::Failed {
             digest,
@@ -576,6 +602,29 @@ mod tests {
         assert_eq!(rt.call(Some(&wb), "one", &[]).unwrap(), Value::Num(2.0));
         assert!(matches!(rt.status(&wb), Status::Active { .. }));
         assert!(rt.apply_live(&wb, &Bundle::new()).is_err());
+    }
+
+    #[test]
+    fn touching_the_file_does_not_undo_a_live_file_set() {
+        let (_d, wb) = workbook_with("function one() return 1 end");
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        rt.enable(&wb).unwrap();
+        let live = crate::package::testutil::bundle_of(&[(
+            "main.lua",
+            "function one() return 2 end function two() return 3 end",
+        )]);
+        rt.apply_live(&wb, &live).unwrap();
+        // Autosave / a sync client touches the file without changing its content.
+        let f = std::fs::File::options().write(true).open(&wb).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5))
+            .unwrap();
+        drop(f);
+        assert_eq!(rt.call(Some(&wb), "two", &[]).unwrap(), Value::Num(3.0));
+        // The saved content changing to something else (the workbook was replaced) wins.
+        let base = wb.with_file_name("base.xlsx");
+        let other = bundle_of(&[("main.lua", "function one() return 9 end")]);
+        embed_bundle(&base, &wb, &other).unwrap();
+        assert!(matches!(rt.status(&wb), Status::Blocked { .. }));
     }
 
     #[test]

@@ -185,7 +185,8 @@ Sync folder** links the active, saved workbook to that folder:
   a workbook you receive cannot make your machine read a folder. Opening a linked workbook syncs it
   at once if the folder changed in the meantime.
 * Click the button again to sync immediately or to unlink (the files stay in the workbook).
-* A folder with no files never empties a workbook.
+* A folder with no files never empties a workbook. Linking an **empty** folder to a workbook that already holds files offers to export those files into the folder first, then follows it, which is the way to start from an existing workbook.
+* The files the sync applied keep running even if something touches the workbook file on disk without changing its saved content (OneDrive, autosave); they are replaced only when the saved content really changes.
 
 ### The Files panel
 

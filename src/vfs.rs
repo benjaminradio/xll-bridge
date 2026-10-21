@@ -502,6 +502,23 @@ impl Bundle {
         Ok(())
     }
 
+    /// Writes every file and folder into the existing directory `dest` (overwriting same-named
+    /// files). Returns how many files were written.
+    pub fn export_all(&self, dest: &Path) -> Result<usize> {
+        // Paths were validated when they entered the bundle (no `..`, no drive letters).
+        for d in self.explicit_dirs() {
+            std::fs::create_dir_all(dest.join(d))?;
+        }
+        for f in self.files() {
+            let out = dest.join(&f.path);
+            if let Some(parent) = out.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(out, &f.data)?;
+        }
+        Ok(self.files().len())
+    }
+
     fn export_rec(&self, path: &str, out: &Path) -> Result<()> {
         match self.kind_of(path) {
             None => Err(VfsError::NotFound(path.to_owned())),
@@ -534,6 +551,21 @@ impl Bundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_all_writes_the_whole_tree() {
+        let mut b = Bundle::new();
+        b.put_file("main.lua", b"a".to_vec(), false).unwrap();
+        b.put_file("lib/x/util.lua", b"b".to_vec(), false).unwrap();
+        b.mkdir("empty").unwrap();
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(b.export_all(d.path()).unwrap(), 2);
+        assert_eq!(
+            std::fs::read(d.path().join("lib/x/util.lua")).unwrap(),
+            b"b"
+        );
+        assert!(d.path().join("empty").is_dir());
+    }
 
     fn b() -> Bundle {
         let mut b = Bundle::new();

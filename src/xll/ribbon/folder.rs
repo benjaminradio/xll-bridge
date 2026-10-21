@@ -241,19 +241,68 @@ fn link(app: &IDispatch, owner: windows::Win32::Foundation::HWND, path: &Path) {
             return;
         }
     };
+    let embedded = workbook_name_by_path(path)
+        .and_then(|n| cells::open_book(app, &n).ok())
+        .and_then(|wb| live::read(&wb).ok().flatten());
+    // An empty folder is the way to start from what the workbook already holds: offer to export
+    // the embedded files into it, then follow it from there.
+    let mut snap = snap;
     if snap.bundle.file_count() == 0 {
-        message(
-            owner,
-            &format!("{} has no files to sync.", folder.display()),
-            "Sync folder",
-            MB_OK | MB_ICONINFORMATION,
+        let Some(held) = embedded.as_ref().filter(|b| b.file_count() > 0) else {
+            message(
+                owner,
+                &format!("{} has no files to sync.", folder.display()),
+                "Sync folder",
+                MB_OK | MB_ICONINFORMATION,
+            );
+            return;
+        };
+        let text = format!(
+            "{} is empty.\n\nExport the {} file(s) embedded in \"{}\" into it, and keep the workbook in step with that folder from now on?",
+            folder.display(),
+            held.file_count(),
+            name_of(path)
         );
+        if !message(
+            owner,
+            &text,
+            "Sync folder",
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) {
+            return;
+        }
+        if let Err(e) = held.export_all(&folder) {
+            message(
+                owner,
+                &format!("Could not export the files: {e}"),
+                "Sync folder",
+                MB_OK | MB_ICONERROR,
+            );
+            return;
+        }
+        match watcher.sync_now() {
+            Ok(s) if s.bundle.file_count() > 0 => snap = s,
+            _ => {
+                message(
+                    owner,
+                    "The export did not produce any files.",
+                    "Sync folder",
+                    MB_OK | MB_ICONERROR,
+                );
+                return;
+            }
+        }
+        deliver(app, path, &folder, snap);
+        STATE.with(|s| {
+            let mut s = s.borrow_mut();
+            let l = s.links.get_or_insert_with(Links::load);
+            l.set(path, folder);
+            l.save();
+            s.watchers.insert(normalize_path(path), watcher);
+        });
         return;
     }
-    let current = workbook_name_by_path(path)
-        .and_then(|n| cells::open_book(app, &n).ok())
-        .and_then(|wb| live::read(&wb).ok().flatten())
-        .map_or(0, |b| b.file_count());
+    let current = embedded.as_ref().map_or(0, |b| b.file_count());
     let text = format!(
         "Keep \"{}\" in step with this folder?\n\n{}\n\nIts {} file(s) will replace the {current} file(s) embedded in the workbook now, \
          and every change you save there is copied into the workbook within a couple of seconds. \
