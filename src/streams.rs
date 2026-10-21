@@ -23,6 +23,7 @@ const MAX_ANNOUNCED: usize = 256;
 /// A stream is stopped after this long even if nobody disconnects it.
 const LIFETIME: Duration = Duration::from_secs(30 * 24 * 3600);
 
+#[derive(Clone)]
 pub struct StreamSpec {
     pub workbook: PathBuf,
     pub bundle: Arc<Bundle>,
@@ -59,11 +60,34 @@ impl Streams {
     /// Excel connects a topic with the same `key`. Cheap when already known.
     pub fn announce(&self, key: &str, spec: impl FnOnce() -> StreamSpec) {
         let mut inner = self.lock();
-        let running = inner.topics.values().any(|t| t.key == key);
-        if running || inner.announced.contains_key(key) || inner.announced.len() >= MAX_ANNOUNCED {
+        if let Some((&id, topic)) = inner.topics.iter_mut().find(|(_, t)| t.key == key) {
+            // Excel still shows this topic but its stream was stopped (the workbook's scripts were
+            // disabled, or re-synced without changing). Excel will not connect it again, so
+            // start the stream afresh on the same topic.
+            if topic.cancel.load(Ordering::Relaxed) {
+                let spec = spec();
+                let cancel = Arc::new(AtomicBool::new(false));
+                topic.cancel = Arc::clone(&cancel);
+                drop(inner);
+                if let Err(e) = self.spawn(id, spec, cancel) {
+                    crate::log::note(&format!("stream restart failed: {e}"));
+                }
+            }
+            return;
+        }
+        if inner.announced.contains_key(key) || inner.announced.len() >= MAX_ANNOUNCED {
             return;
         }
         inner.announced.insert(key.to_owned(), spec());
+    }
+
+    fn spawn(&self, topic: i32, spec: StreamSpec, cancel: Arc<AtomicBool>) -> Result<(), String> {
+        let shared = Arc::clone(&self.inner);
+        std::thread::Builder::new()
+            .name(format!("lua-stream-{}", spec.func))
+            .spawn(move || run(shared, topic, spec, cancel))
+            .map(drop)
+            .map_err(|e| format!("cannot start a thread: {e}"))
     }
 
     /// Excel connected `topic` to the stream announced under `key`: start it.
@@ -90,13 +114,9 @@ impl Streams {
             );
             (spec, cancel)
         };
-        let shared = Arc::clone(&self.inner);
-        let started = std::thread::Builder::new()
-            .name(format!("lua-stream-{}", spec.func))
-            .spawn(move || run(shared, topic, spec, cancel));
-        if let Err(e) = started {
+        if let Err(e) = self.spawn(topic, spec, cancel) {
             self.lock().topics.remove(&topic);
-            return Err(format!("cannot start a thread: {e}"));
+            return Err(e);
         }
         Ok(())
     }
@@ -324,6 +344,24 @@ mod tests {
         assert_ne!(k("d", "f", Value::Num(1.0)), k("e", "f", Value::Num(1.0)));
         assert_ne!(k("d", "f", Value::Num(1.0)), k("d", "g", Value::Num(1.0)));
         assert_eq!(k("d", "f", Value::Empty).len(), 32);
+    }
+
+    #[test]
+    fn a_stopped_stream_that_excel_still_shows_is_restarted_by_the_next_announcement() {
+        let s = Streams::default();
+        s.announce("k", || spec(CODE, "forever", vec![]));
+        s.connect(1, "k").unwrap();
+        wait_for(&s, |v| !v.is_empty());
+        s.cancel_workbook(Path::new("/w/book.xlsx"));
+        assert_eq!(s.running(), 0);
+        std::thread::sleep(Duration::from_millis(100));
+        s.take_updates();
+        // The cell is recalculated: same topic, so the stream must come back by itself.
+        s.announce("k", || spec(CODE, "forever", vec![]));
+        assert_eq!(s.running(), 1);
+        let seen = wait_for(&s, |v| !v.is_empty());
+        assert!(seen.iter().all(|(t, _)| *t == 1));
+        s.terminate();
     }
 
     #[test]

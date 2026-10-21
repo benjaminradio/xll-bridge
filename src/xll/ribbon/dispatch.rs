@@ -2,12 +2,13 @@
 
 use std::ptr::null_mut;
 
+use windows::Win32::Foundation::DISP_E_EXCEPTION;
 use windows::Win32::System::Com::{
     DISPATCH_FLAGS, DISPATCH_METHOD, DISPATCH_PROPERTYGET, DISPATCH_PROPERTYPUT, DISPPARAMS,
-    IDispatch,
+    EXCEPINFO, IDispatch,
 };
 use windows::Win32::System::Variant::VARIANT;
-use windows::core::{GUID, PCWSTR, Result};
+use windows::core::{GUID, HRESULT, PCWSTR, Result};
 
 const LOCALE_USER_DEFAULT: u32 = 0x0400;
 const DISPID_PROPERTYPUT: i32 = -3;
@@ -50,8 +51,10 @@ fn invoke(obj: &IDispatch, name: &str, flags: DISPATCH_FLAGS, args: &[VARIANT]) 
         cNamedArgs: u32::from(is_put),
     };
     let mut result = VARIANT::default();
+    // SAFETY: an all-zero EXCEPINFO is the documented empty state.
+    let mut excep: EXCEPINFO = unsafe { std::mem::zeroed() };
     // SAFETY: `params` points at live argument storage for the duration of the call.
-    unsafe {
+    let outcome = unsafe {
         obj.Invoke(
             id,
             &GUID::zeroed(),
@@ -59,9 +62,37 @@ fn invoke(obj: &IDispatch, name: &str, flags: DISPATCH_FLAGS, args: &[VARIANT]) 
             flags,
             &params,
             Some(&mut result),
+            Some(&mut excep),
             None,
-            None,
-        )?;
+        )
+    };
+    if let Err(e) = outcome {
+        // "Exception occurred" says nothing; the callee's own description does.
+        let mut text = String::new();
+        if e.code() == DISP_E_EXCEPTION {
+            // SAFETY: the callee filled these BSTRs; each is read once and freed once.
+            unsafe {
+                let source = excep.bstrSource.to_string();
+                let desc = excep.bstrDescription.to_string();
+                std::mem::ManuallyDrop::drop(&mut excep.bstrSource);
+                std::mem::ManuallyDrop::drop(&mut excep.bstrDescription);
+                std::mem::ManuallyDrop::drop(&mut excep.bstrHelpFile);
+                text = match (source.is_empty(), desc.is_empty()) {
+                    (_, true) => String::new(),
+                    (true, false) => desc,
+                    (false, false) => format!("{source}: {desc}"),
+                };
+            }
+        }
+        if !text.is_empty() {
+            let code = if excep.scode != 0 {
+                excep.scode
+            } else {
+                e.code().0
+            };
+            return Err(windows::core::Error::new(HRESULT(code), text));
+        }
+        return Err(e);
     }
     Ok(result)
 }
