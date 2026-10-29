@@ -263,7 +263,7 @@ moves things between them and around:
 | with Shift | | **moves** |
 
 Drop on a folder (or on a file, meaning its folder, or on a root). Dragging files in from Explorer onto the
-panel adds them to the folder under the cursor selection. A workbook that `require`s a machine module is no
+panel adds them to the selected folder (of either tree). A workbook that `require`s a machine module is no
 longer self-contained: drag the module into ThisWorkbook to embed it.
 
 Buttons (they act on the selected node; the two roots cannot be renamed or deleted):
