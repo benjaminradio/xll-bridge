@@ -126,7 +126,14 @@ impl LuaHost {
         install_process_api(&lua, Rc::clone(&limits))?;
         install_range_api(&lua, ctx.workbook, ctx.xl.clone())?;
         install_macro_api(&lua)?;
-        install_sql_api(&lua, ctx.workbook, ctx.xl.clone(), Rc::clone(&limits))?;
+        let sql_env = Rc::new(SqlEnv {
+            api: ctx.xl.clone(),
+            workbook: ctx.workbook.to_owned(),
+            bundle: Arc::new(bundle.clone()),
+            limits: Rc::clone(&limits),
+        });
+        install_sql_api(&lua, Rc::clone(&sql_env))?;
+        install_db_api(&lua, sql_env)?;
         if worker {
             let hook_limits = Rc::clone(&limits);
             lua.set_hook(
@@ -552,70 +559,96 @@ fn install_macro_api(lua: &Lua) -> mlua::Result<()> {
     )
 }
 
-/// `xl.sql`, `xl.sql_records`, `xl.sql_exec` and the positional `xl.query` (what `SQL.ASYNC` runs).
-fn install_sql_api(
-    lua: &Lua,
-    workbook: &Path,
+/// What SQL run from Lua needs: where bracketed references read from, the databases `[db:name]`
+/// and `xl.db` can find, and how a running call can stop a query.
+struct SqlEnv {
     api: Option<Arc<dyn XlApi>>,
+    workbook: PathBuf,
+    bundle: Arc<Bundle>,
     limits: Rc<RefCell<Option<Limits>>>,
-) -> mlua::Result<()> {
-    let xl: mlua::Table = lua.globals().get("xl")?;
-    let wb = workbook.to_owned();
+}
 
-    // Where bracketed references read from, and how a running call can stop the query.
-    let env = move || {
-        let source: Box<dyn sqldb::Source> = match &api {
+impl SqlEnv {
+    fn source(&self) -> Box<dyn sqldb::Source> {
+        let base: Box<dyn sqldb::Source> = match &self.api {
             Some(a) => Box::new(sqldb::XlSource {
                 api: Arc::clone(a),
-                workbook: wb.clone(),
+                workbook: self.workbook.clone(),
             }),
             None => Box::new(sqldb::NoSource),
         };
-        let lim = sqldb::Limits {
-            cancel: limits.borrow().as_ref().map(|l| Arc::clone(&l.cancel)),
-            ..Default::default()
-        };
-        (source, lim)
-    };
-    let env = Rc::new(env);
+        Box::new(sqldb::WithDatabases {
+            base,
+            databases: crate::dbstore::resolver(
+                self.workbook.clone(),
+                Some(Arc::clone(&self.bundle)),
+            ),
+        })
+    }
 
-    type Params = (Vec<Value>, Vec<(String, Value)>);
-    fn split_params(t: Option<mlua::Table>) -> mlua::Result<Params> {
-        let mut positional: Vec<Value> = Vec::new();
-        let mut named = Vec::new();
-        if let Some(t) = t {
-            for pair in t.pairs::<LV, LV>() {
-                let (k, v) = pair?;
-                match k {
-                    LV::Integer(i) if i >= 1 => {
-                        let i = i as usize;
-                        if positional.len() < i {
-                            positional.resize(i, Value::Empty);
-                        }
-                        positional[i - 1] = from_lua(&v)?;
+    fn limits(&self) -> sqldb::Limits {
+        sqldb::Limits {
+            cancel: self.limits.borrow().as_ref().map(|l| Arc::clone(&l.cancel)),
+            ..Default::default()
+        }
+    }
+}
+
+type SqlParams = (Vec<Value>, Vec<(String, Value)>);
+
+/// A Lua table of parameters: array part -> `?1..`, string keys -> `:name`.
+fn split_params(t: Option<mlua::Table>) -> mlua::Result<SqlParams> {
+    let mut positional: Vec<Value> = Vec::new();
+    let mut named = Vec::new();
+    if let Some(t) = t {
+        for pair in t.pairs::<LV, LV>() {
+            let (k, v) = pair?;
+            match k {
+                LV::Integer(i) if i >= 1 => {
+                    let i = i as usize;
+                    if positional.len() < i {
+                        positional.resize(i, Value::Empty);
                     }
-                    LV::String(s) => named.push((s.to_string_lossy(), from_lua(&v)?)),
-                    _ => {}
+                    positional[i - 1] = from_lua(&v)?;
                 }
+                LV::String(s) => named.push((s.to_string_lossy(), from_lua(&v)?)),
+                _ => {}
             }
         }
-        Ok((positional, named))
     }
-    let fail = |e: String| mlua::Error::runtime(e);
+    Ok((positional, named))
+}
+
+fn records_to_lua(lua: &Lua, out: &sqldb::Output) -> mlua::Result<mlua::Table> {
+    let list = lua.create_table_with_capacity(out.rows.len(), 0)?;
+    for (i, row) in out.rows.iter().enumerate() {
+        let rec = lua.create_table_with_capacity(0, out.columns.len())?;
+        for (name, v) in out.columns.iter().zip(row) {
+            rec.set(name.as_str(), to_lua(lua, v)?)?;
+        }
+        list.raw_set(i + 1, rec)?;
+    }
+    Ok(list)
+}
+
+/// `xl.sql`, `xl.sql_records`, `xl.sql_exec` and the positional `xl.query` (what `SQL.ASYNC` runs).
+fn install_sql_api(lua: &Lua, env: Rc<SqlEnv>) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    let fail = mlua::Error::runtime;
 
     let e = Rc::clone(&env);
     xl.set(
         "sql",
         lua.create_function(move |lua, (sql, params): (String, Option<mlua::Table>)| {
             let (args, named) = split_params(params)?;
-            let (source, limits) = e();
+            let source = e.source();
             let out = sqldb::run(&sqldb::Query {
                 sql: &sql,
                 args: &args,
                 named: &named,
                 source: source.as_ref(),
                 read_only: false,
-                limits,
+                limits: e.limits(),
             })
             .map_err(fail)?;
             to_lua(lua, &out.with_header())
@@ -627,25 +660,17 @@ fn install_sql_api(
         "sql_records",
         lua.create_function(move |lua, (sql, params): (String, Option<mlua::Table>)| {
             let (args, named) = split_params(params)?;
-            let (source, limits) = e();
+            let source = e.source();
             let out = sqldb::run(&sqldb::Query {
                 sql: &sql,
                 args: &args,
                 named: &named,
                 source: source.as_ref(),
                 read_only: false,
-                limits,
+                limits: e.limits(),
             })
             .map_err(fail)?;
-            let list = lua.create_table_with_capacity(out.rows.len(), 0)?;
-            for (i, row) in out.rows.iter().enumerate() {
-                let rec = lua.create_table_with_capacity(0, out.columns.len())?;
-                for (name, v) in out.columns.iter().zip(row) {
-                    rec.set(name.as_str(), to_lua(lua, v)?)?;
-                }
-                list.raw_set(i + 1, rec)?;
-            }
-            Ok(list)
+            records_to_lua(lua, &out)
         })?,
     )?;
 
@@ -653,34 +678,169 @@ fn install_sql_api(
     xl.set(
         "sql_exec",
         lua.create_function(move |_, script: String| {
-            let (source, limits) = e();
-            sqldb::exec_script(&script, source.as_ref(), &limits).map_err(fail)
+            let source = e.source();
+            sqldb::exec_script(&script, source.as_ref(), &e.limits()).map_err(fail)
         })?,
     )?;
 
     // xl.query(sql, a1, a2, ...): worksheet-function conventions (tables t1.., parameters ?1..),
-    // statements may only read. This is what SQL.ASYNC calls.
+    // statements may only read. SQL.ASYNC calls it as the global `__sql`.
+    let e = env;
+    let query = lua.create_function(move |lua, (sql, rest): (String, MultiValue)| {
+        let args: Vec<Value> = rest
+            .iter()
+            .map(from_lua)
+            .collect::<mlua::Result<Vec<_>>>()?;
+        let source = e.source();
+        let out = sqldb::run(&sqldb::Query {
+            sql: &sql,
+            args: &args,
+            named: &[],
+            source: source.as_ref(),
+            read_only: true,
+            limits: e.limits(),
+        })
+        .map_err(fail)?;
+        to_lua(lua, &out.with_header())
+    })?;
+    lua.globals().set("__sql", query.clone())?;
+    xl.set("query", query)
+}
+
+/// A database opened with `xl.db.open`.
+struct LuaDb {
+    db: Arc<crate::dbstore::Db>,
+    env: Rc<SqlEnv>,
+}
+
+impl UserData for LuaDb {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        // db:sql(sql [, params]) -> table of rows (column names first)
+        methods.add_method(
+            "sql",
+            |lua, this, (sql, params): (String, Option<mlua::Table>)| {
+                let (args, named) = split_params(params)?;
+                let source = this.env.source();
+                let out = this
+                    .db
+                    .run(&sql, &args, &named, source.as_ref(), this.env.limits())
+                    .map_err(mlua::Error::runtime)?;
+                to_lua(lua, &out.with_header())
+            },
+        );
+        // db:records(sql [, params]) -> list of {column = value} tables
+        methods.add_method(
+            "records",
+            |lua, this, (sql, params): (String, Option<mlua::Table>)| {
+                let (args, named) = split_params(params)?;
+                let source = this.env.source();
+                let out = this
+                    .db
+                    .run(&sql, &args, &named, source.as_ref(), this.env.limits())
+                    .map_err(mlua::Error::runtime)?;
+                records_to_lua(lua, &out)
+            },
+        );
+        // db:exec(script) -> runs statements that return no rows
+        methods.add_method("exec", |_, this, script: String| {
+            let source = this.env.source();
+            this.db
+                .exec(&script, source.as_ref(), &this.env.limits())
+                .map_err(mlua::Error::runtime)
+        });
+        methods.add_method("location", |_, this, ()| Ok(this.db.label()));
+        methods.add_meta_method("__tostring", |_, this, ()| {
+            Ok(format!("database({})", this.db.label()))
+        });
+    }
+}
+
+/// `xl.db.open(name [, {create = "embedded"|"local"|"folder", readonly = true}])` and `xl.db.list()`.
+fn install_db_api(lua: &Lua, env: Rc<SqlEnv>) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    let db = lua.create_table()?;
+
     let e = Rc::clone(&env);
-    xl.set(
-        "query",
-        lua.create_function(move |lua, (sql, rest): (String, MultiValue)| {
-            let args: Vec<Value> = rest
-                .iter()
-                .map(from_lua)
-                .collect::<mlua::Result<Vec<_>>>()?;
-            let (source, limits) = e();
-            let out = sqldb::run(&sqldb::Query {
-                sql: &sql,
-                args: &args,
-                named: &[],
-                source: source.as_ref(),
-                read_only: true,
-                limits,
+    db.set(
+        "open",
+        lua.create_function(move |_, (name, opts): (String, Option<mlua::Table>)| {
+            use crate::dbstore::{self, Place};
+            let (mut create, mut read_only) = (None::<String>, false);
+            if let Some(o) = opts {
+                if let LV::String(c) = o.get::<LV>("create")? {
+                    create = Some(c.to_string_lossy());
+                }
+                read_only = matches!(o.get::<LV>("readonly")?, LV::Boolean(true));
+            }
+            let local = dbstore::local_dir();
+            let found = dbstore::locate(&name, Some(&e.bundle), &e.workbook, local.as_deref());
+            let (place, creating) = match (found, create) {
+                (Ok(p), _) => (p, false),
+                (Err(_), Some(where_)) => (
+                    dbstore::creation_place(&name, &where_, &e.workbook, local.as_deref())
+                        .map_err(mlua::Error::runtime)?,
+                    true,
+                ),
+                (Err(m), None) => return Err(mlua::Error::runtime(m)),
+            };
+            let opened = match place {
+                Place::Embedded(path) => {
+                    let bytes = e.bundle.get(&path).map(|f| f.data.as_slice());
+                    dbstore::open_embedded(&e.workbook, &path, bytes, creating, read_only)
+                }
+                Place::File(path) => dbstore::open_file(&path, creating, read_only).map(Arc::new),
+            }
+            .map_err(mlua::Error::runtime)?;
+            Ok(LuaDb {
+                db: opened,
+                env: Rc::clone(&e),
             })
-            .map_err(fail)?;
-            to_lua(lua, &out.with_header())
         })?,
-    )
+    )?;
+
+    let e = env;
+    db.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let out = lua.create_table()?;
+            let mut n = 0;
+            let mut add = |name: String, place: &str| -> mlua::Result<()> {
+                let t = lua.create_table()?;
+                t.set("name", name)?;
+                t.set("place", place)?;
+                n += 1;
+                out.raw_set(n, t)
+            };
+            for f in e.bundle.files() {
+                if crate::vfs::is_database_file(&f.path) {
+                    add(f.path.clone(), "embedded")?;
+                }
+            }
+            let local = crate::dbstore::local_dir();
+            for (dir, place) in [
+                (e.workbook.parent().map(Path::to_path_buf), "folder"),
+                (local, "local"),
+            ] {
+                let Some(dir) = dir.filter(|d| !d.as_os_str().is_empty()) else {
+                    continue;
+                };
+                let Ok(rd) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                let mut names: Vec<String> = rd
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().to_str().map(str::to_owned))
+                    .filter(|n| crate::vfs::is_database_file(n))
+                    .collect();
+                names.sort();
+                for name in names {
+                    add(name, place)?;
+                }
+            }
+            Ok(out)
+        })?,
+    )?;
+    xl.set("db", db)
 }
 
 /// Stands in when no Excel is attached.
@@ -891,15 +1051,14 @@ fn run_from_lua(
     }
 }
 
-/// `require` finds modules next to the workbook, then in `%APPDATA%\xll-bridge\lua`.
+/// `require` finds modules next to the workbook, then in `%APPDATA%\xll-bridge\local`.
 fn configure_package_path(lua: &Lua, workbook: &Path, native: Option<&Path>) -> mlua::Result<()> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     if let Some(d) = workbook.parent() {
         dirs.push(d.to_path_buf());
     }
-    if let Some(p) =
-        crate::trust::TrustStore::default_path().and_then(|p| p.parent().map(|d| d.join("lua")))
-    {
+    // The machine folder: Lua modules, native modules and databases shared by every workbook.
+    if let Some(p) = crate::dbstore::local_dir() {
         dirs.push(p);
     }
     let sep = std::path::MAIN_SEPARATOR;
@@ -1222,6 +1381,76 @@ mod tests {
             h.call("dates", &[]).unwrap(),
             Value::Str("2024-02-29 45351.0".into())
         );
+    }
+
+    #[test]
+    fn databases_embedded_and_beside_the_workbook() {
+        let dir = tempfile::tempdir().unwrap();
+        let wb = dir.path().join("dbbook.xlsx");
+        let h = LuaHost::new(
+            &bundle_of(&[(
+                "t.lua",
+                r#"
+                function make()
+                  local d = xl.db.open("notes", {create = "embedded"})
+                  d:exec("create table n(t, v)")
+                  d:sql("insert into n values (?, ?)", {"hi", 5})
+                  return d:location()
+                end
+                function read()
+                  local d = xl.db.open("notes")           -- found again, with its data
+                  return d:sql("select t, v from n")[2][1]
+                end
+                function records()
+                  local r = xl.db.open("notes"):records("select t, v from n")
+                  return r[1].t .. r[1].v
+                end
+                function attached()
+                  return xl.sql("select v from [db:notes].n")[2][1]
+                end
+                function beside()
+                  local d = xl.db.open("side", {create = "folder"})
+                  d:exec("create table s(x); insert into s values (3)")
+                  return xl.db.open("side"):sql("select x from s")[2][1]
+                end
+                function missing() return xl.db.open("nothing") end
+                function readonly() return xl.db.open("notes", {readonly = true}):exec("drop table n") end
+                function listed()
+                  local names = {}
+                  for _, d in ipairs(xl.db.list()) do names[#names + 1] = d.place .. ":" .. d.name end
+                  return table.concat(names, ",")
+                end
+                "#,
+            )]),
+            &HostContext {
+                workbook: &wb,
+                cache_dir: None,
+                xl: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            h.call("make", &[]).unwrap(),
+            Value::Str("embedded:notes.db".into())
+        );
+        assert_eq!(h.call("read", &[]).unwrap(), Value::Str("hi".into()));
+        assert_eq!(h.call("records", &[]).unwrap(), Value::Str("hi5.0".into()));
+        assert_eq!(h.call("attached", &[]).unwrap(), Value::Num(5.0));
+        assert_eq!(h.call("beside", &[]).unwrap(), Value::Num(3.0));
+        assert!(dir.path().join("side.db").is_file());
+        let e = h.call("missing", &[]).unwrap_err().to_string();
+        assert!(e.contains("not found"), "{e}");
+        assert!(
+            h.call("readonly", &[])
+                .unwrap_err()
+                .to_string()
+                .contains("read-only")
+        );
+        assert_eq!(
+            h.call("listed", &[]).unwrap(),
+            Value::Str("folder:side.db".into())
+        );
+        crate::dbstore::forget_workbook(&wb);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 //! `xll` (XLOPER12, registration, banner) is Windows-only.
 
 pub mod dates;
+pub mod dbstore;
 pub mod dock;
 pub mod jobs;
 pub mod log;

@@ -275,6 +275,22 @@ impl Runtime {
         let digest = bundle.digest();
         self.trust.pretrust(workbook, &digest)?;
         let mtime = std::fs::metadata(workbook).and_then(|m| m.modified()).ok();
+        // Only data files (databases) differ from what runs: keep the Lua state and its globals.
+        if let Some(Entry {
+            book:
+                Book::Active {
+                    digest: d,
+                    bundle: running,
+                    ..
+                },
+            mtime: m,
+        }) = self.books.get_mut(&normalize_path(workbook))
+            && *d == digest
+        {
+            *running = Arc::new(bundle.clone());
+            *m = mtime;
+            return Ok(());
+        }
         let saved = package::read_bundle(workbook)
             .ok()
             .flatten()

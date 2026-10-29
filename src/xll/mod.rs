@@ -321,15 +321,30 @@ fn sql_query_dispatch(args: &[*const Xloper12]) -> Value {
     let Some(Value::Str(sql)) = vals.first().cloned() else {
         return sql_error("the first argument must be the SQL text");
     };
-    let source: Box<dyn crate::sqldb::Source> = match (sql.contains('['), crate::xlapi::global()) {
-        (true, Some(api)) => match locate_caller() {
+    let located = locate_caller();
+    let base: Box<dyn crate::sqldb::Source> = match (sql.contains('['), crate::xlapi::global()) {
+        (true, Some(api)) => match &located {
             Ok(workbook) => Box::new(crate::sqldb::XlSource {
                 api: std::sync::Arc::new(crate::xlapi::ReadOnly(api)),
-                workbook,
+                workbook: workbook.clone(),
             }),
             Err(_) => Box::new(crate::sqldb::NoSource),
         },
         _ => Box::new(crate::sqldb::NoSource),
+    };
+    // `[db:name]`: machine databases always; embedded ones when the workbook's scripts are enabled.
+    let source: Box<dyn crate::sqldb::Source> = if sql.contains("[db:") {
+        let workbook = located.clone().unwrap_or_default();
+        let bundle = located
+            .ok()
+            .and_then(|w| with_runtime(|rt| rt.enabled_files(Some(&w)).ok()))
+            .map(|(b, _)| b);
+        Box::new(crate::sqldb::WithDatabases {
+            base,
+            databases: crate::dbstore::resolver(workbook, bundle),
+        })
+    } else {
+        base
     };
     let query = crate::sqldb::Query {
         sql: &sql,
@@ -345,22 +360,26 @@ fn sql_query_dispatch(args: &[*const Xloper12]) -> Value {
     }
 }
 
-/// The scripts a `SQL.ASYNC` worker runs: one function that forwards to `xl.query`. SQL needs no
-/// user code, so it works in any workbook whether or not its scripts are enabled.
-fn sql_job_bundle() -> &'static (std::sync::Arc<crate::vfs::Bundle>, String) {
-    static B: std::sync::OnceLock<(std::sync::Arc<crate::vfs::Bundle>, String)> =
+/// What a `SQL.ASYNC` worker runs on: the workbook's enabled files (so `[db:name]` finds its
+/// embedded databases), or nothing at all in a workbook without enabled scripts. The worker's
+/// Lua state always has the global `__sql`, which is all the call needs.
+fn sql_job_bundle(
+    workbook: Option<&std::path::Path>,
+) -> (std::sync::Arc<crate::vfs::Bundle>, String) {
+    if let Some(w) = workbook
+        && let Ok(files) = with_runtime(|rt| rt.enabled_files(Some(w)))
+    {
+        return files;
+    }
+    static EMPTY: std::sync::OnceLock<(std::sync::Arc<crate::vfs::Bundle>, String)> =
         std::sync::OnceLock::new();
-    B.get_or_init(|| {
-        let mut b = crate::vfs::Bundle::new();
-        b.put_file(
-            "__sql.lua",
-            b"function __sql(...) return xl.query(...) end".to_vec(),
-            true,
-        )
-        .expect("static file name is valid");
-        let digest = b.digest();
-        (std::sync::Arc::new(b), digest)
-    })
+    EMPTY
+        .get_or_init(|| {
+            let b = crate::vfs::Bundle::new();
+            let digest = b.digest();
+            (std::sync::Arc::new(b), digest)
+        })
+        .clone()
 }
 
 /// `SQL.ASYNC(sql, a1..a10)`: like `SQL.QUERY`, on a background worker (`#GETTING_DATA` until done).
@@ -371,12 +390,12 @@ fn sql_async_dispatch(args: &[*const Xloper12]) -> Value {
         return sql_error("the first argument must be the SQL text");
     };
     let (located, cell) = locate_caller_cell();
-    let (bundle, digest) = sql_job_bundle();
+    let (bundle, digest) = sql_job_bundle(located.as_deref().ok());
     let spec = JobSpec {
         // Unsaved workbooks work too, except for references to cells.
         workbook: located.unwrap_or_default(),
-        digest: digest.clone(),
-        bundle: std::sync::Arc::clone(bundle),
+        digest,
+        bundle,
         func: "__sql".to_owned(),
         args: vals,
         caller: cell,

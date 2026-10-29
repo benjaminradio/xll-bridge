@@ -12,6 +12,7 @@
 
 mod cells;
 mod com;
+mod dbflush;
 mod dialogs;
 mod dispatch;
 mod folder;
@@ -297,6 +298,7 @@ fn refresh_books(app: &IDispatch) {
         });
         for gone in &vanished {
             crate::jobs::global().forget_workbook(gone);
+            crate::dbstore::forget_workbook(gone);
         }
         let has_files = appeared
             .iter()
@@ -380,6 +382,7 @@ unsafe extern "system" fn timer_proc(_: HWND, _: u32, _: usize, _: u32) {
             pump_macros(&app);
             rtd::tick();
             folder::tick(&app);
+            dbflush::tick(&app);
             pane::tick(&app);
         }
     }));

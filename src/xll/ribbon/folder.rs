@@ -127,8 +127,8 @@ pub(super) fn tick(app: &IDispatch) {
                     let embedded = workbook_name_by_path(&path)
                         .and_then(|n| cells::open_book(app, &n).ok())
                         .and_then(|wb| live::read(&wb).ok().flatten())
-                        .map(|b| b.digest());
-                    if embedded.as_deref() != Some(snap.bundle.digest().as_str()) {
+                        .map(|b| b.content_digest());
+                    if embedded.as_deref() != Some(snap.bundle.content_digest().as_str()) {
                         deliver(app, &path, &folder, snap);
                     }
                 }

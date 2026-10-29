@@ -156,7 +156,7 @@ background call also kills the program it is waiting for. These functions exist 
 * `.dll` / `.so` files are extracted (only once the workbook is enabled) to
   `%LOCALAPPDATA%\xll-bridge\cache\<digest>\` and added to `package.cpath`, so `require("native.thing")`
   finds `native/thing.dll`.
-* `require` also searches the workbook's own folder and `%APPDATA%\xll-bridge\lua`.
+* `require` also searches the workbook's own folder and the machine folder `%APPDATA%\xll-bridge\local` (shared Lua and native modules, and machine databases).
 * Paths are validated everywhere (no `..`, drive letters, reserved Windows names); text files are stored
   with `\n` line endings; limits are 32 MB per file and 64 MB per workbook.
 
@@ -187,6 +187,39 @@ enabled scripts, so `SQL.QUERY` and `SQL.ASYNC` work in any workbook.
   `YYYY-MM-DD`, with `THH:MM:SS[.mmm]` when there is a time; the 1900 date system is assumed.
 * Hardening: the schema is not trusted, untrusted-schema tricks are off, extensions cannot be loaded and a
   query is stopped after 60 seconds (or when its background call is cancelled).
+
+### Databases
+
+SQLite is also a place to keep data. A database can live **in the workbook** (travels with the file) or
+**on the machine** (persistent, shared by every workbook). Names are found like Lua modules: first the
+workbook's embedded files, then the workbook's own folder, then `%APPDATA%\xll-bridge\local`. `sales`
+finds `sales.db`, `sales.sqlite` or `sales.sqlite3`; a full path means exactly that file.
+
+```lua
+local db = xl.db.open("sales")                          -- embedded, beside the workbook or machine, in that order
+local db = xl.db.open("log", { create = "embedded" })   -- or "local" (machine folder) or "folder" (beside the workbook)
+db:exec("create table if not exists orders(id integer primary key, item, qty)")
+db:sql("insert into orders(item, qty) values (?, ?)", { "bolt", 10 })
+local rows = db:sql("select item, qty from orders")      -- table of rows, column names first
+local recs = db:records("select * from orders where qty > :n", { n = 5 })
+db:sql("insert into orders(item, qty) select item, qty from [Sheet1!A1:B20]")   -- cells into the database
+xl.db.list()                                            -- { {name=..., place="embedded"|"folder"|"local"}, ... }
+```
+
+* `db:sql` runs one statement, `db:exec` any number that return no rows. `[Sheet1!A1:B20]` and `[Table]`
+  load cells for that one statement (as a temporary table with a generated name, so they never shadow the
+  database's own tables). `{ readonly = true }` opens a database that cannot be changed.
+* An **embedded** database is kept in memory and stored back into the workbook's file tree about a second and
+  a half after the last change (the status bar says so); the workbook is marked modified, so **save it to
+  keep the data**. Everything running in the workbook (`LUA.CALL`, background calls, macros, streams) shares
+  one live copy. The database must fit the 32 MB file limit; use a machine database for big data.
+* Embedded databases are only available in workbooks whose scripts are **enabled**. A database is data, not
+  code: swapping one does not change what a workbook is trusted to run, but SQLite is opened defensively
+  (no unsafe schema functions, no extensions).
+* A database file in a folder you **Sync** is part of that folder; edits made by macros live in the workbook
+  copy until the folder's file itself changes.
+* In `SQL.QUERY` / `SQL.ASYNC` (read only) use `[db:name]` as a schema: `select * from [db:sales].orders`.
+  Embedded databases are read as they are right now, including changes not yet stored.
 
 From Lua (`LUA.CALL`, `LUA.ASYNC`, macros, streams), statements may also change data in the throwaway
 in-memory database:
@@ -274,7 +307,7 @@ first needed:
 * `settings.json`: dock/float choice and panel width; written when you change them
 * `sync.json`: workbook ↔ folder links; written when you link a folder
 * `addin.log`: only when something went wrong (panic, crash, failed write), with the preceding events
-* `lua\`: shared Lua/DLL modules for `require`; create it yourself if you want one
+* `local\`: the machine folder: shared Lua/DLL modules for `require` and machine databases; create it yourself (or let `xl.db.open(..., {create = "local"})` do)
 * `%LOCALAPPDATA%\xll-bridge\cache\`: native modules extracted from a workbook, when it is enabled
 
 The add-in also registers itself for the current user only (no admin rights): the COM classes for the
@@ -293,7 +326,7 @@ the Add-ins dialog deletes those keys; `DllRegisterServer` / `DllUnregisterServe
 | `lua_host` | one Lua state per workbook, `Value` ⇄ Lua, the `xl` table | any |
 | `xlapi` | cell access for Lua behind a trait; routes worker-thread requests to the UI thread | any |
 | `jobs`, `streams`, `macros`, `procrun` | `LUA.ASYNC`, `LUA.STREAM`, macros, running programs | any |
-| `sqldb`, `dates` | SQLite over cells (`SQL.QUERY`, `xl.sql`), Excel date ⇄ ISO 8601 | any |
+| `sqldb`, `dbstore`, `dates` | SQLite over cells (`SQL.QUERY`, `xl.sql`), embedded and machine databases (`xl.db`), Excel date ⇄ ISO 8601 | any |
 | `sync`, `panel`, `settings`, `ui`, `log` | folder sync, Files-panel commands, preferences, button states, diagnostics | any |
 | `xll/` | XLOPER12 FFI (`MdCallBack12` is found at run time, no SDK), registration, exports | Windows x64 |
 | `xll/ribbon/` | the COM add-in in the same DLL: ribbon, Files panel, cell access, RTD server, folder sync | Windows x64 |

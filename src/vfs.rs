@@ -132,6 +132,14 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 /// True if `data` can be stored as XML text without loss.
+/// `.db`, `.sqlite`, `.sqlite3`: SQLite databases.
+pub fn is_database_file(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".db", ".sqlite", ".sqlite3"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+}
+
 pub fn is_xml_text(data: &[u8]) -> bool {
     match std::str::from_utf8(data) {
         Ok(s) => s.chars().all(|c| {
@@ -377,7 +385,22 @@ impl Bundle {
 
     /// Fingerprint of the whole tree; trust is pinned to this.
     pub fn digest(&self) -> String {
-        let mut files: Vec<&File> = self.files.iter().collect();
+        self.digest_of(false)
+    }
+
+    /// Like [`Bundle::digest`] but including database files: changes whenever any byte does.
+    pub fn content_digest(&self) -> String {
+        self.digest_of(true)
+    }
+
+    /// Database files hold data, not code, and a workbook's databases change whenever it saves
+    /// data, so the trust digest ignores them (a changed database alone never blocks a workbook).
+    fn digest_of(&self, with_databases: bool) -> String {
+        let mut files: Vec<&File> = self
+            .files
+            .iter()
+            .filter(|f| with_databases || !is_database_file(&f.path))
+            .collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut dirs: Vec<&String> = self.dirs.iter().collect();
         dirs.sort();
@@ -551,6 +574,19 @@ impl Bundle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_trust_digest_ignores_databases_but_the_content_digest_does_not() {
+        let mut a = Bundle::new();
+        a.put_file("main.lua", b"x = 1".to_vec(), false).unwrap();
+        let mut b = a.clone();
+        a.put_file("data/sales.db", b"v1".to_vec(), false).unwrap();
+        b.put_file("data/sales.db", b"v2".to_vec(), false).unwrap();
+        assert_eq!(a.digest(), b.digest());
+        assert_ne!(a.content_digest(), b.content_digest());
+        a.put_file("main.lua", b"x = 2".to_vec(), true).unwrap();
+        assert_ne!(a.digest(), b.digest());
+    }
 
     #[test]
     fn export_all_writes_the_whole_tree() {

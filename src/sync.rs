@@ -160,7 +160,7 @@ impl Watcher {
         let stamp = stamp(&self.folder)?;
         let snap = scan(&self.folder)?;
         self.applied_stamp = Some(stamp);
-        self.applied_digest = Some(snap.bundle.digest());
+        self.applied_digest = Some(snap.bundle.content_digest());
         self.pending = None;
         Ok(snap)
     }
@@ -188,7 +188,7 @@ impl Watcher {
         match scan(&self.folder) {
             Err(e) => Poll::Failed(e),
             Ok(snap) => {
-                let digest = snap.bundle.digest();
+                let digest = snap.bundle.content_digest();
                 if self.applied_digest.as_deref() == Some(digest.as_str()) {
                     Poll::Idle // touched, not changed
                 } else {

@@ -35,6 +35,37 @@ const MAX_COLUMNS: usize = 2000;
 /// Where bracketed references get their data.
 pub trait Source {
     fn fetch(&self, reference: &str) -> Result<Array, String>;
+
+    /// A database named by `[db:name]` in the SQL text, attached read-only for the query.
+    fn database(&self, name: &str) -> Result<DbHandle, String> {
+        Err(format!("[db:{name}]: databases are not available here"))
+    }
+}
+
+/// What a `[db:name]` reference resolves to.
+pub enum DbHandle {
+    /// An embedded database (its bytes).
+    Bytes(Vec<u8>),
+    /// A database file on disk.
+    File(PathBuf),
+}
+
+/// Looks databases up by name.
+pub type DbResolver = Arc<dyn Fn(&str) -> Result<DbHandle, String> + Send + Sync>;
+
+/// Adds database lookup to another source.
+pub struct WithDatabases {
+    pub base: Box<dyn Source>,
+    pub databases: DbResolver,
+}
+
+impl Source for WithDatabases {
+    fn fetch(&self, reference: &str) -> Result<Array, String> {
+        self.base.fetch(reference)
+    }
+    fn database(&self, name: &str) -> Result<DbHandle, String> {
+        (self.databases)(name)
+    }
 }
 
 /// Reads references through Excel: an Excel table or defined name first, then a range address.
@@ -120,6 +151,8 @@ pub struct Query<'a> {
 pub struct Output {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Value>>,
+    /// The statement could change data (it was not a read-only statement).
+    pub modified: bool,
 }
 
 impl Output {
@@ -140,7 +173,7 @@ impl Output {
 
 /// Finds `[reference]` tokens outside strings, quoted identifiers and comments and replaces each
 /// with a quoted table name. Returns the new text and (reference, table name) pairs.
-fn rewrite(sql: &str) -> (String, Vec<(String, String)>) {
+fn rewrite(sql: &str, friendly_names: bool) -> (String, Vec<(String, String)>) {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());
     let mut refs: Vec<(String, String)> = Vec::new();
@@ -191,7 +224,9 @@ fn rewrite(sql: &str) -> (String, Vec<(String, String)>) {
                     let name = match refs.iter().find(|(t, _)| *t == token) {
                         Some((_, n)) => n.clone(),
                         None => {
-                            let n = if is_identifier(&token) {
+                            let n = if let Some(db) = token.strip_prefix("db:") {
+                                format!("db_{}", db.trim())
+                            } else if friendly_names && is_identifier(&token) {
                                 token.clone()
                             } else {
                                 format!("__r{}", refs.len() + 1)
@@ -215,6 +250,46 @@ fn rewrite(sql: &str) -> (String, Vec<(String, String)>) {
         }
     }
     (out, refs)
+}
+
+/// Is there more than one statement? (A trailing `;` and comments after it do not count.)
+fn has_several_statements(sql: &str) -> bool {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+    let mut seen_semicolon = false;
+    while i < chars.len() {
+        let c = chars[i];
+        match c {
+            '\'' | '"' | '`' | '[' => {
+                if seen_semicolon {
+                    return true;
+                }
+                let close = if c == '[' { ']' } else { c };
+                i += 1;
+                while i < chars.len() && chars[i] != close {
+                    i += 1;
+                }
+            }
+            '-' if chars.get(i + 1) == Some(&'-') => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            '/' if chars.get(i + 1) == Some(&'*') => {
+                i += 2;
+                while i < chars.len() && !(chars[i] == '*' && chars.get(i + 1) == Some(&'/')) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            ';' => seen_semicolon = true,
+            c if c.is_whitespace() => {}
+            _ if seen_semicolon => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 fn is_identifier(s: &str) -> bool {
@@ -311,7 +386,7 @@ fn load_table(conn: &Connection, name: &str, data: &Array) -> Result<(), String>
 
 // ------------------------------------------------------------------ running a query
 
-fn open() -> Result<Connection, String> {
+pub fn open() -> Result<Connection, String> {
     let conn = Connection::open_in_memory().map_err(|e| e.to_string())?;
     // Untrusted input hardening: no writable schema tricks, no triggers/views calling unsafe functions.
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)
@@ -322,7 +397,7 @@ fn open() -> Result<Connection, String> {
     Ok(conn)
 }
 
-fn register_functions(conn: &Connection) -> Result<(), String> {
+pub fn register_functions(conn: &Connection) -> Result<(), String> {
     let flags = FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC;
     conn.create_scalar_function("xl_iso", 1, flags, |ctx| {
         Ok(match ctx.get_raw(0) {
@@ -341,36 +416,84 @@ fn register_functions(conn: &Connection) -> Result<(), String> {
     .map_err(|e| e.to_string())
 }
 
+/// Runs `q` in a fresh in-memory database that is thrown away afterwards.
 pub fn run(q: &Query<'_>) -> Result<Output, String> {
-    let (sql, refs) = rewrite(q.sql);
     let mut conn = open()?;
+    run_on(&mut conn, q, true)
+}
 
-    for (i, a) in q.args.iter().enumerate() {
-        if let Value::Array(arr) = a {
-            load_table(&conn, &format!("t{}", i + 1), arr)?;
-        }
-    }
-    for (token, table) in &refs {
-        let data = q.source.fetch(token)?;
-        load_table(&conn, table, &data)?;
-    }
-
-    if q.read_only {
-        conn.pragma_update(None, "query_only", true)
-            .map_err(|e| e.to_string())?;
-    }
-    let deadline = Instant::now() + q.limits.timeout;
-    let cancel = q.limits.cancel.clone();
+fn arm_limits(conn: &mut Connection, limits: &Limits) -> Result<(), String> {
+    let deadline = Instant::now() + limits.timeout;
+    let cancel = limits.cancel.clone();
     conn.progress_handler(
         1000,
         Some(move || {
             cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) || Instant::now() > deadline
         }),
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| e.to_string())
+}
 
-    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
-    if q.read_only && !stmt.readonly() {
+/// Runs `q` on an existing connection. The cells and tables it refers to are loaded as temporary
+/// tables for the duration of the call and dropped again. `friendly_names` lets a reference such
+/// as `[Orders]` be called `Orders` in the SQL; persistent databases pass `false` so a loaded
+/// table can never shadow one of their own.
+pub fn run_on(
+    conn: &mut Connection,
+    q: &Query<'_>,
+    friendly_names: bool,
+) -> Result<Output, String> {
+    arm_limits(conn, &q.limits)?;
+    let result = run_inner(conn, q, friendly_names);
+    let _ = conn.progress_handler(0, None::<fn() -> bool>);
+    result
+}
+
+fn run_inner(conn: &mut Connection, q: &Query<'_>, friendly_names: bool) -> Result<Output, String> {
+    let (sql, refs) = rewrite(q.sql, friendly_names);
+    let mut created: Vec<String> = Vec::new();
+    let mut attached: Vec<String> = Vec::new();
+    let outcome = (|| {
+        for (i, a) in q.args.iter().enumerate() {
+            if let Value::Array(arr) = a {
+                let name = format!("t{}", i + 1);
+                load_table(conn, &name, arr)?;
+                created.push(name);
+            }
+        }
+        for (token, table) in &refs {
+            if let Some(db) = token.strip_prefix("db:") {
+                attach(conn, db.trim(), table, q.source.database(db.trim())?)?;
+                attached.push(table.clone());
+            } else {
+                load_table(conn, table, &q.source.fetch(token)?)?;
+                created.push(table.clone());
+            }
+        }
+        execute(conn, &sql, q)
+    })();
+    // Leave a persistent connection as it was found.
+    let _ = conn.pragma_update(None, "query_only", false);
+    for name in &created {
+        let _ = conn.execute_batch(&format!("DROP TABLE temp.{}", quote_ident(name)));
+    }
+    for name in &attached {
+        let _ = conn.execute_batch(&format!("DETACH DATABASE {}", quote_ident(name)));
+    }
+    outcome
+}
+
+fn execute(conn: &Connection, sql: &str, q: &Query<'_>) -> Result<Output, String> {
+    if q.read_only {
+        conn.pragma_update(None, "query_only", true)
+            .map_err(|e| e.to_string())?;
+    }
+    if has_several_statements(sql) {
+        return Err("only one statement at a time here (xl.sql_exec / db:exec run several)".into());
+    }
+    let mut stmt = conn.prepare(sql).map_err(|e| e.to_string())?;
+    let modified = !stmt.readonly();
+    if q.read_only && modified {
         return Err(
             "this statement changes data, but SQL.QUERY only reads (use SQL.ASYNC or a macro)"
                 .into(),
@@ -401,6 +524,7 @@ pub fn run(q: &Query<'_>) -> Result<Output, String> {
         return Ok(Output {
             columns,
             rows: Vec::new(),
+            modified,
         });
     }
     let mut rows = Vec::new();
@@ -417,7 +541,47 @@ pub fn run(q: &Query<'_>) -> Result<Output, String> {
                 .collect(),
         );
     }
-    Ok(Output { columns, rows })
+    Ok(Output {
+        columns,
+        rows,
+        modified,
+    })
+}
+
+/// Attaches `handle` read-only as the schema `alias`.
+fn attach(conn: &mut Connection, name: &str, alias: &str, handle: DbHandle) -> Result<(), String> {
+    let a = quote_ident(alias);
+    match handle {
+        DbHandle::Bytes(bytes) => {
+            conn.execute_batch(&format!("ATTACH DATABASE ':memory:' AS {a}"))
+                .map_err(|e| format!("[db:{name}]: {e}"))?;
+            conn.deserialize_read_exact(alias, bytes.as_slice(), bytes.len(), true)
+                .map_err(|e| format!("[db:{name}]: {e}"))
+        }
+        DbHandle::File(path) => {
+            let uri = file_uri(&path);
+            conn.execute(&format!("ATTACH DATABASE ?1 AS {a}"), [uri])
+                .map(drop)
+                .map_err(|e| format!("[db:{name}]: {e}"))
+        }
+    }
+}
+
+/// `file:` URI for a path, opened read-only.
+fn file_uri(path: &std::path::Path) -> String {
+    let p = path.to_string_lossy().replace('\\', "/");
+    let mut enc = String::new();
+    for c in p.chars() {
+        match c {
+            '%' => enc.push_str("%25"),
+            '?' => enc.push_str("%3f"),
+            '#' => enc.push_str("%23"),
+            ' ' => enc.push_str("%20"),
+            _ => enc.push(c),
+        }
+    }
+    let lead = if enc.starts_with('/') { "" } else { "/" };
+    format!("file://{lead}{enc}?mode=ro")
 }
 
 fn interrupted(e: rusqlite::Error) -> String {
@@ -433,21 +597,32 @@ fn interrupted(e: rusqlite::Error) -> String {
 
 /// Runs statements that return no rows (several separated by `;` are fine).
 pub fn exec_script(sql: &str, source: &dyn Source, limits: &Limits) -> Result<(), String> {
-    let (sql, refs) = rewrite(sql);
     let mut conn = open()?;
-    for (token, table) in &refs {
-        load_table(&conn, table, &source.fetch(token)?)?;
+    exec_script_on(&mut conn, sql, source, limits, true)
+}
+
+pub fn exec_script_on(
+    conn: &mut Connection,
+    sql: &str,
+    source: &dyn Source,
+    limits: &Limits,
+    friendly_names: bool,
+) -> Result<(), String> {
+    arm_limits(conn, limits)?;
+    let (sql, refs) = rewrite(sql, friendly_names);
+    let mut created = Vec::new();
+    let outcome = (|| {
+        for (token, table) in &refs {
+            load_table(conn, table, &source.fetch(token)?)?;
+            created.push(table.clone());
+        }
+        conn.execute_batch(&sql).map_err(interrupted)
+    })();
+    for name in &created {
+        let _ = conn.execute_batch(&format!("DROP TABLE temp.{}", quote_ident(name)));
     }
-    let deadline = Instant::now() + limits.timeout;
-    let cancel = limits.cancel.clone();
-    conn.progress_handler(
-        1000,
-        Some(move || {
-            cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) || Instant::now() > deadline
-        }),
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute_batch(&sql).map_err(interrupted)
+    let _ = conn.progress_handler(0, None::<fn() -> bool>);
+    outcome
 }
 
 #[cfg(test)]
@@ -572,6 +747,15 @@ mod tests {
     }
 
     #[test]
+    fn several_statements_are_refused_not_silently_cut_off() {
+        let src = source();
+        let e = run(&q("select 1; select 2", &[], &src)).unwrap_err();
+        assert!(e.contains("one statement"), "{e}");
+        assert!(run(&q("select 1;", &[], &src)).is_ok());
+        assert!(run(&q("select ';x' ; -- done\n", &[], &src)).is_ok());
+    }
+
+    #[test]
     fn named_parameters() {
         let src = source();
         let mut query = q("select name from [Orders] where qty >= :min", &[], &src);
@@ -585,8 +769,10 @@ mod tests {
 
     #[test]
     fn brackets_in_strings_and_comments_are_left_alone() {
-        let (sql, refs) =
-            rewrite("select '[not a ref]', \"[nor this]\" /* [nor] */ from [T] -- [x]\n");
+        let (sql, refs) = rewrite(
+            "select '[not a ref]', \"[nor this]\" /* [nor] */ from [T] -- [x]\n",
+            true,
+        );
         assert_eq!(refs, vec![("T".to_owned(), "T".to_owned())]);
         assert!(sql.contains("'[not a ref]'") && sql.contains("-- [x]") && sql.contains("\"T\""));
     }
