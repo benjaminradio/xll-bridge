@@ -4,6 +4,7 @@
 //! `value`, `package` (script storage), `trust`, `lua_host` and `runtime` are portable;
 //! `xll` (XLOPER12, registration, banner) is Windows-only.
 
+pub mod csvio;
 pub mod dates;
 pub mod dbstore;
 pub mod dock;

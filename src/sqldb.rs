@@ -299,13 +299,13 @@ fn is_identifier(s: &str) -> bool {
         && it.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-fn quote_ident(name: &str) -> String {
+pub(crate) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 // ------------------------------------------------------------------ loading data
 
-fn to_sql(v: &Value) -> SqlValue {
+pub(crate) fn to_sql(v: &Value) -> SqlValue {
     match v {
         Value::Empty => SqlValue::Null,
         Value::Num(n) => SqlValue::Real(*n),
@@ -326,7 +326,7 @@ fn from_sql(v: ValueRef<'_>) -> Value {
     }
 }
 
-fn column_names(header: &[Value]) -> Vec<String> {
+pub(crate) fn column_names(header: &[Value]) -> Vec<String> {
     let mut names: Vec<String> = Vec::with_capacity(header.len());
     for (i, h) in header.iter().enumerate() {
         let base = match h {

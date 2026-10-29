@@ -230,6 +230,23 @@ impl Db {
         out
     }
 
+    /// Replaces `table` with the contents of a CSV file (see [`crate::csvio`]).
+    pub fn import_csv(
+        &self,
+        path: &Path,
+        table: &str,
+        opts: &crate::csvio::Options,
+        limits: &Limits,
+    ) -> Result<crate::csvio::Imported, String> {
+        if self.read_only {
+            return Err("this database was opened read-only".into());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let out = crate::csvio::import(&mut conn, path, table, opts, limits);
+        self.mark_dirty();
+        out
+    }
+
     /// The whole database as bytes (what gets stored in the workbook).
     pub fn snapshot(&self) -> Result<Vec<u8>, String> {
         let mut conn = self.conn.lock().unwrap();

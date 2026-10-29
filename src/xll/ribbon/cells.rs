@@ -204,6 +204,18 @@ fn string_of(v: windows::core::Result<VARIANT>) -> Result<String, XlError> {
         .map_err(com)
 }
 
+/// An omitted optional argument (`DISP_E_PARAMNOTFOUND`).
+fn missing_arg() -> VARIANT {
+    let mut v = VARIANT::default();
+    // SAFETY: writing the discriminant and the matching union member of a fresh VARIANT.
+    unsafe {
+        let inner = &mut *v.Anonymous.Anonymous;
+        inner.vt = VT_ERROR;
+        inner.Anonymous.scode = 0x8002_0004u32 as i32;
+    }
+    v
+}
+
 fn count_of(obj: &IDispatch, prop: &str) -> Result<i32, XlError> {
     dispatch::get(obj, prop)
         .and_then(|v| i32::try_from(&v))
@@ -367,6 +379,50 @@ pub(super) fn execute(op: Op) -> Result<Reply, XlError> {
         Op::Clear { workbook, address } => {
             let r = resolve(&app, &workbook, &address)?;
             dispatch::call(&r.range, "ClearContents", &[]).map_err(com)?;
+            Ok(Reply::Done)
+        }
+        Op::AsTable {
+            workbook,
+            address,
+            name,
+        } => {
+            let r = resolve(&app, &workbook, &address)?;
+            let single = describe(&r.range, &r.book, r.explicit_book)
+                .map(|i| i.rows == 1 && i.cols == 1)
+                .unwrap_or(false);
+            // One cell stands for the block of data around it, as Ctrl+T does.
+            let target = if single {
+                dispatch_of(dispatch::get(&r.range, "CurrentRegion"))?
+            } else {
+                r.range
+            };
+            let sheet = dispatch_of(dispatch::get(&target, "Worksheet"))?;
+            let tables = dispatch_of(dispatch::get(&sheet, "ListObjects"))?;
+            let existing = dispatch_of(dispatch::get_with(
+                &tables,
+                "Item",
+                &[VARIANT::from(name.as_str())],
+            ));
+            match existing {
+                Ok(table) => {
+                    dispatch::call(&table, "Resize", &[VARIANT::from(target)]).map_err(com)?;
+                }
+                Err(e) if e.retryable => return Err(e),
+                Err(_) => {
+                    // ListObjects.Add(xlSrcRange = 1, source, LinkSource missing, xlYes = 1)
+                    let table = dispatch_of(dispatch::call(
+                        &tables,
+                        "Add",
+                        &[
+                            VARIANT::from(1i32),
+                            VARIANT::from(target),
+                            missing_arg(),
+                            VARIANT::from(1i32),
+                        ],
+                    ))?;
+                    dispatch::put(&table, "Name", VARIANT::from(name.as_str())).map_err(com)?;
+                }
+            }
             Ok(Reply::Done)
         }
         Op::Table { workbook, name } => {

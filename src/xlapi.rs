@@ -53,6 +53,13 @@ pub enum Op {
         workbook: PathBuf,
         name: String,
     },
+    /// Turns a range into an Excel table (a single cell stands for its current region, like
+    /// Ctrl+T), or resizes the table of that name on the sheet to it.
+    AsTable {
+        workbook: PathBuf,
+        address: String,
+        name: String,
+    },
     Sheets {
         workbook: PathBuf,
     },
@@ -67,7 +74,10 @@ pub enum Op {
 
 impl Op {
     pub fn is_write(&self) -> bool {
-        matches!(self, Op::Write { .. } | Op::Clear { .. })
+        matches!(
+            self,
+            Op::Write { .. } | Op::Clear { .. } | Op::AsTable { .. }
+        )
     }
 }
 
@@ -533,6 +543,11 @@ pub(crate) mod fake {
                             s.formulas.remove(&(r, c));
                         }
                     }
+                    Ok(Reply::Done)
+                }
+                Op::AsTable { address, name, .. } => {
+                    self.resolve(&address)?;
+                    self.tables.lock().unwrap().insert(name, address);
                     Ok(Reply::Done)
                 }
                 Op::Table { name, .. } => {

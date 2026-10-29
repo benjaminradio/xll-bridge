@@ -27,7 +27,7 @@ use crate::trust::normalize_path;
 use crate::value::Value;
 use crate::vfs::Bundle;
 
-pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(120);
+pub const DEFAULT_JOB_TIMEOUT: Duration = Duration::from_secs(600);
 const WORKERS: usize = 4;
 const MAX_ENTRIES: usize = 2000;
 const MAX_STATES_PER_WORKER: usize = 8;

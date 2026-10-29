@@ -15,6 +15,7 @@ path = "src/bin/xllb-pack.rs"
 
 [dependencies]
 base64 = "0.23.1"
+csv = "1.4.0"
 mlua = { version = "0.12.2", features = ["lua54", "vendored"] }
 quick-xml = "0.42.0"
 rusqlite = { version = "0.41.1", features = ["bundled", "functions", "hooks", "serialize"] }

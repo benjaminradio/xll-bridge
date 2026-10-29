@@ -126,6 +126,7 @@ impl LuaHost {
         install_process_api(&lua, Rc::clone(&limits))?;
         install_range_api(&lua, ctx.workbook, ctx.xl.clone())?;
         install_macro_api(&lua)?;
+        install_file_helpers(&lua)?;
         let sql_env = Rc::new(SqlEnv {
             api: ctx.xl.clone(),
             workbook: ctx.workbook.to_owned(),
@@ -421,6 +422,18 @@ impl UserData for LuaRange {
                 .map_err(api_err)?;
             Ok(())
         });
+        // range:as_table(name): make the data at (or around) this range an Excel table, so a
+        // PivotTable can be built on it. A single cell means the block of data around it.
+        methods.add_method("as_table", |_, this, name: String| {
+            this.api
+                .call(Op::AsTable {
+                    workbook: this.workbook.clone(),
+                    address: this.address.clone(),
+                    name,
+                })
+                .map_err(api_err)?;
+            Ok(())
+        });
         methods.add_method("size", |_, this, ()| Ok((this.rows, this.cols)));
         methods.add_method("address", |_, this, ()| Ok(this.address.clone()));
         methods.add_meta_method("__tostring", |_, this, ()| {
@@ -707,6 +720,98 @@ fn install_sql_api(lua: &Lua, env: Rc<SqlEnv>) -> mlua::Result<()> {
     xl.set("query", query)
 }
 
+fn string_list(t: &mlua::Table, key: &str) -> mlua::Result<Vec<String>> {
+    Ok(match t.get::<LV>(key)? {
+        LV::Table(l) => l
+            .sequence_values::<String>()
+            .collect::<mlua::Result<Vec<_>>>()?,
+        LV::String(s) => vec![s.to_string_lossy()],
+        _ => Vec::new(),
+    })
+}
+
+/// `{ clean_names = true, dates = {...}, text = {...}, index = {...} }`
+fn csv_options(opts: Option<mlua::Table>) -> mlua::Result<crate::csvio::Options> {
+    let mut o = crate::csvio::Options {
+        clean_names: true,
+        ..Default::default()
+    };
+    if let Some(t) = opts {
+        if let LV::Boolean(b) = t.get::<LV>("clean_names")? {
+            o.clean_names = b;
+        }
+        o.dates = string_list(&t, "dates")?;
+        o.text = string_list(&t, "text")?;
+        o.index = string_list(&t, "index")?;
+    }
+    Ok(o)
+}
+
+/// `xl.read_csv`, `xl.hash`, `xl.stat`, `xl.mkdir`, `xl.local_dir`: the small things a data-refresh
+/// script needs around the programs it runs.
+fn install_file_helpers(lua: &Lua) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    // xl.read_csv(path [, opts]) -> table of rows, column names first
+    xl.set(
+        "read_csv",
+        lua.create_function(|lua, (path, opts): (String, Option<mlua::Table>)| {
+            let o = csv_options(opts)?;
+            let a = crate::csvio::read_array(Path::new(&path), &o, MAX_CELLS)
+                .map_err(mlua::Error::runtime)?;
+            to_lua(lua, &Value::Array(a))
+        })?,
+    )?;
+    // xl.hash(text) -> SHA-256 as lowercase hex
+    xl.set(
+        "hash",
+        lua.create_function(|_, text: mlua::LuaString| {
+            use sha2::{Digest, Sha256};
+            Ok(Sha256::digest(&*text.as_bytes())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>())
+        })?,
+    )?;
+    // xl.stat(path) -> { size, mtime (seconds since 1970), is_dir, is_file } or nil
+    xl.set(
+        "stat",
+        lua.create_function(|lua, path: String| {
+            let Ok(m) = std::fs::metadata(&path) else {
+                return Ok(LV::Nil);
+            };
+            let t = lua.create_table()?;
+            t.set("size", m.len() as f64)?;
+            t.set(
+                "mtime",
+                m.modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0.0, |d| d.as_secs_f64()),
+            )?;
+            t.set("is_dir", m.is_dir())?;
+            t.set("is_file", m.is_file())?;
+            Ok(LV::Table(t))
+        })?,
+    )?;
+    // xl.mkdir(path) -> true, or nil and a message
+    xl.set(
+        "mkdir",
+        lua.create_function(|_, path: String| {
+            Ok(match std::fs::create_dir_all(&path) {
+                Ok(()) => (Some(true), None),
+                Err(e) => (None, Some(format!("{path}: {e}"))),
+            })
+        })?,
+    )?;
+    // xl.local_dir() -> the machine folder (it may not exist yet)
+    xl.set(
+        "local_dir",
+        lua.create_function(|_, ()| {
+            Ok(crate::dbstore::local_dir().map(|p| p.to_string_lossy().into_owned()))
+        })?,
+    )
+}
+
 /// A database opened with `xl.db.open`.
 struct LuaDb {
     db: Arc<crate::dbstore::Db>,
@@ -748,6 +853,21 @@ impl UserData for LuaDb {
                 .exec(&script, source.as_ref(), &this.env.limits())
                 .map_err(mlua::Error::runtime)
         });
+        // db:import_csv(path, table [, opts]) -> { rows = n, columns = {...} }; replaces the table
+        methods.add_method(
+            "import_csv",
+            |lua, this, (path, table, opts): (String, String, Option<mlua::Table>)| {
+                let o = csv_options(opts)?;
+                let done = this
+                    .db
+                    .import_csv(Path::new(&path), &table, &o, &this.env.limits())
+                    .map_err(mlua::Error::runtime)?;
+                let t = lua.create_table()?;
+                t.set("rows", done.rows as i64)?;
+                t.set("columns", lua.create_sequence_from(done.columns)?)?;
+                Ok(t)
+            },
+        );
         methods.add_method("location", |_, this, ()| Ok(this.db.label()));
         methods.add_meta_method("__tostring", |_, this, ()| {
             Ok(format!("database({})", this.db.label()))
@@ -1451,6 +1571,126 @@ mod tests {
             Value::Str("folder:side.db".into())
         );
         crate::dbstore::forget_workbook(&wb);
+    }
+
+    #[test]
+    fn csv_files_load_into_databases_and_helpers_for_refresh_scripts() {
+        use crate::xlapi::fake::MemGrid;
+        let dir = tempfile::tempdir().unwrap();
+        let wb = dir.path().join("csvbook.xlsx");
+        let csv = dir.path().join("gl.csv");
+        std::fs::write(
+            &csv,
+            "'Dim'[BU],[Month],[Amount]\nNorth,2024-01-31,5\nSouth,2024-02-29,7.5\nNorth,2024-02-29,1\n",
+        )
+        .unwrap();
+        let g = MemGrid::new();
+        let h = LuaHost::new(
+            &bundle_of(&[(
+                "t.lua",
+                r#"
+                function load(csv)
+                  local d = xl.db.open("gl", {create = "folder"})
+                  local r = d:import_csv(csv, "gl", {dates = {"Month"}, index = {"BU"}})
+                  local t = d:sql("select BU, sum(Amount) from gl group by BU order by BU")
+                  return r.rows .. ":" .. r.columns[2] .. ":" .. t[2][1] .. "=" .. t[2][2]
+                end
+                function read(csv)
+                  local t = xl.read_csv(csv, {dates = {"Month"}})
+                  return #t .. ":" .. t[1][3] .. ":" .. t[2][2]
+                end
+                function helpers(path)
+                  local s = xl.stat(path)
+                  return xl.hash("abc"):sub(1, 8) .. ":" .. tostring(s.is_file) .. ":" .. tostring(xl.stat(path .. "x"))
+                end
+                function table_of()
+                  xl.range("A1"):set({{"k", "v"}, {1, 2}})
+                  xl.range("A1:B2"):as_table("Report")
+                  return xl.sql("select v from [Report]")[2][1]
+                end
+                "#,
+            )]),
+            &HostContext {
+                workbook: &wb,
+                cache_dir: None,
+                xl: Some(Arc::clone(&g) as Arc<dyn XlApi>),
+            },
+        )
+        .unwrap();
+        let path = Value::Str(csv.to_string_lossy().into_owned());
+        assert_eq!(
+            h.call("load", std::slice::from_ref(&path)).unwrap(),
+            Value::Str("3:Month:North=6.0".into())
+        );
+        assert_eq!(
+            h.call("read", std::slice::from_ref(&path)).unwrap(),
+            Value::Str("4:Amount:45322.0".into())
+        );
+        assert_eq!(
+            h.call("helpers", &[path]).unwrap(),
+            Value::Str("ba7816bf:true:nil".into())
+        );
+        // A range becomes a named table that SQL (and, in Excel, PivotTables) can use.
+        assert_eq!(h.call("table_of", &[]).unwrap(), Value::Num(2.0));
+        assert!(g.tables.lock().unwrap().contains_key("Report"));
+        assert!(dir.path().join("gl.db").is_file());
+        crate::dbstore::forget_workbook(&wb);
+    }
+
+    #[test]
+    fn the_fabric_example_caches_pulls_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, src) = (dir.path().join("local"), dir.path().join("src.csv"));
+        std::fs::write(&src, "'Dim'[BU],[Amount]\nNorth,5\nSouth,7\n").unwrap();
+        // LOCAL and SRC are plain globals for the script, set by a file that loads first.
+        let code = format!(
+            "LOCAL = [[{}]] SRC = [[{}]]\n",
+            cache.display(),
+            src.display()
+        );
+        let bundle = bundle_of(&[
+            ("fabric.lua", include_str!("../examples/fabric.lua")),
+            ("a_globals.lua", &code),
+            (
+                "t.lua",
+                r#"
+                local fabric = require("fabric")
+                xl.local_dir = function() return LOCAL end
+                pulls = 0
+                fabric.config.command = function(c, dax_file, out_file)
+                  pulls = pulls + 1
+                  if package.config:sub(1, 1) == "\\" then
+                    return { "cmd", "/C", "copy", SRC, out_file }
+                  end
+                  return { "cp", SRC, out_file }
+                end
+                fabric.config.refresh_after = "00:00"
+                function run(dax, force)
+                  local t = fabric.table(dax, { force = force })
+                  return pulls .. ":" .. #t .. ":" .. t[1][1] .. ":" .. t[3][2]
+                end
+                "#,
+            ),
+        ]);
+        let h = LuaHost::new(
+            &bundle,
+            &HostContext {
+                workbook: &dir.path().join("b.xlsx"),
+                cache_dir: None,
+                xl: None,
+            },
+        )
+        .unwrap();
+        let q = |dax: &str, force: bool| {
+            h.call("run", &[Value::Str(dax.into()), Value::Bool(force)])
+                .unwrap()
+        };
+        // The first call pulls; the same DAX again is served from disk; other DAX pulls again.
+        assert_eq!(q("EVALUATE A", false), Value::Str("1:3:BU:7.0".into()));
+        assert_eq!(q("EVALUATE A", false), Value::Str("1:3:BU:7.0".into()));
+        assert_eq!(q("EVALUATE B", false), Value::Str("2:3:BU:7.0".into()));
+        assert_eq!(q("EVALUATE A", true), Value::Str("3:3:BU:7.0".into()));
+        assert!(cache.join("fabric-cache").is_dir());
     }
 
     #[test]

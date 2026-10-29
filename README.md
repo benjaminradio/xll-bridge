@@ -73,7 +73,7 @@ arrives; only the waiting cells recalculate and Excel stays usable.
   are not visible to `LUA.CALL` or to other workers. Pass what a function needs as arguments.
 * Results are **cached** per function, arguments and script version, so recalculating does not re-run a
   slow call. They run again when the arguments or scripts change, or with **Re-run async** on the Lua tab.
-* A call is limited to 120 s and is cancelled when re-run or when the workbook closes (a Lua loop is
+* A call is limited to 10 minutes and is cancelled when re-run or when the workbook closes (a Lua loop is
   interrupted; a program started with `xl.run` is killed).
 * In manual calculation mode finished cells are marked dirty and appear on the next F9.
 
@@ -230,6 +230,46 @@ local recs = xl.sql_records("select * from [Data!A1:B9] where k >= :min", {min =
 xl.sql_exec("create temp table t(a); insert into t values (1), (2)")
 xl.range("Out!A1"):set(rows)                                             -- write a result to the sheet (macro/async)
 ```
+
+## Example: a local cache of a Fabric / Power BI model
+
+Pivot tables and live connections hit the server for every slice. A cache that is pulled once and
+queried locally avoids that. `examples/fabric.lua` (in the package) is a ready-made module; put it in the
+machine folder (`%APPDATA%\xll-bridge\local`) and adapt its `config` (the `dscmd` path, server, dataset,
+and the `command` function, which must match your own working `dscmd` command line):
+
+```lua
+local fabric = require("fabric")
+
+function gl_summary(month)                 -- =LUA.ASYNC("gl_summary", "2024-06")
+  return fabric.table(([[EVALUATE SUMMARIZECOLUMNS(...)]]):format(month))
+end
+
+xl.macro("Refresh Fabric cache", function()   -- Lua > Macros
+  fabric.load("fabric", "gl", [[EVALUATE ...detailed query...]],
+              { dates = { "Month" }, text = { "Account" }, index = { "BU", "Account" } })
+end)
+```
+
+* **One pull per DAX text and day.** The result of each distinct DAX text is kept as a CSV file in
+  `local\fabric-cache` and reused by every workbook until it is older than the latest `refresh_after` time.
+  Building the DAX with string concatenation and variables gives you exactly the aligned, focused datasets
+  you need. Excel's own `LUA.ASYNC` cache additionally keeps the result in memory until the arguments change.
+* **`LUA.ASYNC`** shows `#GETTING_DATA` while `dscmd` runs (including its sign-in popup); Excel stays usable.
+  A call may take up to 10 minutes. Cancelling (Re-run async, closing the workbook) ends `dscmd` too.
+* **A database for the big, detailed pull.** `fabric.load` replaces a table of the machine database in one
+  transaction (readers keep seeing the old data until the new data is complete; nothing is half-loaded).
+  Millions of rows load in seconds, and any workbook can then query them:
+  `=SQL.QUERY("select BU, sum(Amount) from [db:fabric].gl where Month >= xl_date('2024-01-01') group by BU")`.
+* **From the cache to PivotTables.** In a macro: `xl.range("Data!A1"):set(rows)` then
+  `xl.range("Data!A1"):as_table("GL")` makes the data an Excel table; a PivotTable on it never touches
+  Fabric.
+
+Lua helpers this uses (also available to your own scripts): `xl.read_csv(path, opts)`, `db:import_csv(path,
+table, opts)` (options `clean_names` (default true: `'Dim'[BU]` becomes `BU`), `dates`, `text`, `index`),
+`range:as_table(name)`, `xl.hash(text)`, `xl.stat(path)`, `xl.mkdir(path)`, `xl.local_dir()`. Column types come
+from the data; codes with leading zeros (`007`) stay text; empty fields are NULL / empty cells; dates are
+read as ISO 8601 into Excel date numbers.
 
 ## The Lua ribbon tab
 
