@@ -34,6 +34,17 @@ pub enum Command {
         path: String,
         name: String,
     },
+    /// Copy (or move) a node onto a folder: between the workbook and the machine folder, or
+    /// within one of them. Both are node ids (see [`MACHINE_ROOT`]).
+    Transfer {
+        from: String,
+        to_dir: String,
+        move_: bool,
+    },
+    /// Open a machine file in the user's editor.
+    OpenInEditor {
+        path: String,
+    },
     Refresh,
     /// Switch between docked and floating.
     ToggleDock,
@@ -41,6 +52,53 @@ pub enum Command {
     Close,
     /// Recreate the window in the currently configured mode (used by the docking fallback).
     Recreate,
+}
+
+// ------------------------------------------------------------------ node ids
+
+/// The panel shows two trees: the workbook's embedded files ("ThisWorkbook") and the machine folder
+/// ("Machine"). A node is identified by one string: a workbook node by its path in the file tree
+/// (`""` is the ThisWorkbook root), a machine node by that path behind this marker (which is
+/// never part of a valid file name), the machine root by the marker alone.
+pub const MACHINE_ROOT: &str = "\u{1}";
+
+pub fn is_machine(id: &str) -> bool {
+    id.starts_with('\u{1}')
+}
+
+pub fn machine_id(rel: &str) -> String {
+    format!("{MACHINE_ROOT}{rel}")
+}
+
+/// The path inside the machine folder (`""` for its root).
+pub fn machine_rel(id: &str) -> &str {
+    id.strip_prefix('\u{1}').unwrap_or(id)
+}
+
+pub fn is_root(id: &str) -> bool {
+    id.is_empty() || id == MACHINE_ROOT
+}
+
+/// The node a node hangs from (`None` for the two roots).
+pub fn parent_id(id: &str) -> Option<String> {
+    if is_root(id) {
+        return None;
+    }
+    let (prefix, rel) = if is_machine(id) {
+        (MACHINE_ROOT, machine_rel(id))
+    } else {
+        ("", id)
+    };
+    Some(format!(
+        "{prefix}{}",
+        rel.rsplit_once('/').map_or("", |(p, _)| p)
+    ))
+}
+
+/// The last path component.
+pub fn node_name(id: &str) -> &str {
+    let rel = if is_machine(id) { machine_rel(id) } else { id };
+    rel.rsplit('/').next().unwrap_or(rel)
 }
 
 pub fn join(parent: &str, name: &str) -> String {
@@ -116,6 +174,28 @@ pub fn delete_summary(bundle: &Bundle, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn node_ids_tell_the_two_trees_apart() {
+        use super::*;
+        assert!(is_root("") && is_root(MACHINE_ROOT) && !is_root("a"));
+        assert_eq!(parent_id("a/b.lua").as_deref(), Some("a"));
+        assert_eq!(parent_id("a").as_deref(), Some(""));
+        assert_eq!(parent_id(""), None);
+        let m = machine_id("lib/x.lua");
+        assert!(is_machine(&m) && !is_machine("lib/x.lua"));
+        assert_eq!(machine_rel(&m), "lib/x.lua");
+        assert_eq!(parent_id(&m), Some(machine_id("lib")));
+        assert_eq!(
+            parent_id(&machine_id("x.lua")).as_deref(),
+            Some(MACHINE_ROOT)
+        );
+        assert_eq!(parent_id(MACHINE_ROOT), None);
+        assert_eq!(node_name(&m), "x.lua");
+        assert_eq!(node_name("a/b.lua"), "b.lua");
+        // The marker can never be part of a real path.
+        assert!(crate::vfs::clean_path(&m).is_err());
+    }
+
     use super::*;
     use crate::package::testutil::bundle_of;
 

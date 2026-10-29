@@ -14,7 +14,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -29,22 +29,26 @@ use windows::Win32::System::Com::IDispatch;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{
     HTREEITEM, ICC_TREEVIEW_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx, NM_DBLCLK, NMHDR,
-    NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, TVE_COLLAPSE, TVE_EXPAND, TVGN_CARET, TVI_LAST,
-    TVI_ROOT, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0, TVITEMW, TVM_DELETEITEM,
-    TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_INSERTITEMW, TVM_SELECTITEM,
-    TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW, TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW,
-    TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES, TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEW,
+    NMTREEVIEWW, NMTVDISPINFOW, NMTVKEYDOWN, TVE_COLLAPSE, TVE_EXPAND, TVGN_CARET, TVGN_DROPHILITE,
+    TVHITTESTINFO, TVI_LAST, TVI_ROOT, TVIF_PARAM, TVIF_TEXT, TVINSERTSTRUCTW, TVINSERTSTRUCTW_0,
+    TVITEMW, TVM_DELETEITEM, TVM_EDITLABELW, TVM_ENSUREVISIBLE, TVM_EXPAND, TVM_HITTEST,
+    TVM_INSERTITEMW, TVM_SELECTITEM, TVN_BEGINDRAGW, TVN_BEGINLABELEDITW, TVN_ENDLABELEDITW,
+    TVN_ITEMEXPANDEDW, TVN_KEYDOWN, TVN_SELCHANGEDW, TVS_EDITLABELS, TVS_HASBUTTONS, TVS_HASLINES,
+    TVS_LINESATROOT, TVS_SHOWSELALWAYS, WC_TREEVIEW,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, ReleaseCapture, SetCapture, VK_DELETE, VK_F2,
+    EnableWindow, GetKeyState, ReleaseCapture, SetCapture, VK_CONTROL, VK_DELETE, VK_F2, VK_SHIFT,
 };
-use windows::Win32::UI::Shell::{DragAcceptFiles, DragFinish, DragQueryFileW, HDROP};
+use windows::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, ShellExecuteW,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, PWSTR, w};
 
 use super::{dialogs, dispatch, live, message};
 use crate::dock::{Dock, Rect as DRect};
+use crate::localfs;
 use crate::panel::{self, Command};
 use crate::runtime::Status;
 use crate::settings::{self, Settings};
@@ -67,16 +71,20 @@ const ID_RENAME: usize = 105;
 const ID_DELETE: usize = 106;
 const ID_MODE: usize = 107;
 const ID_CLOSE: usize = 108;
+const ID_EDIT: usize = 109;
+const ID_COPY: usize = 110;
 /// Width of the strip on a docked panel's left edge that can be dragged to resize it (96 DPI).
 const GRIP: i32 = 6;
 const DOCK_TICK_MS: u32 = 50;
-const BUTTONS: [(usize, PCWSTR); 6] = [
+const BUTTONS: [(usize, PCWSTR); 8] = [
     (ID_NEW, w!("New folder")),
     (ID_ADD_FILES, w!("Add files\u{2026}")),
     (ID_ADD_FOLDER, w!("Add folder\u{2026}")),
     (ID_EXPORT, w!("Export\u{2026}")),
     (ID_RENAME, w!("Rename")),
     (ID_DELETE, w!("Delete")),
+    (ID_COPY, w!("Copy over")),
+    (ID_EDIT, w!("Open in editor")),
 ];
 
 /// Posted to the panel to drain the command queue outside of any control notification.
@@ -116,6 +124,10 @@ struct Model {
     key: String,
     live: Option<Bundle>,
     live_read: Option<Instant>,
+    /// The machine folder's contents and when they were last read.
+    machine: Vec<Entry>,
+    machine_read: Option<Instant>,
+    roots_seeded: bool,
     message: Option<(bool, String, Instant)>,
     signature: String,
     authored_unsaved: Vec<String>,
@@ -144,6 +156,8 @@ thread_local! {
     /// True while we rebuild the tree ourselves: its notifications must be ignored.
     static REBUILDING: Cell<bool> = const { Cell::new(false) };
     static EDITING: Cell<bool> = const { Cell::new(false) };
+    /// The node being dragged (set by TVN_BEGINDRAG while the mouse is captured).
+    static DRAG: RefCell<Option<String>> = const { RefCell::new(None) };
     static FONTS: Cell<Option<(isize, isize)>> = const { Cell::new(None) }; // (normal, bold)
 }
 
@@ -456,7 +470,8 @@ fn layout(h: &Handles) {
                 );
             }
         }
-        let tree_top = header + pad * 2 + btn_h * 2 + pad / 2;
+        let rows = BUTTONS.len().div_ceil(3) as i32;
+        let tree_top = header + pad * 2 + btn_h * rows + pad / 2 * (rows - 1);
         let _ = MoveWindow(
             h.tree,
             lm,
@@ -787,8 +802,13 @@ fn refresh(app: &IDispatch, h: Handles) {
         .as_ref()
         .map(Bundle::content_digest)
         .unwrap_or_default();
+    let machine = refresh_machine(false);
+    let machine_sig: String = machine
+        .iter()
+        .map(|e| format!("{}:{};", e.path, e.size))
+        .collect();
     let signature = format!(
-        "{key}|{digest}|{:?}|{}|{dirty}|{message:?}|{can_edit}",
+        "{key}|{digest}|{:?}|{}|{dirty}|{message:?}|{can_edit}|{machine_sig}",
         view.light, view.label
     );
     if MODEL.with(|m| m.borrow().signature == signature) {
@@ -809,16 +829,18 @@ fn refresh(app: &IDispatch, h: Handles) {
             (format!("{n} file{}", if n == 1 { "" } else { "s" }), false)
         }
     };
-    let entries = bundle.as_ref().map(Bundle::entries).unwrap_or_default();
-    let roots: HashSet<String> = bundle
-        .as_ref()
-        .map(|b| b.root_scripts().iter().map(|f| f.path.clone()).collect())
-        .unwrap_or_default();
+    let nodes = build_nodes(bundle.as_ref(), &machine);
     MODEL.with(|m| {
         let mut m = m.borrow_mut();
-        if m.key != key {
+        if m.key != key || !m.roots_seeded {
             m.expanded.clear();
-            m.selected = None;
+            // Both trees start open.
+            m.expanded.insert(String::new());
+            m.expanded.insert(panel::MACHINE_ROOT.to_owned());
+            m.roots_seeded = true;
+            if m.key != key {
+                m.selected = None;
+            }
         }
         m.wb_name = name;
         m.view = Some(view);
@@ -827,8 +849,27 @@ fn refresh(app: &IDispatch, h: Handles) {
         m.can_edit = can_edit;
         m.signature = signature;
     });
-    rebuild(h, &entries, &roots);
+    rebuild(h, &nodes);
     update_chrome(h);
+}
+
+/// The machine folder's contents, re-read every few seconds (or when forced).
+fn refresh_machine(force: bool) -> Vec<Entry> {
+    let stale = MODEL.with(|m| {
+        let m = m.borrow();
+        force || m.machine_read.is_none_or(|t| t.elapsed() > LIVE_REFRESH)
+    });
+    if stale {
+        let listing = crate::dbstore::local_dir()
+            .and_then(|d| localfs::list(&d).ok())
+            .unwrap_or_default();
+        MODEL.with(|m| {
+            let mut m = m.borrow_mut();
+            m.machine = listing;
+            m.machine_read = Some(Instant::now());
+        });
+    }
+    MODEL.with(|m| m.borrow().machine.clone())
 }
 
 // ------------------------------------------------------------------ painting the window
@@ -842,9 +883,25 @@ fn update_chrome(h: Handles) {
     unsafe {
         let t = wide(&foot);
         let _ = SetWindowTextW(h.foot, PCWSTR(t.as_ptr()));
+        let sel = selected.as_deref();
+        let on_machine = sel.is_some_and(panel::is_machine);
+        let on_node = sel.is_some_and(|s| !panel::is_root(s));
+        let on_machine_file = on_node
+            && on_machine
+            && MODEL.with(|m| {
+                m.borrow()
+                    .items
+                    .iter()
+                    .any(|i| Some(i.path.as_str()) == sel && i.kind == Kind::File)
+            });
+        // The machine folder needs no open workbook; the workbook's tree does.
+        let usable = can_edit || on_machine;
         for (id, _) in BUTTONS {
-            let needs_selection = matches!(id, ID_EXPORT | ID_RENAME | ID_DELETE);
-            let on = can_edit && (!needs_selection || selected.is_some());
+            let on = match id {
+                ID_EXPORT | ID_RENAME | ID_DELETE | ID_COPY => usable && on_node,
+                ID_EDIT => on_machine_file,
+                _ => usable,
+            };
             if let Ok(b) = GetDlgItem(Some(h.win), id as i32) {
                 let _ = EnableWindow(b, on);
             }
@@ -994,7 +1051,54 @@ fn insert_item(tree: HWND, parent: isize, label: &str, param: isize) -> isize {
     .0
 }
 
-fn rebuild(h: Handles, entries: &[Entry], roots: &HashSet<String>) {
+/// One row of the tree: its node id (see [`panel::MACHINE_ROOT`]), kind and text.
+struct Node {
+    id: String,
+    kind: Kind,
+    label: String,
+}
+
+/// Both trees: ThisWorkbook (the embedded files) and Machine (the machine folder).
+fn build_nodes(bundle: Option<&Bundle>, machine: &[Entry]) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    let roots: HashSet<String> = bundle
+        .map(|b| b.root_scripts().iter().map(|f| f.path.clone()).collect())
+        .unwrap_or_default();
+    let count = bundle.map_or(0, Bundle::file_count);
+    nodes.push(Node {
+        id: String::new(),
+        kind: Kind::Dir,
+        label: match bundle {
+            Some(_) => format!(
+                "ThisWorkbook   ({count} file{})",
+                if count == 1 { "" } else { "s" }
+            ),
+            None => "ThisWorkbook   (no workbook)".to_owned(),
+        },
+    });
+    for e in bundle.map(Bundle::entries).unwrap_or_default() {
+        nodes.push(Node {
+            label: label(&e, &roots),
+            id: e.path,
+            kind: e.kind,
+        });
+    }
+    nodes.push(Node {
+        id: panel::MACHINE_ROOT.to_owned(),
+        kind: Kind::Dir,
+        label: "Machine   (xll-bridge\\local, shared by every workbook)".to_owned(),
+    });
+    for e in machine {
+        nodes.push(Node {
+            label: label(e, &HashSet::new()),
+            id: panel::machine_id(&e.path),
+            kind: e.kind,
+        });
+    }
+    nodes
+}
+
+fn rebuild(h: Handles, nodes: &[Node]) {
     let (expanded, selected) = MODEL.with(|m| {
         let m = m.borrow();
         (m.expanded.clone(), m.selected.clone())
@@ -1005,18 +1109,17 @@ fn rebuild(h: Handles, entries: &[Entry], roots: &HashSet<String>) {
         SendMessageW(h.tree, WM_SETREDRAW, Some(WPARAM(0)), None);
         SendMessageW(h.tree, TVM_DELETEITEM, None, Some(LPARAM(TVI_ROOT.0)));
     }
-    let mut items: Vec<Item> = Vec::with_capacity(entries.len());
-    let mut by_path: HashMap<&str, isize> = HashMap::new();
-    for e in entries {
-        let parent = e
-            .path
-            .rsplit_once('/')
-            .map_or(TVI_ROOT.0, |(p, _)| *by_path.get(p).unwrap_or(&TVI_ROOT.0));
-        let handle = insert_item(h.tree, parent, &label(e, roots), items.len() as isize + 1);
-        by_path.insert(&e.path, handle);
+    let mut items: Vec<Item> = Vec::with_capacity(nodes.len());
+    let mut by_id: HashMap<&str, isize> = HashMap::new();
+    for n in nodes {
+        let parent = panel::parent_id(&n.id)
+            .and_then(|p| by_id.get(p.as_str()).copied())
+            .unwrap_or(TVI_ROOT.0);
+        let handle = insert_item(h.tree, parent, &n.label, items.len() as isize + 1);
+        by_id.insert(&n.id, handle);
         items.push(Item {
-            path: e.path.clone(),
-            kind: e.kind,
+            path: n.id.clone(),
+            kind: n.kind,
             handle,
         });
     }
@@ -1078,15 +1181,16 @@ fn target_dir() -> String {
         };
         match m.items.iter().find(|i| &i.path == sel).map(|i| i.kind) {
             Some(Kind::Dir) => sel.clone(),
-            _ => sel
-                .rsplit_once('/')
-                .map_or(String::new(), |(p, _)| p.to_owned()),
+            _ => panel::parent_id(sel).unwrap_or_default(),
         }
     })
 }
 
 fn begin_new_folder(h: Handles) {
-    if MODEL.with(|m| m.borrow().pending_new.is_some()) || !MODEL.with(|m| m.borrow().can_edit) {
+    let machine_target = panel::is_machine(&target_dir());
+    if MODEL.with(|m| m.borrow().pending_new.is_some())
+        || !(machine_target || MODEL.with(|m| m.borrow().can_edit))
+    {
         return;
     }
     let parent = target_dir();
@@ -1125,7 +1229,7 @@ fn begin_new_folder(h: Handles) {
 fn begin_rename(h: Handles) {
     let handle = MODEL.with(|m| {
         let m = m.borrow();
-        let sel = m.selected.as_ref()?;
+        let sel = m.selected.as_ref().filter(|s| !panel::is_root(s))?;
         m.items.iter().find(|i| &i.path == sel).map(|i| i.handle)
     });
     if let Some(handle) = handle {
@@ -1151,10 +1255,32 @@ fn button_clicked(h: Handles, id: usize) {
         ID_ADD_FILES => enqueue(Command::AddFiles { dest: target_dir() }),
         ID_ADD_FOLDER => enqueue(Command::AddFolder { dest: target_dir() }),
         ID_EXPORT => selected
+            .filter(|s| !panel::is_root(s))
             .map(|path| enqueue(Command::Export { path }))
             .unwrap_or_default(),
         ID_RENAME => begin_rename(h),
+        ID_COPY => {
+            if let Some(from) = selected.filter(|s| !panel::is_root(s)) {
+                // The other tree's root (use drag and drop to pick a folder).
+                let to_dir = if panel::is_machine(&from) {
+                    String::new()
+                } else {
+                    panel::MACHINE_ROOT.to_owned()
+                };
+                enqueue(Command::Transfer {
+                    from,
+                    to_dir,
+                    move_: false,
+                });
+            }
+        }
+        ID_EDIT => {
+            if let Some(path) = selected.filter(|s| panel::is_machine(s)) {
+                enqueue(Command::OpenInEditor { path });
+            }
+        }
         ID_DELETE => selected
+            .filter(|s| !panel::is_root(s))
             .map(|path| enqueue(Command::Delete { path }))
             .unwrap_or_default(),
         ID_MODE => enqueue(Command::ToggleDock),
@@ -1190,8 +1316,22 @@ fn notify(h: Handles, nm: &NMHDR, lparam: LPARAM) -> LRESULT {
                 }
             }
             TVN_BEGINLABELEDITW => {
+                // The two roots keep their names.
+                let info = &*(lparam.0 as *const NMTVDISPINFOW);
+                if item_for_param(info.item.lParam.0).is_some_and(|(p, _, _)| panel::is_root(&p)) {
+                    return LRESULT(1); // cancel
+                }
                 EDITING.with(|e| e.set(true));
                 return LRESULT(0); // allow
+            }
+            TVN_BEGINDRAGW => {
+                let t = &*(lparam.0 as *const NMTREEVIEWW);
+                if let Some((id, _, _)) = item_for_param(t.itemNew.lParam.0)
+                    && !panel::is_root(&id)
+                {
+                    DRAG.with(|d| *d.borrow_mut() = Some(id));
+                    let _ = SetCapture(h.win);
+                }
             }
             TVN_ENDLABELEDITW => {
                 EDITING.with(|e| e.set(false));
@@ -1219,7 +1359,7 @@ fn notify(h: Handles, nm: &NMHDR, lparam: LPARAM) -> LRESULT {
                                         .map(|i| (i.path.clone(), i.kind, i.handle))
                                 })
                             })
-                            && path.rsplit('/').next() != Some(name.as_str())
+                            && panel::node_name(&path) != name.as_str()
                         {
                             enqueue(Command::Rename { path, name });
                         }
@@ -1232,7 +1372,7 @@ fn notify(h: Handles, nm: &NMHDR, lparam: LPARAM) -> LRESULT {
                 let k = &*(lparam.0 as *const NMTVKEYDOWN);
                 let selected = MODEL.with(|m| m.borrow().selected.clone());
                 if k.wVKey == VK_DELETE.0 {
-                    if let Some(path) = selected {
+                    if let Some(path) = selected.filter(|s| !panel::is_root(s)) {
                         enqueue(Command::Delete { path });
                     }
                 } else if k.wVKey == VK_F2.0 {
@@ -1244,6 +1384,108 @@ fn notify(h: Handles, nm: &NMHDR, lparam: LPARAM) -> LRESULT {
         }
     }
     LRESULT(0)
+}
+
+// ------------------------------------------------------------------ drag and drop inside the tree
+
+/// The tree node under a point given in the panel window's client coordinates.
+fn node_at(h: Handles, lparam: LPARAM) -> Option<(String, Kind, isize)> {
+    let mut pts = [POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    }];
+    // SAFETY: both windows are ours; the hit-test structure outlives the synchronous message.
+    let hit = unsafe {
+        MapWindowPoints(Some(h.win), Some(h.tree), &mut pts);
+        let mut info = TVHITTESTINFO {
+            pt: pts[0],
+            ..Default::default()
+        };
+        SendMessageW(
+            h.tree,
+            TVM_HITTEST,
+            None,
+            Some(LPARAM(&mut info as *mut _ as isize)),
+        );
+        info.hItem.0
+    };
+    if hit == 0 {
+        return None;
+    }
+    MODEL.with(|m| {
+        m.borrow()
+            .items
+            .iter()
+            .find(|i| i.handle == hit)
+            .map(|i| (i.path.clone(), i.kind, i.handle))
+    })
+}
+
+/// The folder a drop on `node` lands in: the folder itself, or a file's folder.
+fn drop_folder(id: &str, kind: Kind) -> String {
+    if kind == Kind::Dir {
+        id.to_owned()
+    } else {
+        panel::parent_id(id).unwrap_or_default()
+    }
+}
+
+fn set_drop_highlight(h: Handles, handle: isize) {
+    // SAFETY: our own tree control.
+    unsafe {
+        SendMessageW(
+            h.tree,
+            TVM_SELECTITEM,
+            Some(WPARAM(TVGN_DROPHILITE as usize)),
+            Some(LPARAM(handle)),
+        );
+    }
+}
+
+fn drag_move(h: Handles, lparam: LPARAM) {
+    let target = node_at(h, lparam).map(|(id, kind, handle)| (drop_folder(&id, kind), handle));
+    let source = DRAG.with(|d| d.borrow().clone());
+    // Highlight only where a drop would do something: not onto the node itself.
+    match (source, target) {
+        (Some(src), Some((folder, handle))) if folder != src => set_drop_highlight(h, handle),
+        _ => set_drop_highlight(h, 0),
+    }
+}
+
+fn drag_end(h: Handles) {
+    DRAG.with(|d| *d.borrow_mut() = None);
+    set_drop_highlight(h, 0);
+    // SAFETY: releases the capture we took in TVN_BEGINDRAG (a no-op if it is already gone).
+    unsafe {
+        let _ = ReleaseCapture();
+    }
+}
+
+fn drag_drop(h: Handles, lparam: LPARAM) {
+    let source = DRAG.with(|d| d.borrow().clone());
+    let target = node_at(h, lparam).map(|(id, kind, _)| drop_folder(&id, kind));
+    drag_end(h);
+    let (Some(from), Some(to_dir)) = (source, target) else {
+        return;
+    };
+    if to_dir == from || panel::parent_id(&from).as_deref() == Some(to_dir.as_str()) {
+        return; // dropped where it already is
+    }
+    // Within one tree a drop moves (Ctrl copies); between the trees it copies (Shift moves).
+    let same_tree = panel::is_machine(&from) == panel::is_machine(&to_dir);
+    // SAFETY: reads the keyboard state.
+    let (ctrl, shift) = unsafe {
+        (
+            GetKeyState(i32::from(VK_CONTROL.0)) < 0,
+            GetKeyState(i32::from(VK_SHIFT.0)) < 0,
+        )
+    };
+    let move_ = if same_tree { !ctrl } else { shift };
+    enqueue(Command::Transfer {
+        from,
+        to_dir,
+        move_,
+    });
 }
 
 fn dropped(h: Handles, hdrop: HDROP) {
@@ -1381,6 +1623,25 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
                 });
                 // SAFETY: capture for our own window; released on button-up.
                 unsafe { SetCapture(hwnd) };
+            }
+            Some(LRESULT(0))
+        }
+        WM_MOUSEMOVE if DRAG.with(|d| d.borrow().is_some()) => {
+            if let Some(h) = h {
+                drag_move(h, lparam);
+            }
+            Some(LRESULT(0))
+        }
+        WM_LBUTTONUP if DRAG.with(|d| d.borrow().is_some()) => {
+            if let Some(h) = h {
+                drag_drop(h, lparam);
+            }
+            Some(LRESULT(0))
+        }
+        WM_CAPTURECHANGED if DRAG.with(|d| d.borrow().is_some()) => {
+            // Capture was taken away (another window, Escape in a dialog): cancel the drag.
+            if let Some(h) = h {
+                drag_end(h);
             }
             Some(LRESULT(0))
         }
@@ -1547,7 +1808,181 @@ fn edit(current: &Bundle, cmd: &Command) -> Outcome {
     }
 }
 
+/// Does the command touch the machine folder, or move things between the two trees?
+fn involves_machine(cmd: &Command) -> bool {
+    match cmd {
+        Command::NewFolder { parent, .. } => panel::is_machine(parent),
+        Command::AddFiles { dest }
+        | Command::AddFolder { dest }
+        | Command::AddPaths { dest, .. } => panel::is_machine(dest),
+        Command::Export { path }
+        | Command::Delete { path }
+        | Command::Rename { path, .. }
+        | Command::OpenInEditor { path } => panel::is_machine(path),
+        Command::Transfer { .. } => true,
+        _ => false,
+    }
+}
+
+/// Opens a file with whatever the user has set up for it; Notepad when nothing is.
+fn open_in_editor(owner: HWND, path: &Path) -> Result<String, String> {
+    let file = wide(&path.to_string_lossy());
+    // SAFETY: NUL-terminated strings that outlive the call.
+    let r = unsafe {
+        ShellExecuteW(
+            Some(owner),
+            w!("open"),
+            PCWSTR(file.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if r.0 as isize > 32 {
+        return Ok(format!("Opened {}", path.display()));
+    }
+    std::process::Command::new("notepad.exe")
+        .arg(path)
+        .spawn()
+        .map(|_| format!("Opened {} in Notepad", path.display()))
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))
+}
+
+fn export_machine(owner: HWND, root: &Path, rel: &str) -> Result<String, String> {
+    let path = localfs::path_of(root, rel)?;
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    if path.is_dir() {
+        match dialogs::pick_folder(owner, "Choose where to export the folder") {
+            None => Ok(String::new()),
+            Some(dest) => localfs::export_dir(root, rel, &dest),
+        }
+    } else {
+        match dialogs::save_file(owner, name) {
+            None => Ok(String::new()),
+            Some(dest) => localfs::export_file(root, rel, &dest),
+        }
+    }
+}
+
+/// Copies or moves a node between the trees (or within the workbook's tree, which is the only
+/// combination the machine folder itself does not cover).
+fn transfer(
+    active: Option<&Active>,
+    root: &Path,
+    from: &str,
+    to_dir: &str,
+    move_: bool,
+) -> Result<String, String> {
+    let need_workbook = || active.ok_or_else(|| "Open a workbook first.".to_owned());
+    match (panel::is_machine(from), panel::is_machine(to_dir)) {
+        (true, true) => localfs::transfer_within(
+            root,
+            panel::machine_rel(from),
+            panel::machine_rel(to_dir),
+            move_,
+        ),
+        (true, false) => {
+            let active = need_workbook()?;
+            let mut b = refresh_live(active, true).unwrap_or_default();
+            let msg = localfs::copy_to_bundle(root, panel::machine_rel(from), &mut b, to_dir)?;
+            commit(active, b, msg);
+            if move_ {
+                localfs::delete(root, panel::machine_rel(from))?;
+            }
+            Ok(String::new()) // commit has reported
+        }
+        (false, true) => {
+            let active = need_workbook()?;
+            let b = refresh_live(active, true).unwrap_or_default();
+            let msg = localfs::copy_from_bundle(root, panel::machine_rel(to_dir), &b, from)?;
+            if move_ {
+                let mut without = b.clone();
+                without.remove(from).map_err(|e| e.to_string())?;
+                commit(
+                    active,
+                    without,
+                    format!("Moved {from} to the machine folder"),
+                );
+                return Ok(String::new());
+            }
+            Ok(msg)
+        }
+        (false, false) => {
+            let active = need_workbook()?;
+            let mut b = refresh_live(active, true).unwrap_or_default();
+            let target = panel::join(to_dir, panel::node_name(from));
+            let msg = if move_ {
+                b.rename(from, &target).map_err(|e| e.to_string())?;
+                format!("Moved to {target}")
+            } else {
+                b.copy(from, &target).map_err(|e| e.to_string())?;
+                format!("Copied to {target}")
+            };
+            commit(active, b, msg);
+            Ok(String::new())
+        }
+    }
+}
+
+fn handle_machine(owner: HWND, active: Option<&Active>, cmd: Command) {
+    let Some(root) = crate::dbstore::local_dir() else {
+        say(true, "The machine folder is not available.".to_owned());
+        return;
+    };
+    let add = |paths: Vec<PathBuf>, dest: &str| {
+        if paths.is_empty() {
+            Ok(String::new())
+        } else {
+            localfs::add_paths(&root, panel::machine_rel(dest), &paths)
+        }
+    };
+    let result = match &cmd {
+        Command::NewFolder { parent, name } => {
+            localfs::new_folder(&root, panel::machine_rel(parent), name)
+        }
+        Command::Rename { path, name } => localfs::rename(&root, panel::machine_rel(path), name),
+        Command::Delete { path } => {
+            let rel = panel::machine_rel(path);
+            let what = localfs::delete_summary(&root, rel);
+            if message(
+                owner,
+                &format!("Delete {what} from the machine folder?\n\nThis cannot be undone."),
+                "Delete",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) {
+                localfs::delete(&root, rel)
+            } else {
+                Ok(String::new())
+            }
+        }
+        Command::AddFiles { dest } => add(dialogs::pick_files(owner), dest),
+        Command::AddFolder { dest } => add(dialogs::pick_folders(owner), dest),
+        Command::AddPaths { dest, paths } => add(paths.clone(), dest),
+        Command::Export { path } => export_machine(owner, &root, panel::machine_rel(path)),
+        Command::OpenInEditor { path } => localfs::path_of(&root, panel::machine_rel(path))
+            .and_then(|p| open_in_editor(owner, &p)),
+        Command::Transfer {
+            from,
+            to_dir,
+            move_,
+        } => transfer(active, &root, from, to_dir, *move_),
+        _ => Ok(String::new()),
+    };
+    refresh_machine(true);
+    match result {
+        Ok(m) if m.is_empty() => {}
+        Ok(m) => say(false, m),
+        Err(e) => say(true, e),
+    }
+}
+
 fn handle(owner: HWND, active: Option<&Active>, cmd: Command) {
+    // The machine folder and drag-and-drop between the trees need no special handling of the
+    // workbook here (the transfer helpers ask for it when they do).
+    if involves_machine(&cmd) {
+        handle_machine(owner, active, cmd);
+        return;
+    }
     let Some(active) = active else {
         say(true, "Open a workbook first.".to_owned());
         return;
@@ -1576,6 +2011,7 @@ fn handle(owner: HWND, active: Option<&Active>, cmd: Command) {
         Command::AddFolder { dest } => add(&current, dest, dialogs::pick_folders(owner)),
         Command::AddPaths { dest, paths } => add(&current, dest, paths.clone()),
         Command::Export { path } => export(owner, &current, path),
+        Command::Transfer { .. } | Command::OpenInEditor { .. } => Outcome::Nothing,
     };
     match outcome {
         Outcome::Nothing => {}
@@ -1711,21 +2147,124 @@ mod tests {
     }
 
     fn show(h: Handles, b: &Bundle) {
-        let entries = b.entries();
-        let roots: HashSet<String> = b.root_scripts().iter().map(|f| f.path.clone()).collect();
+        let nodes = build_nodes(Some(b), &[]);
         MODEL.with(|m| {
             let mut m = m.borrow_mut();
             m.can_edit = true;
             m.view = Some(ui::view(&Status::NoScripts));
             m.wb_name = "Book1.xlsx".into();
         });
-        rebuild(h, &entries, &roots);
+        rebuild(h, &nodes);
         update_chrome(h);
     }
 
     fn enabled(h: Handles, id: usize) -> bool {
         // SAFETY: our own child window.
         unsafe { IsWindowEnabled(GetDlgItem(Some(h.win), id as i32).unwrap()) }.as_bool()
+    }
+
+    fn select(h: Handles, id: &str) {
+        let handle = MODEL
+            .with(|m| {
+                m.borrow()
+                    .items
+                    .iter()
+                    .find(|i| i.path == id)
+                    .map(|i| i.handle)
+            })
+            .unwrap_or_else(|| panic!("no node {id:?}"));
+        // SAFETY: our own tree control.
+        unsafe {
+            SendMessageW(
+                h.tree,
+                TVM_SELECTITEM,
+                Some(WPARAM(TVGN_CARET as usize)),
+                Some(LPARAM(handle)),
+            )
+        };
+    }
+
+    #[test]
+    fn the_machine_tree_sits_beside_the_workbook_and_its_buttons_follow_the_selection() {
+        let Some(h) = setup() else {
+            eprintln!("cannot create windows on this machine: skipping panel test");
+            return;
+        };
+        let b = bundle_of(&[("main.lua", "x")]);
+        let machine = vec![
+            Entry {
+                path: "lib".into(),
+                kind: Kind::Dir,
+                size: 0,
+            },
+            Entry {
+                path: "lib/x.lua".into(),
+                kind: Kind::File,
+                size: 3,
+            },
+        ];
+        let nodes = build_nodes(Some(&b), &machine);
+        MODEL.with(|m| {
+            let mut m = m.borrow_mut();
+            m.can_edit = true;
+            m.view = Some(ui::view(&Status::NoScripts));
+        });
+        rebuild(h, &nodes);
+        update_chrome(h);
+        // ThisWorkbook + main.lua + Machine + lib + lib/x.lua
+        assert_eq!(tree_count(h), 5);
+
+        // The roots cannot be renamed, deleted, exported or copied; opening needs a machine file.
+        select(h, "");
+        assert!(enabled(h, ID_NEW) && enabled(h, ID_ADD_FILES));
+        assert!(!enabled(h, ID_DELETE) && !enabled(h, ID_RENAME) && !enabled(h, ID_COPY));
+        assert!(!enabled(h, ID_EDIT));
+        select(h, panel::MACHINE_ROOT);
+        assert!(!enabled(h, ID_DELETE) && !enabled(h, ID_EDIT));
+        assert_eq!(target_dir(), panel::MACHINE_ROOT);
+
+        // A workbook file can be copied over but not opened in an editor.
+        select(h, "main.lua");
+        assert!(enabled(h, ID_COPY) && !enabled(h, ID_EDIT));
+        button_clicked(h, ID_COPY);
+        // A machine file can be opened, and copies over to the workbook root.
+        let file = panel::machine_id("lib/x.lua");
+        select(h, &file);
+        assert!(enabled(h, ID_EDIT) && enabled(h, ID_COPY) && enabled(h, ID_DELETE));
+        assert_eq!(target_dir(), panel::machine_id("lib"));
+        button_clicked(h, ID_COPY);
+        button_clicked(h, ID_EDIT);
+        let q: Vec<Command> = QUEUE.with(|q| q.borrow_mut().drain(..).collect());
+        assert_eq!(
+            q,
+            [
+                Command::Transfer {
+                    from: "main.lua".into(),
+                    to_dir: panel::MACHINE_ROOT.into(),
+                    move_: false
+                },
+                Command::Transfer {
+                    from: file.clone(),
+                    to_dir: String::new(),
+                    move_: false
+                },
+                Command::OpenInEditor { path: file }
+            ]
+        );
+        assert!(involves_machine(&q[0]) && involves_machine(&q[2]));
+        assert!(!involves_machine(&Command::Delete {
+            path: "main.lua".into()
+        }));
+
+        // With no workbook open the machine tree still works.
+        MODEL.with(|m| m.borrow_mut().can_edit = false);
+        select(h, &panel::machine_id("lib"));
+        update_chrome(h);
+        assert!(enabled(h, ID_NEW) && enabled(h, ID_DELETE));
+        select(h, "main.lua");
+        update_chrome(h);
+        assert!(!enabled(h, ID_NEW) && !enabled(h, ID_DELETE));
+        shutdown();
     }
 
     #[test]
@@ -1740,7 +2279,7 @@ mod tests {
             ("lib/deep/z.lua", "z"),
         ]);
         show(h, &b);
-        assert_eq!(tree_count(h), 5); // lib, lib/deep, z.lua, util.lua, main.lua
+        assert_eq!(tree_count(h), 7); // ThisWorkbook, lib, lib/deep, z.lua, util.lua, main.lua, Machine
         assert!(!enabled(h, ID_DELETE), "nothing selected yet");
         assert!(enabled(h, ID_NEW) && enabled(h, ID_ADD_FILES));
 
@@ -1789,7 +2328,7 @@ mod tests {
                     .items
                     .iter()
                     .find(|i| i.path == "lib/util.lua")
-                    .map(|i| (i.handle, 4))
+                    .map(|i| (i.handle, 5))
             })
             .unwrap();
         let mut name = wide("renamed.lua");
@@ -1826,7 +2365,7 @@ mod tests {
 
         // A new folder starts as an editable placeholder; cancelling it removes it again.
         button_clicked(h, ID_NEW);
-        assert_eq!(tree_count(h), 6);
+        assert_eq!(tree_count(h), 8);
         let pending = MODEL
             .with(|m| m.borrow().pending_new.as_ref().map(|p| p.handle))
             .unwrap();
@@ -1854,7 +2393,7 @@ mod tests {
         assert_eq!(q, [Command::Refresh]);
         // ...and a refresh rebuilds without the placeholder.
         show(h, &b);
-        assert_eq!(tree_count(h), 5);
+        assert_eq!(tree_count(h), 7);
         shutdown();
     }
 

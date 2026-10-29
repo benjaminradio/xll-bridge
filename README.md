@@ -243,22 +243,43 @@ xl.range("Out!A1"):set(rows)                                             -- writ
 
 ### The Files panel
 
-A panel docked on the right side of Excel's window (the workbook area gives up a strip) showing the
-workbook's embedded tree. Drag its left edge to resize it. **Float** turns it into a tool window
-(**Dock** puts it back), ✕ closes it. It follows the active workbook and edits the **open** workbook
-through `CustomXMLParts`, so nothing needs reloading; **save the workbook** to keep the changes (the
-footer says "Unsaved changes" until you do).
+A panel docked on the right side of Excel's window (the workbook area gives up a strip) with two trees,
+like a code explorer:
 
-* **New folder**, **Add files…** / **Add folder…** (folders are imported recursively), or drag files and
-  folders in from Explorer. Additions go into the selected folder.
-* **Rename** (button or F2), **Delete** (button or Delete key, with confirmation).
-* **Export…** a file (Save As) or a folder (choose a destination).
+* **ThisWorkbook**: the files embedded in the open workbook. The panel follows the active workbook and edits
+  it through `CustomXMLParts`; **save the workbook** to keep the changes (the footer says "Unsaved changes"
+  until you do). Changes run at once: new functions and macros are available without reopening.
+* **Machine**: the folder `%APPDATA%\xll-bridge\local` on this computer (shared Lua and native modules,
+  machine databases; `require` and `xl.db.open` search it). It is real files on disk, needs no open
+  workbook, and is created the first time you put something in it.
 
-There is deliberately **no script editor** in the panel: edit your files in your own editor, using
-[Sync folder](#editing-scripts-in-your-own-editor) or Import.
+Seeing both side by side shows what travels with the workbook and what does not. **Drag and drop**
+moves things between them and around:
+
+| Drag | Within one tree | Between the trees |
+|---|---|---|
+| plain | **moves** | **copies** |
+| with Ctrl | copies | |
+| with Shift | | **moves** |
+
+Drop on a folder (or on a file, meaning its folder, or on a root). Dragging files in from Explorer onto the
+panel adds them to the folder under the cursor selection. A workbook that `require`s a machine module is no
+longer self-contained: drag the module into ThisWorkbook to embed it.
+
+Buttons (they act on the selected node; the two roots cannot be renamed or deleted):
+**New folder** (name in place), **Add files…** / **Add folder…**, **Export…** (to anywhere on disk),
+**Rename** (or F2), **Delete** (or the Delete key, with confirmation), **Copy over** (copies the selection
+to the other tree's root), **Open in editor** (a machine file, in the program Windows associates with it,
+Notepad if none). Embedded files are edited by [syncing a folder](#editing-scripts-in-your-own-editor) or by
+copying them to Machine first.
+
+Drag the panel's left edge to resize it. **Float** turns it into a tool window (**Dock** puts it back), ✕
+closes it. There is deliberately **no script editor** in the panel.
 
 If the workbook was green or yellow, files you add or change are trusted too (they are your own work).
-A blocked workbook stays blocked until you enable it with the status button.
+A blocked workbook stays blocked until you enable it with the status button. Machine files are the user's
+own and are not subject to that: a workbook's scripts are what is trusted, and they may `require` machine
+modules once enabled.
 
 ## Editing scripts in your own editor
 

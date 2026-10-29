@@ -8,6 +8,7 @@ pub mod dates;
 pub mod dbstore;
 pub mod dock;
 pub mod jobs;
+pub mod localfs;
 pub mod log;
 pub mod lua_host;
 pub mod macros;

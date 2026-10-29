@@ -294,6 +294,42 @@ impl Bundle {
     }
 
     /// Renames or moves a file or folder. The target must not exist (a case-only change is fine).
+    /// Copies a file or folder to a new path (an existing file at the target is overwritten; a
+    /// folder is merged into an existing folder).
+    pub fn copy(&mut self, from: &str, to: &str) -> Result<usize> {
+        let (from, to) = (clean_path(from)?, clean_path(to)?);
+        if self.kind_of(&from).is_none() {
+            return Err(VfsError::NotFound(from));
+        }
+        if is_inside(&to, &from) || same(&to, &from) {
+            return Err(VfsError::InvalidPath(
+                to,
+                "cannot copy something onto or into itself",
+            ));
+        }
+        let mut count = 0;
+        let sources: Vec<(String, Vec<u8>)> = self
+            .files
+            .iter()
+            .filter(|f| same(&f.path, &from) || is_inside(&f.path, &from))
+            .map(|f| (format!("{to}{}", &f.path[from.len()..]), f.data.clone()))
+            .collect();
+        let dirs: Vec<String> = self
+            .dirs
+            .iter()
+            .filter(|d| is_inside(d, &from) || same(d, &from))
+            .map(|d| format!("{to}{}", &d[from.len()..]))
+            .collect();
+        for d in dirs {
+            self.mkdir(&d)?;
+        }
+        for (path, data) in sources {
+            self.put_file(&path, data, true)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     pub fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         let (from, to) = (clean_path(from)?, clean_path(to)?);
         if self.kind_of(&from).is_none() {
@@ -586,6 +622,21 @@ mod tests {
         assert_ne!(a.content_digest(), b.content_digest());
         a.put_file("main.lua", b"x = 2".to_vec(), true).unwrap();
         assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn copy_duplicates_files_and_folders_without_touching_the_source() {
+        let mut b = Bundle::new();
+        b.put_file("lib/a.lua", b"a".to_vec(), false).unwrap();
+        b.put_file("lib/sub/b.lua", b"b".to_vec(), false).unwrap();
+        b.mkdir("lib/empty").unwrap();
+        assert_eq!(b.copy("lib", "backup/lib").unwrap(), 2);
+        assert_eq!(b.get("backup/lib/sub/b.lua").unwrap().data, b"b");
+        assert!(b.get("lib/a.lua").is_some());
+        assert_eq!(b.kind_of("backup/lib/empty"), Some(Kind::Dir));
+        assert_eq!(b.copy("lib/a.lua", "top.lua").unwrap(), 1);
+        assert!(b.copy("lib", "lib/inner").is_err());
+        assert!(b.copy("nope", "x").is_err());
     }
 
     #[test]
