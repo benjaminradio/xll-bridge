@@ -48,6 +48,11 @@ pub enum Op {
         workbook: PathBuf,
         address: String,
     },
+    /// An Excel table (ListObject): header row and data, by table name.
+    Table {
+        workbook: PathBuf,
+        name: String,
+    },
     Sheets {
         workbook: PathBuf,
     },
@@ -347,6 +352,8 @@ pub(crate) mod fake {
         pub active: String,
         pub selection: Mutex<Option<String>>,
         pub log: Mutex<Vec<String>>,
+        /// Excel table name -> address of its range (header included).
+        pub tables: Mutex<HashMap<String, String>>,
     }
 
     /// (row1, col1, row2, col2), 0-based.
@@ -399,6 +406,7 @@ pub(crate) mod fake {
                 active: "Data".into(),
                 selection: Mutex::new(None),
                 log: Mutex::default(),
+                tables: Mutex::default(),
             })
         }
 
@@ -526,6 +534,20 @@ pub(crate) mod fake {
                         }
                     }
                     Ok(Reply::Done)
+                }
+                Op::Table { name, .. } => {
+                    let address = self
+                        .tables
+                        .lock()
+                        .unwrap()
+                        .get(&name)
+                        .cloned()
+                        .ok_or_else(|| XlError::new(format!("no table named '{name}'")))?;
+                    self.call(Op::Read {
+                        workbook: PathBuf::new(),
+                        address,
+                        formulas: false,
+                    })
                 }
                 Op::Sheets { .. } => Ok(Reply::Names(
                     self.sheets.lock().unwrap().keys().cloned().collect(),

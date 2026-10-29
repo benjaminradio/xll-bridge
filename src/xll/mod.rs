@@ -6,6 +6,7 @@
 //! * `LUA.CALL(name, [a1..a10])` — call a global Lua function defined by the workbook's scripts
 //! * `LUA.EVAL(code, [a1..a10])` — evaluate a chunk/expression; arguments are `...`
 //! * `LUA.STREAM(name, [a1..a10])` — a Lua function that pushes values over time (RTD)
+//! * `SQL.QUERY(sql, [a1..a10])` / `SQL.ASYNC(...)` — SQL (SQLite) over ranges and Excel tables
 //! * `LUA.STATUS()`              — scripts status for this workbook (none / blocked / enabled)
 
 mod ffi;
@@ -306,6 +307,113 @@ pub extern "system" fn LuaStream(
     guarded(|| stream_dispatch(&all))
 }
 
+/// The text of a failed SQL call.
+fn sql_error(m: &str) -> Value {
+    Value::Str(format!("#SQL: {m}"))
+}
+
+/// `SQL.QUERY(sql, a1..a10)`: one read-only SQL statement over cells. Range arguments become the
+/// tables `t1`.., scalar arguments the parameters `?1`..; `[Sheet1!A1:C9]` and `[Table]` inside
+/// the text read cells (or Excel tables) directly. Returns the column names and the rows.
+fn sql_query_dispatch(args: &[*const Xloper12]) -> Value {
+    // SAFETY: Excel passes valid operands (or null/missing) for every registered argument.
+    let vals = unsafe { oper::collect_args(args) };
+    let Some(Value::Str(sql)) = vals.first().cloned() else {
+        return sql_error("the first argument must be the SQL text");
+    };
+    let source: Box<dyn crate::sqldb::Source> = match (sql.contains('['), crate::xlapi::global()) {
+        (true, Some(api)) => match locate_caller() {
+            Ok(workbook) => Box::new(crate::sqldb::XlSource {
+                api: std::sync::Arc::new(crate::xlapi::ReadOnly(api)),
+                workbook,
+            }),
+            Err(_) => Box::new(crate::sqldb::NoSource),
+        },
+        _ => Box::new(crate::sqldb::NoSource),
+    };
+    let query = crate::sqldb::Query {
+        sql: &sql,
+        args: &vals[1..],
+        named: &[],
+        source: source.as_ref(),
+        read_only: true,
+        limits: crate::sqldb::Limits::default(),
+    };
+    match crate::sqldb::run(&query) {
+        Ok(out) => out.with_header(),
+        Err(m) => sql_error(&m),
+    }
+}
+
+/// The scripts a `SQL.ASYNC` worker runs: one function that forwards to `xl.query`. SQL needs no
+/// user code, so it works in any workbook whether or not its scripts are enabled.
+fn sql_job_bundle() -> &'static (std::sync::Arc<crate::vfs::Bundle>, String) {
+    static B: std::sync::OnceLock<(std::sync::Arc<crate::vfs::Bundle>, String)> =
+        std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        let mut b = crate::vfs::Bundle::new();
+        b.put_file(
+            "__sql.lua",
+            b"function __sql(...) return xl.query(...) end".to_vec(),
+            true,
+        )
+        .expect("static file name is valid");
+        let digest = b.digest();
+        (std::sync::Arc::new(b), digest)
+    })
+}
+
+/// `SQL.ASYNC(sql, a1..a10)`: like `SQL.QUERY`, on a background worker (`#GETTING_DATA` until done).
+fn sql_async_dispatch(args: &[*const Xloper12]) -> Value {
+    // SAFETY: Excel passes valid operands (or null/missing) for every registered argument.
+    let vals = unsafe { oper::collect_args(args) };
+    let Some(Value::Str(_)) = vals.first() else {
+        return sql_error("the first argument must be the SQL text");
+    };
+    let (located, cell) = locate_caller_cell();
+    let (bundle, digest) = sql_job_bundle();
+    let spec = JobSpec {
+        // Unsaved workbooks work too, except for references to cells.
+        workbook: located.unwrap_or_default(),
+        digest: digest.clone(),
+        bundle: std::sync::Arc::clone(bundle),
+        func: "__sql".to_owned(),
+        args: vals,
+        caller: cell,
+        timeout: jobs::DEFAULT_JOB_TIMEOUT,
+    };
+    match jobs::global().poll_or_start(spec) {
+        Poll::Pending => Value::Err(crate::value::ErrorCode::GettingData),
+        Poll::Ready(Ok(v)) => v,
+        Poll::Ready(Err(m)) => sql_error(m.trim_start_matches("runtime error: ")),
+    }
+}
+
+macro_rules! sql_udf {
+    ($name:ident, $run:ident) => {
+        #[unsafe(no_mangle)]
+        pub extern "system" fn $name(
+            f: *const Xloper12,
+            a1: *const Xloper12,
+            a2: *const Xloper12,
+            a3: *const Xloper12,
+            a4: *const Xloper12,
+            a5: *const Xloper12,
+            a6: *const Xloper12,
+            a7: *const Xloper12,
+            a8: *const Xloper12,
+            a9: *const Xloper12,
+            a10: *const Xloper12,
+        ) -> *mut Xloper12 {
+            let all: [*const Xloper12; UDF_PARAMS] = [f, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10];
+            guarded(|| $run(&all))
+        }
+    };
+}
+
+sql_udf!(SqlQuery, sql_query_dispatch);
+sql_udf!(SqlAsync, sql_async_dispatch);
+
 #[unsafe(no_mangle)]
 pub extern "system" fn LuaStatus() -> *mut Xloper12 {
     guarded(|| {
@@ -342,7 +450,7 @@ struct FnDef {
     help: &'static str,
 }
 
-const FUNCTIONS: [FnDef; 5] = [
+const FUNCTIONS: [FnDef; 7] = [
     FnDef {
         proc_name: "LuaCall",
         params: UDF_PARAMS,
@@ -370,6 +478,20 @@ const FUNCTIONS: [FnDef; 5] = [
         excel_name: "LUA.STREAM",
         arg_text: "function,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
         help: "Runs a Lua function that keeps pushing values with xl.emit(value); the cell updates live",
+    },
+    FnDef {
+        proc_name: "SqlQuery",
+        params: UDF_PARAMS,
+        excel_name: "SQL.QUERY",
+        arg_text: "sql,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
+        help: "Runs a SQL query (SQLite) over ranges: range arguments are tables t1.., other arguments parameters ?1.., [Sheet1!A1:C9] or [Table] in the text read cells",
+    },
+    FnDef {
+        proc_name: "SqlAsync",
+        params: UDF_PARAMS,
+        excel_name: "SQL.ASYNC",
+        arg_text: "sql,arg1,arg2,arg3,arg4,arg5,arg6,arg7,arg8,arg9,arg10",
+        help: "Like SQL.QUERY but in the background, so Excel is not blocked; shows #GETTING_DATA until it finishes",
     },
     FnDef {
         proc_name: "LuaStatus",

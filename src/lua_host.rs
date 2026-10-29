@@ -21,6 +21,7 @@ use mlua::{
 };
 
 use crate::procrun::{self, RunSpec};
+use crate::sqldb;
 use crate::value::{Array, ErrorCode, Value};
 use crate::vfs::Bundle;
 use crate::xlapi::{self, MAX_CELLS, Op, Reply, XlApi};
@@ -125,6 +126,7 @@ impl LuaHost {
         install_process_api(&lua, Rc::clone(&limits))?;
         install_range_api(&lua, ctx.workbook, ctx.xl.clone())?;
         install_macro_api(&lua)?;
+        install_sql_api(&lua, ctx.workbook, ctx.xl.clone(), Rc::clone(&limits))?;
         if worker {
             let hook_limits = Rc::clone(&limits);
             lua.set_hook(
@@ -320,6 +322,15 @@ fn install_xl_table(lua: &Lua, workbook: Option<&Path>) -> mlua::Result<()> {
     }
     xl.set("EMPTY", lua.create_userdata(XlEmpty)?)?;
     xl.set("version", env!("CARGO_PKG_VERSION"))?;
+    // Excel date numbers <-> ISO 8601 text (nil when it cannot be converted).
+    xl.set(
+        "date_to_iso",
+        lua.create_function(|_, n: f64| Ok(crate::dates::serial_to_iso(n)))?,
+    )?;
+    xl.set(
+        "iso_to_date",
+        lua.create_function(|_, s: String| Ok(crate::dates::iso_to_serial(&s)))?,
+    )?;
     if let Some(wb) = workbook {
         xl.set("workbook", wb.to_string_lossy().into_owned())?;
     }
@@ -537,6 +548,137 @@ fn install_macro_api(lua: &Lua) -> mlua::Result<()> {
                 return Err(mlua::Error::runtime("a macro needs a name"));
             }
             macros.set(name, f)
+        })?,
+    )
+}
+
+/// `xl.sql`, `xl.sql_records`, `xl.sql_exec` and the positional `xl.query` (what `SQL.ASYNC` runs).
+fn install_sql_api(
+    lua: &Lua,
+    workbook: &Path,
+    api: Option<Arc<dyn XlApi>>,
+    limits: Rc<RefCell<Option<Limits>>>,
+) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    let wb = workbook.to_owned();
+
+    // Where bracketed references read from, and how a running call can stop the query.
+    let env = move || {
+        let source: Box<dyn sqldb::Source> = match &api {
+            Some(a) => Box::new(sqldb::XlSource {
+                api: Arc::clone(a),
+                workbook: wb.clone(),
+            }),
+            None => Box::new(sqldb::NoSource),
+        };
+        let lim = sqldb::Limits {
+            cancel: limits.borrow().as_ref().map(|l| Arc::clone(&l.cancel)),
+            ..Default::default()
+        };
+        (source, lim)
+    };
+    let env = Rc::new(env);
+
+    type Params = (Vec<Value>, Vec<(String, Value)>);
+    fn split_params(t: Option<mlua::Table>) -> mlua::Result<Params> {
+        let mut positional: Vec<Value> = Vec::new();
+        let mut named = Vec::new();
+        if let Some(t) = t {
+            for pair in t.pairs::<LV, LV>() {
+                let (k, v) = pair?;
+                match k {
+                    LV::Integer(i) if i >= 1 => {
+                        let i = i as usize;
+                        if positional.len() < i {
+                            positional.resize(i, Value::Empty);
+                        }
+                        positional[i - 1] = from_lua(&v)?;
+                    }
+                    LV::String(s) => named.push((s.to_string_lossy(), from_lua(&v)?)),
+                    _ => {}
+                }
+            }
+        }
+        Ok((positional, named))
+    }
+    let fail = |e: String| mlua::Error::runtime(e);
+
+    let e = Rc::clone(&env);
+    xl.set(
+        "sql",
+        lua.create_function(move |lua, (sql, params): (String, Option<mlua::Table>)| {
+            let (args, named) = split_params(params)?;
+            let (source, limits) = e();
+            let out = sqldb::run(&sqldb::Query {
+                sql: &sql,
+                args: &args,
+                named: &named,
+                source: source.as_ref(),
+                read_only: false,
+                limits,
+            })
+            .map_err(fail)?;
+            to_lua(lua, &out.with_header())
+        })?,
+    )?;
+
+    let e = Rc::clone(&env);
+    xl.set(
+        "sql_records",
+        lua.create_function(move |lua, (sql, params): (String, Option<mlua::Table>)| {
+            let (args, named) = split_params(params)?;
+            let (source, limits) = e();
+            let out = sqldb::run(&sqldb::Query {
+                sql: &sql,
+                args: &args,
+                named: &named,
+                source: source.as_ref(),
+                read_only: false,
+                limits,
+            })
+            .map_err(fail)?;
+            let list = lua.create_table_with_capacity(out.rows.len(), 0)?;
+            for (i, row) in out.rows.iter().enumerate() {
+                let rec = lua.create_table_with_capacity(0, out.columns.len())?;
+                for (name, v) in out.columns.iter().zip(row) {
+                    rec.set(name.as_str(), to_lua(lua, v)?)?;
+                }
+                list.raw_set(i + 1, rec)?;
+            }
+            Ok(list)
+        })?,
+    )?;
+
+    let e = Rc::clone(&env);
+    xl.set(
+        "sql_exec",
+        lua.create_function(move |_, script: String| {
+            let (source, limits) = e();
+            sqldb::exec_script(&script, source.as_ref(), &limits).map_err(fail)
+        })?,
+    )?;
+
+    // xl.query(sql, a1, a2, ...): worksheet-function conventions (tables t1.., parameters ?1..),
+    // statements may only read. This is what SQL.ASYNC calls.
+    let e = Rc::clone(&env);
+    xl.set(
+        "query",
+        lua.create_function(move |lua, (sql, rest): (String, MultiValue)| {
+            let args: Vec<Value> = rest
+                .iter()
+                .map(from_lua)
+                .collect::<mlua::Result<Vec<_>>>()?;
+            let (source, limits) = e();
+            let out = sqldb::run(&sqldb::Query {
+                sql: &sql,
+                args: &args,
+                named: &[],
+                source: source.as_ref(),
+                read_only: true,
+                limits,
+            })
+            .map_err(fail)?;
+            to_lua(lua, &out.with_header())
         })?,
     )
 }
@@ -1022,6 +1164,64 @@ mod tests {
             h.call_macro("nope", &limits),
             Err(HostError::Undefined(_))
         ));
+    }
+
+    #[test]
+    fn sql_from_lua_over_cells_tables_and_dates() {
+        use crate::xlapi::fake::MemGrid;
+        let g = MemGrid::new();
+        for (a, v) in [
+            ("A1", Value::Str("name".into())),
+            ("B1", Value::Str("qty".into())),
+            ("A2", Value::Str("bolt".into())),
+            ("B2", Value::Num(10.0)),
+            ("A3", Value::Str("nut".into())),
+            ("B3", Value::Num(25.0)),
+        ] {
+            g.put("Data", a, v);
+        }
+        g.tables
+            .lock()
+            .unwrap()
+            .insert("Orders".into(), "Data!A1:B3".into());
+        let h = grid_host(
+            r#"
+            function rows() return xl.sql("select name from [Orders] where qty > ?", {15}) end
+            function named()
+              local r = xl.sql_records("select name, qty from [Data!A1:B3] where qty >= :m order by qty", {m = 10})
+              return #r .. ":" .. r[1].name .. ":" .. r[2].qty
+            end
+            function chain()
+              xl.sql_exec("create temp table t(a); insert into t values (1),(2)")
+              return 1
+            end
+            function wsf() return xl.query("select count(*) as n from t1 where qty > ?2", xl.range("A1:B3"):values(), 5) end
+            function bad() return xl.sql("select * from [Nope]") end
+            function dates() return xl.date_to_iso(45351) .. " " .. xl.iso_to_date("2024-02-29") end
+            "#,
+            Arc::clone(&g),
+        );
+        let Value::Array(a) = h.call("rows", &[]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(
+            a.data,
+            vec![Value::Str("name".into()), Value::Str("nut".into())]
+        );
+        assert_eq!(
+            h.call("named", &[]).unwrap(),
+            Value::Str("2:bolt:25.0".into())
+        );
+        assert_eq!(h.call("chain", &[]).unwrap(), Value::Num(1.0));
+        let Value::Array(w) = h.call("wsf", &[]).unwrap() else {
+            panic!()
+        };
+        assert_eq!(w.data[1], Value::Num(2.0));
+        assert!(h.call("bad", &[]).unwrap_err().to_string().contains("Nope"));
+        assert_eq!(
+            h.call("dates", &[]).unwrap(),
+            Value::Str("2024-02-29 45351.0".into())
+        );
     }
 
     #[test]

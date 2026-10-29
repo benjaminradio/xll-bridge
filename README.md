@@ -14,7 +14,7 @@ in the background and stream live values into cells.
 
 ## Contents
 
-[Quick start](#quick-start) · [Worksheet functions](#worksheet-functions) · [Lua API](#lua-api) ·
+[Quick start](#quick-start) · [Worksheet functions](#worksheet-functions) · [Lua API](#lua-api) · [SQL over cells](#sql-over-cells) ·
 [The Lua ribbon tab](#the-lua-ribbon-tab) · [Editing scripts in your own editor](#editing-scripts-in-your-own-editor)
 · [Trust model](#trust-model) · [Files on disk](#files-on-disk) · [How it works](#how-it-works) ·
 [Troubleshooting](#troubleshooting) · [Limitations](#limitations) · [Future considerations](#future-considerations)
@@ -57,6 +57,8 @@ Workbooks must be saved to a local path (OneDrive/SharePoint copies are resolved
 | `LUA.EVAL(code, a1…a10)` | Excel's UI thread | read only | one-off expressions (sandboxed when the workbook has no enabled scripts) |
 | `LUA.ASYNC(name, a1…a10)` | background worker | read and write | slow work: web requests, programs |
 | `LUA.STREAM(name, a1…a10)` | its own thread | read and write | values that change over time |
+| `SQL.QUERY(sql, a1…a10)` | Excel's UI thread | read only | SQL over ranges and Excel tables ([below](#sql-over-cells)) |
+| `SQL.ASYNC(sql, a1…a10)` | background worker | read only | the same for slow queries |
 | `LUA.STATUS()` | | | trust state of this workbook (and, once streams are used, RTD diagnostics) |
 
 `LUA.CALL` runs on Excel's UI thread, so a slow function freezes Excel while it runs; use `LUA.ASYNC`
@@ -158,6 +160,44 @@ background call also kills the program it is waiting for. These functions exist 
 * Paths are validated everywhere (no `..`, drive letters, reserved Windows names); text files are stored
   with `\n` line endings; limits are 32 MB per file and 64 MB per workbook.
 
+## SQL over cells
+
+An embedded SQLite engine (no database server, nothing to install) runs SQL over your cells. SQL needs no
+enabled scripts, so `SQL.QUERY` and `SQL.ASYNC` work in any workbook.
+
+```
+=SQL.QUERY("select item, qty from t1 where qty > ?2 order by qty desc", A16:B19, 8)
+=SQL.QUERY("select c.name, sum(o.qty) from [Orders] o join [Customers] c on c.id = o.cust group by 1")
+=SQL.QUERY("select xl_iso(Day), Amount from [Sales!A1:B400] where Day >= xl_date('2024-01-01')")
+```
+
+* **Arguments**: a range argument *k* becomes the table `tk` (its first row is the header row and gives the
+  column names); a scalar argument *k* is the parameter `?k`. Range arguments are tracked by Excel, so the
+  formula recalculates when they change.
+* **References in the SQL text**: `[Sheet1!A1:C9]` (first row = header), `[Orders]` (an Excel table or
+  defined name). A reference that is a plain name becomes a table of that name, so `[Orders]` can be used as
+  `Orders.qty`; anything else gets a generated name, so give it an alias (`[Sheet1!A1:C9] as a`). These reads
+  are not dependency-tracked: pass a range as an argument when the result must refresh by itself.
+* **Result**: the column names, then the rows, spilling from the formula cell (Excel 365). `SQL.QUERY`
+  accepts one statement that only reads; `SQL.ASYNC` is the same on a worker (`#GETTING_DATA` until done).
+* **Types**: numbers, text and empty cells (NULL) map as you would expect; booleans are 0/1; errors become
+  their text (`#N/A`). Tables are snapshots: a query never changes the sheet.
+* **Dates stay numbers** (they sort and subtract correctly). Convert at the edges: SQL `xl_iso(n)` /
+  `xl_date('2024-02-29')`, Lua `xl.date_to_iso(n)` / `xl.iso_to_date(s)`. ISO 8601 text is
+  `YYYY-MM-DD`, with `THH:MM:SS[.mmm]` when there is a time; the 1900 date system is assumed.
+* Hardening: the schema is not trusted, untrusted-schema tricks are off, extensions cannot be loaded and a
+  query is stopped after 60 seconds (or when its background call is cancelled).
+
+From Lua (`LUA.CALL`, `LUA.ASYNC`, macros, streams), statements may also change data in the throwaway
+in-memory database:
+
+```lua
+local rows = xl.sql("select name from [Orders] where qty > ?", {15})   -- table of rows, header first
+local recs = xl.sql_records("select * from [Data!A1:B9] where k >= :min", {min = 10})  -- {{k=..., v=...}, ...}
+xl.sql_exec("create temp table t(a); insert into t values (1), (2)")
+xl.range("Out!A1"):set(rows)                                             -- write a result to the sheet (macro/async)
+```
+
 ## The Lua ribbon tab
 
 | Control | What it does |
@@ -253,6 +293,7 @@ the Add-ins dialog deletes those keys; `DllRegisterServer` / `DllUnregisterServe
 | `lua_host` | one Lua state per workbook, `Value` ⇄ Lua, the `xl` table | any |
 | `xlapi` | cell access for Lua behind a trait; routes worker-thread requests to the UI thread | any |
 | `jobs`, `streams`, `macros`, `procrun` | `LUA.ASYNC`, `LUA.STREAM`, macros, running programs | any |
+| `sqldb`, `dates` | SQLite over cells (`SQL.QUERY`, `xl.sql`), Excel date ⇄ ISO 8601 | any |
 | `sync`, `panel`, `settings`, `ui`, `log` | folder sync, Files-panel commands, preferences, button states, diagnostics | any |
 | `xll/` | XLOPER12 FFI (`MdCallBack12` is found at run time, no SDK), registration, exports | Windows x64 |
 | `xll/ribbon/` | the COM add-in in the same DLL: ribbon, Files panel, cell access, RTD server, folder sync | Windows x64 |

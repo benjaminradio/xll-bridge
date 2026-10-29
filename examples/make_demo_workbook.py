@@ -36,6 +36,12 @@ for r, (x, y) in enumerate([(1, 2), (3, 4), (5, 6)], start=11):
     ws.cell(row=r, column=2, value=y)
 ws["D10"] = "transpose(A11:B13)  (Ctrl+Shift+Enter on pre-365 Excel)"
 ws["D11"] = "=_xll.LUA.CALL(\"transpose\", A11:B13)"
+ws["A15"] = "SQL over cells"
+for r, row in enumerate([("item", "qty"), ("bolt", 10), ("nut", 25), ("gear", 7)], start=16):
+    ws.cell(row=r, column=1, value=row[0])
+    ws.cell(row=r, column=2, value=row[1])
+ws["D15"] = "SQL.QUERY: items with qty > 8 (spills in Excel 365)"
+ws["D16"] = '=_xll.SQL.QUERY("select item, qty from t1 where qty > ?2 order by qty desc", A16:B19, 8)'
 ws.column_dimensions["A"].width = 18
 ws.column_dimensions["B"].width = 18
 wb.save(sys.argv[1])

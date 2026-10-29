@@ -43,6 +43,20 @@ impl ErrorCode {
         Self::ALL.into_iter().find(|e| e.xl_code() == code)
     }
 
+    /// The text Excel shows for the error.
+    pub fn excel_text(self) -> &'static str {
+        match self {
+            ErrorCode::Null => "#NULL!",
+            ErrorCode::Div0 => "#DIV/0!",
+            ErrorCode::Value => "#VALUE!",
+            ErrorCode::Ref => "#REF!",
+            ErrorCode::Name => "#NAME?",
+            ErrorCode::Num => "#NUM!",
+            ErrorCode::NA => "#N/A",
+            ErrorCode::GettingData => "#GETTING_DATA",
+        }
+    }
+
     /// Name as exposed to Lua (`xl.NA`, `xl.DIV0`, ...).
     pub fn lua_name(self) -> &'static str {
         match self {

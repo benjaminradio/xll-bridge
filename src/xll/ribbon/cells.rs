@@ -369,6 +369,33 @@ pub(super) fn execute(op: Op) -> Result<Reply, XlError> {
             dispatch::call(&r.range, "ClearContents", &[]).map_err(com)?;
             Ok(Reply::Done)
         }
+        Op::Table { workbook, name } => {
+            let book = book_name_of(&workbook)
+                .ok_or_else(|| XlError::new("this workbook is not open in Excel"))?;
+            let sheets = dispatch_of(dispatch::get(&open_book(&app, &book)?, "Worksheets"))?;
+            for i in 1..=count_of(&sheets, "Count")? {
+                let ws = dispatch_of(dispatch::get_with(&sheets, "Item", &[VARIANT::from(i)]))?;
+                let tables = dispatch_of(dispatch::get(&ws, "ListObjects"))?;
+                let found = dispatch_of(dispatch::get_with(
+                    &tables,
+                    "Item",
+                    &[VARIANT::from(name.as_str())],
+                ));
+                let table = match found {
+                    Ok(t) => t,
+                    Err(e) if e.retryable => return Err(e),
+                    Err(_) => continue, // not on this sheet
+                };
+                // The whole table, header row included.
+                let range = dispatch_of(dispatch::get(&table, "Range"))?;
+                let v = dispatch::get(&range, "Value2").map_err(com)?;
+                return Ok(Reply::Data(match read_variant(&v)? {
+                    a @ Value::Array(_) => a,
+                    scalar => Value::Array(Array::new(1, 1, vec![scalar])),
+                }));
+            }
+            Err(XlError::new(format!("no table named '{name}'")))
+        }
         Op::Sheets { workbook } => {
             let book = book_name_of(&workbook)
                 .ok_or_else(|| XlError::new("this workbook is not open in Excel"))?;
