@@ -1086,7 +1086,7 @@ fn build_nodes(bundle: Option<&Bundle>, machine: &[Entry]) -> Vec<Node> {
     nodes.push(Node {
         id: panel::MACHINE_ROOT.to_owned(),
         kind: Kind::Dir,
-        label: "Machine   (xll-bridge\\local, shared by every workbook)".to_owned(),
+        label: "Machine".to_owned(),
     });
     for e in machine {
         nodes.push(Node {
