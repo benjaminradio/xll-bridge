@@ -29,7 +29,7 @@ fn store(app: &IDispatch, f: &Flush) -> Outcome {
     }
     // Only a data file changed, so the running scripts and their trust are unaffected.
     match with_runtime(|rt| rt.apply_live(&f.workbook, &bundle)) {
-        Ok(()) => Outcome::Stored,
+        Ok(_) => Outcome::Stored,
         Err(e) => Outcome::Failed(e.to_string()),
     }
 }

@@ -766,10 +766,10 @@ fn refresh(app: &IDispatch, h: Handles) {
         Some(a) => {
             let bundle = refresh_live(a, false);
             let (view, disk) = match &a.path {
-                Some(p) => with_runtime(|rt| (ui::view(&rt.status(p)), rt.disk_digest(p))),
+                Some(p) => with_runtime(|rt| (ui::view(&rt.status(p)), rt.disk_content_digest(p))),
                 None => (ui::view_without_file(), None),
             };
-            let dirty = bundle.as_ref().map(Bundle::digest) != disk;
+            let dirty = bundle.as_ref().map(Bundle::content_digest) != disk;
             (view, bundle, dirty, a.name.clone(), a.key.clone(), true)
         }
     };
@@ -783,7 +783,10 @@ fn refresh(app: &IDispatch, h: Handles) {
         }
         m.message.as_ref().map(|(e, t, _)| (*e, t.clone()))
     });
-    let digest = bundle.as_ref().map(Bundle::digest).unwrap_or_default();
+    let digest = bundle
+        .as_ref()
+        .map(Bundle::content_digest)
+        .unwrap_or_default();
     let signature = format!(
         "{key}|{digest}|{:?}|{}|{dirty}|{message:?}|{can_edit}",
         view.light, view.label
@@ -1655,7 +1658,17 @@ fn commit(active: &Active, bundle: Bundle, mut msg: String) {
     if bundle.file_count() > 0 {
         match &active.path {
             Some(path) => {
-                if !with_runtime(|rt| rt.note_edit(path, &digest)) {
+                if with_runtime(|rt| rt.note_edit(path, &digest)) {
+                    // The user's own change: run it now, no need to save and reopen.
+                    let app = dispatch::get(&active.wb, "Application")
+                        .ok()
+                        .and_then(|v| IDispatch::try_from(&v).ok());
+                    if let Some(app) = app
+                        && let Err(e) = super::folder::run_live(&app, path, &bundle)
+                    {
+                        msg.push_str(&format!(". Could not start the new code: {e}"));
+                    }
+                } else {
                     msg.push_str(". Lua stays disabled until you enable it with the ribbon button");
                 }
             }

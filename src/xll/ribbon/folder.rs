@@ -44,18 +44,31 @@ fn name_of(p: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// Starts running `bundle` (already stored in the open workbook) as the workbook's scripts: the new
+/// code is trusted (the user wrote it here), results and streams of the old code are dropped and the
+/// workbook recalculates. A change that only touches data files leaves the running state alone.
+pub(super) fn run_live(
+    app: &IDispatch,
+    workbook: &Path,
+    bundle: &crate::vfs::Bundle,
+) -> Result<(), String> {
+    let code_changed =
+        with_runtime(|rt| rt.apply_live(workbook, bundle)).map_err(|e| e.to_string())?;
+    if code_changed {
+        crate::jobs::global().forget_workbook(workbook);
+        crate::streams::global().cancel_workbook(workbook);
+        let _ = dispatch::call(app, "CalculateFull", &[]);
+    }
+    Ok(())
+}
+
 /// Writes the folder's files into the open workbook and starts running them.
 fn apply(app: &IDispatch, workbook: &Path, snap: &Snapshot) -> Result<(), String> {
     let book = workbook_name_by_path(workbook)
         .ok_or_else(|| "the workbook is not open in Excel".to_owned())?;
     let wb = cells::open_book(app, &book).map_err(|e| e.message)?;
     live::write(&wb, &snap.bundle).map_err(|e| format!("could not update the workbook: {e}"))?;
-    with_runtime(|rt| rt.apply_live(workbook, &snap.bundle)).map_err(|e| e.to_string())?;
-    // The old code's results and streams are obsolete; recalculating starts the new ones.
-    crate::jobs::global().forget_workbook(workbook);
-    crate::streams::global().cancel_workbook(workbook);
-    let _ = dispatch::call(app, "CalculateFull", &[]);
-    Ok(())
+    run_live(app, workbook, &snap.bundle)
 }
 
 fn report(app: &IDispatch, folder: &Path, snap: &Snapshot) {

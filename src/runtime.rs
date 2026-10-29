@@ -83,6 +83,8 @@ pub struct Runtime {
     books: HashMap<String, Entry>,
     /// Shared sandbox for `LUA.EVAL` where there is no trusted script state.
     sandbox: Option<LuaHost>,
+    /// Content digest of each saved file by modification time (see `disk_content_digest`).
+    content_digests: HashMap<String, (Option<std::time::SystemTime>, Option<String>)>,
 }
 
 impl Runtime {
@@ -91,6 +93,7 @@ impl Runtime {
             trust,
             books: HashMap::new(),
             sandbox: None,
+            content_digests: HashMap::new(),
         }
     }
 
@@ -246,6 +249,24 @@ impl Runtime {
         }
     }
 
+    /// Digest of everything stored in the saved file, databases included (None when there are no
+    /// files). Remembered per file modification time.
+    pub fn disk_content_digest(&mut self, workbook: &Path) -> Option<String> {
+        let key = normalize_path(workbook);
+        let mtime = std::fs::metadata(workbook).and_then(|m| m.modified()).ok();
+        if let Some((m, d)) = self.content_digests.get(&key)
+            && *m == mtime
+        {
+            return d.clone();
+        }
+        let digest = match package::read_bundle(workbook) {
+            Ok(Some(b)) if b.file_count() > 0 => Some(b.content_digest()),
+            _ => None,
+        };
+        self.content_digests.insert(key, (mtime, digest.clone()));
+        digest
+    }
+
     /// Digest of the file set on disk for this workbook (None when there are no files).
     pub fn disk_digest(&mut self, workbook: &Path) -> Option<String> {
         match self.state(workbook) {
@@ -268,7 +289,9 @@ impl Runtime {
     /// Makes `bundle` the trusted, running file set of `workbook` right away, without waiting for
     /// the workbook to be saved. For a folder the user linked on purpose (see `sync`): the files
     /// are theirs. Saving later keeps the running state, since the saved digest matches.
-    pub fn apply_live(&mut self, workbook: &Path, bundle: &Bundle) -> std::io::Result<()> {
+    /// Returns whether the running code changed (false: only data files differed, the Lua state
+    /// was kept).
+    pub fn apply_live(&mut self, workbook: &Path, bundle: &Bundle) -> std::io::Result<bool> {
         if bundle.file_count() == 0 {
             return Err(std::io::Error::other("there are no files to run"));
         }
@@ -289,7 +312,7 @@ impl Runtime {
         {
             *running = Arc::new(bundle.clone());
             *m = mtime;
-            return Ok(());
+            return Ok(false);
         }
         let saved = package::read_bundle(workbook)
             .ok()
@@ -303,7 +326,7 @@ impl Runtime {
         }
         self.books
             .insert(normalize_path(workbook), Entry { mtime, book });
-        Ok(())
+        Ok(true)
     }
 
     /// A file set the user authored in an unsaved workbook has now been saved to `workbook`:
@@ -641,6 +664,32 @@ mod tests {
         let other = bundle_of(&[("main.lua", "function one() return 9 end")]);
         embed_bundle(&base, &wb, &other).unwrap();
         assert!(matches!(rt.status(&wb), Status::Blocked { .. }));
+    }
+
+    #[test]
+    fn data_only_changes_keep_the_running_state() {
+        let (_d, wb) =
+            workbook_with("counter = 0 function bump() counter = counter + 1 return counter end");
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        rt.enable(&wb).unwrap();
+        assert_eq!(rt.call(Some(&wb), "bump", &[]).unwrap(), Value::Num(1.0));
+        // Adding a database changes no code: the state (counter) survives.
+        let mut live = crate::package::read_bundle(&wb).unwrap().unwrap();
+        live.put_file("data.db", b"v1".to_vec(), true).unwrap();
+        assert!(!rt.apply_live(&wb, &live).unwrap());
+        assert_eq!(rt.call(Some(&wb), "bump", &[]).unwrap(), Value::Num(2.0));
+        // Changing code rebuilds the state.
+        live.put_file(
+            "main.lua",
+            b"counter = 100 function bump() counter = counter + 1 return counter end".to_vec(),
+            true,
+        )
+        .unwrap();
+        assert!(rt.apply_live(&wb, &live).unwrap());
+        assert_eq!(rt.call(Some(&wb), "bump", &[]).unwrap(), Value::Num(101.0));
+        // The saved file's content digest sees databases that the trust digest ignores.
+        let before = rt.disk_content_digest(&wb);
+        assert!(before.is_some());
     }
 
     #[test]
