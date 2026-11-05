@@ -27,6 +27,10 @@ pub struct RunSpec {
     pub timeout: Duration,
     /// When set from another thread, the process is killed and the run reports `cancelled`.
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Windows: give the program a real console window instead of none. Needed by tools that sign
+    /// in interactively (MSAL / Entra ID uses the console window as the parent of its sign-in
+    /// dialog and fails with "a window handle must be configured" without one).
+    pub show_console: bool,
 }
 
 impl RunSpec {
@@ -39,6 +43,7 @@ impl RunSpec {
             stdin: None,
             timeout: DEFAULT_TIMEOUT,
             cancel: None,
+            show_console: false,
         }
     }
 
@@ -117,7 +122,13 @@ pub fn run(spec: &RunSpec) -> std::io::Result<RunResult> {
         if let Some(tail) = &spec.raw_tail {
             cmd.raw_arg(tail);
         }
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW: no console flashing over Excel
+        // CREATE_NO_WINDOW keeps a console from flashing over Excel; CREATE_NEW_CONSOLE gives
+        // programs that need a window to parent a sign-in dialog one.
+        cmd.creation_flags(if spec.show_console {
+            0x0000_0010
+        } else {
+            0x0800_0000
+        });
     }
     if let Some(dir) = &spec.cwd {
         cmd.current_dir(dir);
@@ -216,6 +227,15 @@ mod tests {
         let r = run(&spec).unwrap();
         assert!(r.cancelled && !r.timed_out && !r.ok(), "{r:?}");
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn a_visible_console_still_captures_output() {
+        let mut spec = RunSpec::shell("echo hello");
+        spec.show_console = true;
+        let r = run(&spec).unwrap();
+        assert!(r.ok(), "{r:?}");
+        assert_eq!(text(&r.stdout), "hello");
     }
 
     #[test]

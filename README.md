@@ -144,7 +144,9 @@ local s = xl.shell("dir /b | find \".lua\"", { timeout = 5 })   -- through cmd /
 ```
 
 Output is captured (32 MB cap per stream), `stdin = "text"` is supported, and `timeout` (seconds, default 60)
-really kills the process (and its children on Windows). No console window appears. Cancelling a
+really kills the process (and its children on Windows). No console window appears, unless you pass
+`window = true`: programs that sign in with a dialog (Microsoft's MSAL, as in DAX Studio's `dscmd`, fails with
+"a window handle must be configured" otherwise) need a console window to attach it to. Cancelling a
 background call also kills the program it is waiting for. These functions exist only in enabled workbooks.
 
 ### Files, modules and DLLs

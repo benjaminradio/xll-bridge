@@ -36,6 +36,11 @@ M.config = {
   refresh_after = "06:30",
   -- Give dscmd time for the sign-in popup and a long query (seconds).
   timeout = 900,
+  -- dscmd signs in with Microsoft's Windows account manager (MSAL), which needs a console window
+  -- to attach its sign-in dialog to. Without one it fails with "A window handle must be configured".
+  -- A console window therefore appears while dscmd runs; set to false once a sign-in is cached
+  -- (run dscmd once by hand) if you would rather not see it.
+  window = true,
 
   -- ADAPT THIS to your dscmd syntax. It must return the command as a list of words that runs the
   -- DAX in `dax_file` against the model and writes the result as CSV to `out_file`. The words
@@ -83,7 +88,9 @@ function M.csv(dax, opts)
   os.remove(part)
 
   -- The sign-in popup (if any) is dscmd's own; this waits for it.
-  local r, err = xl.run(c.command(c, dax_file, part))
+  local words = c.command(c, dax_file, part)
+  words.window = c.window
+  local r, err = xl.run(words)
   if not r then error("cannot start dscmd: " .. tostring(err), 0) end
   if r.timed_out or not r.ok then
     error(("dscmd failed (exit %s): %s"):format(tostring(r.code), (r.stderr ~= "" and r.stderr or r.stdout):sub(1, 400)), 0)

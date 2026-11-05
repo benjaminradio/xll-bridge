@@ -1155,6 +1155,8 @@ fn run_from_lua(
         if let LV::String(input) = o.get::<LV>("stdin")? {
             run.stdin = Some(input.as_bytes().to_vec());
         }
+        // window = true: a visible console, for programs that sign in with a dialog.
+        run.show_console = matches!(o.get::<LV>("window")?, LV::Boolean(true));
     }
     run.cancel = cancel;
     match procrun::run(&run) {
