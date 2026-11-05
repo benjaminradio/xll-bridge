@@ -1969,6 +1969,8 @@ fn handle_machine(owner: HWND, active: Option<&Active>, cmd: Command) {
         _ => Ok(String::new()),
     };
     refresh_machine(true);
+    // Edited machine scripts take effect at once.
+    with_runtime(|rt| rt.rescan_machine());
     match result {
         Ok(m) if m.is_empty() => {}
         Ok(m) => say(false, m),

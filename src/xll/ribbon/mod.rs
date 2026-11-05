@@ -300,9 +300,11 @@ fn refresh_books(app: &IDispatch) {
             crate::jobs::global().forget_workbook(gone);
             crate::dbstore::forget_workbook(gone);
         }
-        let has_files = appeared
-            .iter()
-            .any(|p| with_runtime(|rt| !matches!(rt.status(p), Status::NoScripts)));
+        let has_files = appeared.iter().any(|p| {
+            with_runtime(|rt| {
+                !matches!(rt.status(p), Status::NoScripts | Status::MachineOnly { .. })
+            })
+        });
         BOOKS.with(|b| {
             let mut b = b.borrow_mut();
             b.by_name = map;
@@ -538,6 +540,40 @@ fn on_click() {
     };
     let status = with_runtime(|rt| rt.status(&path));
     match status {
+        Status::MachineOnly { names } => {
+            let text = format!(
+                "\"{}\" has no Lua scripts of its own, but the machine folder has {} script(s):\n\n{}\n\nThey can read and write files and run programs on this computer. \
+                 Run them in this workbook?",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                names.len(),
+                names
+                    .iter()
+                    .map(|n| format!("  \u{2022} {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+            if !message(
+                owner,
+                &text,
+                "Run machine scripts?",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) {
+                return;
+            }
+            match with_runtime(|rt| rt.enable(&path)) {
+                Ok(()) => drop(dispatch::call(&app, "CalculateFull", &[])),
+                Err(e) => {
+                    message(
+                        owner,
+                        &format!("Could not enable Lua: {e}"),
+                        "Lua",
+                        MB_OK | MB_ICONWARNING,
+                    );
+                }
+            }
+        }
         Status::Blocked { names } => {
             let text = format!(
                 "\"{}\" contains {} Lua script(s):\n\n{}\n\nLua scripts can read and write files and run programs on this computer. \

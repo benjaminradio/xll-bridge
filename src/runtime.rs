@@ -1,7 +1,7 @@
 //! Per-workbook state machine tying storage, trust and the Lua host together.
 //!
 //! ```text
-//!   no scripts part ──────────────► NoScripts
+//!   no scripts part ──────────────► NoScripts   (or MachineOnly when the machine folder has scripts)
 //!   scripts, not trusted ─────────► Blocked  ──enable()──► Active
 //!   scripts, trusted ─────────────► Active
 //!   Lua failed to load ───────────► Failed
@@ -21,6 +21,11 @@ use crate::vfs::Bundle;
 
 pub enum Book {
     NoScripts,
+    /// The workbook has no scripts of its own, but the machine folder does and they have not been
+    /// enabled for this workbook. `LUA.EVAL` still runs in the sandbox.
+    MachineOnly {
+        names: Vec<String>,
+    },
     Blocked {
         digest: String,
         names: Vec<String>,
@@ -46,6 +51,8 @@ pub enum Book {
 pub enum Status {
     /// No scripts (or no file on disk): nothing to trust.
     NoScripts,
+    /// No scripts of its own, but machine scripts exist that could be enabled for it.
+    MachineOnly { names: Vec<String> },
     /// Scripts present and trusted; Lua is running.
     Active { names: Vec<String> },
     /// Scripts present but not trusted; nothing has been executed.
@@ -56,6 +63,8 @@ pub enum Status {
 
 struct Entry {
     mtime: Option<SystemTime>,
+    /// Fingerprint of the machine scripts this state was built with.
+    machine: u64,
     book: Book,
 }
 
@@ -66,6 +75,10 @@ pub enum CallError {
     Blocked,
     #[error("#NOSCRIPTS: this workbook has no embedded Lua scripts")]
     NoScripts,
+    #[error(
+        "#NOSCRIPTS: this workbook has no scripts of its own; use the Lua ribbon button to run the machine scripts in it"
+    )]
+    MachineOnly,
     #[error("#NOPATH: cannot locate this workbook on disk")]
     NoPath,
     #[error("#LUA: {0}")]
@@ -83,6 +96,8 @@ pub struct Runtime {
     books: HashMap<String, Entry>,
     /// Shared sandbox for `LUA.EVAL` where there is no trusted script state.
     sandbox: Option<LuaHost>,
+    /// Fingerprint of the machine scripts and when it was taken (looked at once a second at most).
+    machine_checked: Option<(std::time::Instant, u64)>,
     /// Content digest of each saved file by modification time (see `disk_content_digest`).
     content_digests: HashMap<String, (Option<std::time::SystemTime>, Option<String>)>,
 }
@@ -94,18 +109,49 @@ impl Runtime {
             books: HashMap::new(),
             sandbox: None,
             content_digests: HashMap::new(),
+            machine_checked: None,
         }
+    }
+
+    /// The machine scripts' fingerprint, re-read at most once a second.
+    fn machine_stamp(&mut self) -> u64 {
+        if let Some((t, stamp)) = self.machine_checked
+            && t.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return stamp;
+        }
+        let stamp = crate::dbstore::machine_stamp();
+        self.machine_checked = Some((std::time::Instant::now(), stamp));
+        stamp
+    }
+
+    /// Look at the machine folder again right away (after the user changed it).
+    pub fn rescan_machine(&mut self) {
+        self.machine_checked = None;
     }
 
     /// Current state for a workbook, (re)reading it from disk if the file changed.
     pub fn state(&mut self, workbook: &Path) -> &Book {
         let key = normalize_path(workbook);
         let mtime = std::fs::metadata(workbook).and_then(|m| m.modified()).ok();
-        let stale = self.books.get(&key).is_none_or(|e| e.mtime != mtime);
+        let machine = self.machine_stamp();
+        let stale = self
+            .books
+            .get(&key)
+            .is_none_or(|e| e.mtime != mtime || e.machine != machine);
         if stale {
             let old = self.books.remove(&key);
-            let book = self.load(workbook, old.map(|e| e.book));
-            self.books.insert(key.clone(), Entry { mtime, book });
+            // A running Lua state is only kept if the machine scripts it loaded are unchanged.
+            let keep = old.as_ref().is_some_and(|e| e.machine == machine);
+            let book = self.load(workbook, old.map(|e| e.book).filter(|_| keep));
+            self.books.insert(
+                key.clone(),
+                Entry {
+                    mtime,
+                    machine,
+                    book,
+                },
+            );
         }
         &self.books[&key].book
     }
@@ -126,14 +172,21 @@ impl Runtime {
         {
             return kept;
         }
+        let machine_names = crate::dbstore::machine_script_names();
         let scripts = match disk {
             Some(s) => s,
             // Unreadable (e.g. mid-save, not yet a zip) is treated like "no scripts"; the next
             // mtime change retries.
-            None => return Book::NoScripts,
+            None if machine_names.is_empty() => return Book::NoScripts,
+            // Nothing embedded, but there are machine scripts: they run once enabled here.
+            None => Bundle::new(),
         };
         let digest = scripts.digest();
-        let names = script_names(&scripts);
+        let mut names = script_names(&scripts);
+        names.extend(machine_names.iter().map(|n| format!("local/{n}")));
+        if scripts.file_count() == 0 && !self.trust.is_trusted(workbook, &digest) {
+            return Book::MachineOnly { names };
+        }
         // A save by Excel changes the mtime but not the scripts: keep the live Lua state.
         if let Some(Book::Active {
             digest: d,
@@ -162,14 +215,21 @@ impl Runtime {
         let key = normalize_path(workbook);
         let (digest, scripts) = match package::read_bundle(workbook) {
             Ok(Some(s)) if s.file_count() > 0 => (s.digest(), s),
+            // No scripts of its own: enabling runs the machine scripts in this workbook.
+            _ if !crate::dbstore::machine_script_names().is_empty() => {
+                let empty = Bundle::new();
+                (empty.digest(), empty)
+            }
             _ => return Err(std::io::Error::other("no scripts to enable")),
         };
         self.trust.trust(workbook, &digest)?;
         let mtime = std::fs::metadata(workbook).and_then(|m| m.modified()).ok();
+        let machine = self.machine_stamp();
         self.books.insert(
             key,
             Entry {
                 mtime,
+                machine,
                 book: activate(workbook, &scripts, digest),
             },
         );
@@ -204,7 +264,7 @@ impl Runtime {
     ) -> Result<Value, CallError> {
         let sandboxed = match workbook {
             None => true,
-            Some(p) => matches!(self.state(p), Book::NoScripts),
+            Some(p) => matches!(self.state(p), Book::NoScripts | Book::MachineOnly { .. }),
         };
         if sandboxed {
             if self.sandbox.is_none() {
@@ -222,6 +282,7 @@ impl Runtime {
             Book::Active { host, .. } => Ok(host),
             Book::Blocked { .. } => Err(CallError::Blocked),
             Book::NoScripts => Err(CallError::NoScripts),
+            Book::MachineOnly { .. } => Err(CallError::MachineOnly),
             Book::Failed { message, .. } => Err(CallError::Lua(message.clone())),
         }
     }
@@ -237,6 +298,7 @@ impl Runtime {
             Book::Active { bundle, digest, .. } => Ok((Arc::clone(bundle), digest.clone())),
             Book::Blocked { .. } => Err(CallError::Blocked),
             Book::NoScripts => Err(CallError::NoScripts),
+            Book::MachineOnly { .. } => Err(CallError::MachineOnly),
             Book::Failed { message, .. } => Err(CallError::Lua(message.clone())),
         }
     }
@@ -270,7 +332,7 @@ impl Runtime {
     /// Digest of the file set on disk for this workbook (None when there are no files).
     pub fn disk_digest(&mut self, workbook: &Path) -> Option<String> {
         match self.state(workbook) {
-            Book::NoScripts => None,
+            Book::NoScripts | Book::MachineOnly { .. } => None,
             Book::Blocked { digest, .. }
             | Book::Active { digest, .. }
             | Book::Failed { digest, .. } => Some(digest.clone()),
@@ -282,7 +344,10 @@ impl Runtime {
     /// new file set too so it stays enabled once saved. A blocked workbook stays blocked.
     /// Returns whether the new set was trusted.
     pub fn note_edit(&mut self, workbook: &Path, new_digest: &str) -> bool {
-        let allowed = matches!(self.state(workbook), Book::NoScripts | Book::Active { .. });
+        let allowed = matches!(
+            self.state(workbook),
+            Book::NoScripts | Book::MachineOnly { .. } | Book::Active { .. }
+        );
         allowed && self.trust.pretrust(workbook, new_digest).is_ok()
     }
 
@@ -307,6 +372,7 @@ impl Runtime {
                     ..
                 },
             mtime: m,
+            ..
         }) = self.books.get_mut(&normalize_path(workbook))
             && *d == digest
         {
@@ -324,8 +390,15 @@ impl Runtime {
         if let Book::Active { live_over, .. } = &mut book {
             *live_over = Some(saved);
         }
-        self.books
-            .insert(normalize_path(workbook), Entry { mtime, book });
+        let machine = self.machine_stamp();
+        self.books.insert(
+            normalize_path(workbook),
+            Entry {
+                mtime,
+                machine,
+                book,
+            },
+        );
         Ok(true)
     }
 
@@ -345,6 +418,9 @@ impl Runtime {
     pub fn status(&mut self, workbook: &Path) -> Status {
         match self.state(workbook) {
             Book::NoScripts => Status::NoScripts,
+            Book::MachineOnly { names } => Status::MachineOnly {
+                names: names.clone(),
+            },
             Book::Blocked { names, .. } => Status::Blocked {
                 names: names.clone(),
             },
@@ -690,6 +766,85 @@ mod tests {
         // The saved file's content digest sees databases that the trust digest ignores.
         let before = rt.disk_content_digest(&wb);
         assert!(before.is_some());
+    }
+
+    #[test]
+    fn machine_scripts_run_in_a_workbook_without_scripts_once_enabled() {
+        let machine = tempfile::tempdir().unwrap();
+        crate::dbstore::set_local_dir_for_test(Some(machine.path().to_path_buf()));
+        std::fs::write(
+            machine.path().join("shared.lua"),
+            "function shared() return 'from machine' end",
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let wb = dir.path().join("plain.xlsx");
+        minimal_xlsx(&wb);
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+
+        // Nothing embedded, machine scripts available: nothing runs until enabled here.
+        assert!(
+            matches!(rt.status(&wb), Status::MachineOnly { names } if names == ["local/shared.lua"])
+        );
+        assert!(matches!(
+            rt.call(Some(&wb), "shared", &[]),
+            Err(CallError::MachineOnly)
+        ));
+        assert_eq!(
+            rt.eval(Some(&wb), "1 + 2", &[]).unwrap(),
+            Value::Num(3.0),
+            "the sandbox still works"
+        );
+        rt.enable(&wb).unwrap();
+        assert!(matches!(rt.status(&wb), Status::Active { .. }));
+        assert_eq!(
+            rt.call(Some(&wb), "shared", &[]).unwrap(),
+            Value::Str("from machine".into())
+        );
+
+        // Editing a machine script takes effect (once the folder is looked at again).
+        std::fs::write(
+            machine.path().join("shared.lua"),
+            "function shared() return 'edited' end function more() return 1 end",
+        )
+        .unwrap();
+        rt.rescan_machine();
+        assert_eq!(
+            rt.call(Some(&wb), "shared", &[]).unwrap(),
+            Value::Str("edited".into())
+        );
+        assert_eq!(rt.call(Some(&wb), "more", &[]).unwrap(), Value::Num(1.0));
+
+        // Disabling puts it back; with no machine scripts left there is nothing to enable.
+        rt.revoke(&wb).unwrap();
+        assert!(matches!(rt.status(&wb), Status::MachineOnly { .. }));
+        std::fs::remove_file(machine.path().join("shared.lua")).unwrap();
+        rt.rescan_machine();
+        assert!(matches!(rt.status(&wb), Status::NoScripts));
+        assert!(rt.enable(&wb).is_err());
+        crate::dbstore::set_local_dir_for_test(None);
+    }
+
+    #[test]
+    fn machine_scripts_run_before_the_workbooks_own_and_only_after_it_is_enabled() {
+        let machine = tempfile::tempdir().unwrap();
+        crate::dbstore::set_local_dir_for_test(Some(machine.path().to_path_buf()));
+        std::fs::write(
+            machine.path().join("a_base.lua"),
+            "function base() return 10 end",
+        )
+        .unwrap();
+        let (_d, wb) = workbook_with("function mine() return base() + 1 end");
+        let mut rt = Runtime::new(TrustStore::ephemeral());
+        // The workbook's own scripts are untrusted: nothing, machine scripts included, has run.
+        assert!(matches!(rt.status(&wb), Status::Blocked { .. }));
+        assert!(matches!(
+            rt.call(Some(&wb), "base", &[]),
+            Err(CallError::Blocked)
+        ));
+        rt.enable(&wb).unwrap();
+        assert_eq!(rt.call(Some(&wb), "mine", &[]).unwrap(), Value::Num(11.0));
+        crate::dbstore::set_local_dir_for_test(None);
     }
 
     #[test]

@@ -317,9 +317,15 @@ Drag the panel's left edge to resize it. **Float** turns it into a tool window (
 closes it. There is deliberately **no script editor** in the panel.
 
 If the workbook was green or yellow, files you add or change are trusted too (they are your own work).
-A blocked workbook stays blocked until you enable it with the status button. Machine files are the user's
-own and are not subject to that: a workbook's scripts are what is trusted, and they may `require` machine
-modules once enabled.
+A blocked workbook stays blocked until you enable it with the status button.
+
+**Machine scripts.** The root `.lua` files of the machine folder run in every *enabled* workbook's Lua
+state, before the workbook's own scripts, so what they define is available to formulas and to the
+workbook's scripts; modules in sub-folders are loaded with `require`. A workbook with no scripts of its own
+still needs to be enabled before it runs machine scripts (so a workbook you receive cannot call your
+machine functions): while it is not, the button is green ("Lua: none here") and clicking it offers to run
+the machine scripts in this workbook; `LUA.CALL` says `#NOSCRIPTS` until then. Editing machine scripts in
+the panel takes effect at once; edits made outside Excel are noticed within about a second.
 
 ## Editing scripts in your own editor
 

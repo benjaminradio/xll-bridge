@@ -442,6 +442,10 @@ pub extern "system" fn LuaStatus() -> *mut Xloper12 {
         };
         let s = with_runtime(|rt| match rt.status(&wb) {
             Status::NoScripts => "no Lua scripts".to_owned(),
+            Status::MachineOnly { names } => format!(
+                "no scripts in this workbook; {} machine script(s) can be enabled with the Lua ribbon button",
+                names.len()
+            ),
             Status::Blocked { names } => {
                 format!(
                     "{} script(s) BLOCKED - use the Lua ribbon button",

@@ -49,6 +49,15 @@ pub fn view(status: &Status) -> View {
             screentip: "No Lua scripts".into(),
             supertip: "This workbook has no embedded Lua scripts.".into(),
         },
+        Status::MachineOnly { names } => View {
+            light: Light::Green,
+            label: "Lua: none here".into(),
+            screentip: "No Lua scripts in this workbook".into(),
+            supertip: format!(
+                "This workbook has no scripts of its own, but the machine folder has:\n{}\n\nClick to run them in this workbook.",
+                list(names)
+            ),
+        },
         Status::Active { names } => View {
             light: Light::Yellow,
             label: "Lua: running".into(),

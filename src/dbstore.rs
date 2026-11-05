@@ -25,9 +25,86 @@ pub const FLUSH_AFTER: Duration = Duration::from_millis(1500);
 
 const DB_EXTS: [&str; 3] = [".db", ".sqlite", ".sqlite3"];
 
+#[cfg(test)]
+thread_local! {
+    static LOCAL_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests point the machine folder at a temporary one (for the current thread only).
+#[cfg(test)]
+pub fn set_local_dir_for_test(dir: Option<PathBuf>) {
+    LOCAL_OVERRIDE.with(|o| *o.borrow_mut() = dir);
+}
+
 /// `%APPDATA%\xll-bridge\local`: machine Lua modules and databases.
 pub fn local_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(d) = LOCAL_OVERRIDE.with(|o| o.borrow().clone()) {
+        return Some(d);
+    }
     crate::trust::TrustStore::default_path().and_then(|p| p.parent().map(|d| d.join("local")))
+}
+
+/// The root-level `.lua` files of the machine folder, in name order. They run in every enabled
+/// workbook's Lua state before the workbook's own scripts.
+pub struct MachineScript {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
+fn machine_script_paths() -> Vec<(String, PathBuf)> {
+    let Some(dir) = local_dir() else {
+        return Vec::new();
+    };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found: Vec<(String, PathBuf)> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_str()?.to_owned();
+            let is_file = e.file_type().ok()?.is_file();
+            (is_file && name.to_ascii_lowercase().ends_with(".lua") && !name.starts_with('.'))
+                .then(|| (name, e.path()))
+        })
+        .collect();
+    found.sort_by_key(|(n, _)| n.to_ascii_lowercase());
+    found.truncate(64);
+    found
+}
+
+/// Names of the machine scripts (cheap: no file is read).
+pub fn machine_script_names() -> Vec<String> {
+    machine_script_paths().into_iter().map(|(n, _)| n).collect()
+}
+
+pub fn machine_scripts() -> Vec<MachineScript> {
+    machine_script_paths()
+        .into_iter()
+        .filter_map(|(name, p)| {
+            let meta = std::fs::metadata(&p).ok()?;
+            if meta.len() > vfs::MAX_FILE_BYTES as u64 {
+                return None;
+            }
+            Some(MachineScript {
+                name,
+                data: std::fs::read(&p).ok()?,
+            })
+        })
+        .collect()
+}
+
+/// A fingerprint of the machine scripts (names, sizes, modification times) for noticing edits.
+pub fn machine_stamp() -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for (name, path) in machine_script_paths() {
+        let meta = std::fs::metadata(&path).ok();
+        name.hash(&mut h);
+        meta.as_ref().map(|m| m.len()).hash(&mut h);
+        meta.and_then(|m| m.modified().ok()).hash(&mut h);
+    }
+    h.finish()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -161,6 +161,14 @@ impl LuaHost {
             None => None,
         };
         configure_package_path(&lua, ctx.workbook, native.as_deref())?;
+        // Machine scripts (the root `.lua` files of %APPDATA%\xll-bridge\local) come first, so a
+        // workbook's own scripts can use what they define.
+        for f in crate::dbstore::machine_scripts() {
+            lua.load(strip_bom(&f.data))
+                .set_name(format!("=local/{}", f.name))
+                .set_mode(ChunkMode::Text)
+                .exec()?;
+        }
         for f in bundle.root_scripts() {
             lua.load(strip_bom(&f.data))
                 .set_name(format!("={}", f.path))
