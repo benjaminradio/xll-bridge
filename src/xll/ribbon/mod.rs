@@ -89,6 +89,23 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
             <button id="rollEndBack" label="Shrink end by 1" tag="end:-1" onAction="OnRegionRoll"/>
             <button id="rollBothBack" label="Slide the window back by 1" tag="both:-1" onAction="OnRegionRoll"/>
           </menu>
+          <menu id="menuRegionRules" size="large" label="Rules" imageMso="TableDesign"
+                screentip="Roll rules" supertip="Choose how the formula regions in your selection follow a workbook roll: the start moves (forecast), the end extends (actuals), the window slides (rolling forecast), or they stay put.">
+            <button id="ruleNone" label="Does not roll" tag="none" onAction="OnRegionRule"/>
+            <button id="ruleStart" label="Move start (forecast); old cells become values" tag="start" onAction="OnRegionRule"/>
+            <button id="ruleStartKeep" label="Move start (forecast); old cells keep formulas" tag="start:keep" onAction="OnRegionRule"/>
+            <button id="ruleEnd" label="Extend end (actuals)" tag="end" onAction="OnRegionRule"/>
+            <button id="ruleSlide" label="Slide window (rolling forecast); old cells become values" tag="slide" onAction="OnRegionRule"/>
+            <button id="ruleSlideKeep" label="Slide window (rolling forecast); old cells keep formulas" tag="slide:keep" onAction="OnRegionRule"/>
+          </menu>
+          <menu id="menuRegionRollAll" size="large" label="Roll all" imageMso="RightArrow2"
+                screentip="Roll every region by its rule" supertip="Roll every formula region in the workbook that has a rule, each by its own rule. Regions with no rule stay as they are.">
+            <button id="rollAllFwd" label="Roll all forward by 1" tag="1" onAction="OnRegionRollAll"/>
+            <button id="rollAllBack" label="Roll all back by 1" tag="-1" onAction="OnRegionRollAll"/>
+          </menu>
+          <button id="btnRegionReport" size="normal" label="List" imageMso="ViewsDatasheetView"
+                  screentip="List formula regions" supertip="Write every region with its address, size and roll rule to a 'Region rules' sheet."
+                  onAction="OnRegionReport"/>
           <button id="btnRegionRemove" size="normal" label="Remove" imageMso="Delete"
                   screentip="Remove the formula region" supertip="Stop tracking the region around the active cell. Its cells keep their formulas."
                   onAction="OnRegionRemove"/>
@@ -102,7 +119,7 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
 </customUI>"#;
 
 // IDispatch ids for the ribbon callbacks (names must match RIBBON_XML).
-const CALLBACKS: [(&str, i32); 18] = [
+const CALLBACKS: [(&str, i32); 21] = [
     ("OnRibbonLoad", 1),
     ("GetLabel", 2),
     ("GetScreentip", 3),
@@ -121,6 +138,9 @@ const CALLBACKS: [(&str, i32); 18] = [
     ("OnRegionRoll", 16),
     ("OnRegionOverwrite", 17),
     ("GetRegionOverwrite", 18),
+    ("OnRegionRule", 19),
+    ("OnRegionRollAll", 20),
+    ("OnRegionReport", 21),
 ];
 
 #[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
@@ -828,6 +848,27 @@ impl IDispatch_Impl for Addin_Impl {
                         }
                     }
                 }
+                19 | 20 => {
+                    if params.cArgs >= 1 && !params.rgvarg.is_null() {
+                        // SAFETY: at least one argument present.
+                        let tag = IDispatch::try_from(unsafe { &*params.rgvarg })
+                            .ok()
+                            .and_then(|c| dispatch::get(&c, "Tag").ok())
+                            .and_then(|v| bstr_of(&v));
+                        if let (Some(tag), Some(app)) = (tag, app()) {
+                            if id == 19 {
+                                regions::ui_rule(&app, &tag);
+                            } else {
+                                regions::ui_roll_all(&app, &tag);
+                            }
+                        }
+                    }
+                }
+                21 => {
+                    if let Some(app) = app() {
+                        regions::ui_report(&app);
+                    }
+                }
                 17 => {
                     // onAction(control, pressed): the last declared parameter comes first.
                     if params.cArgs >= 1 && !params.rgvarg.is_null() {
@@ -1008,8 +1049,8 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 22,
-            "onLoad + 5 on the status button + refresh + sync + files + the macro menu + 4 region buttons + 6 roll items + the overwrite toggle (2)"
+            checked, 31,
+            "onLoad + 5 on the status button + refresh + sync + files + the macro menu + 4 region buttons + 6 roll items + the overwrite toggle (2) + 6 rule items + 2 roll-all items + list"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));
     }

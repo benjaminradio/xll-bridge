@@ -114,6 +114,11 @@ pub enum RegionOp {
     Remove {
         name: String,
     },
+    /// Set how the region follows a workbook-wide roll-forward.
+    SetRule {
+        name: String,
+        rule: crate::regions::Rule,
+    },
 }
 
 impl Op {
@@ -450,6 +455,7 @@ pub(crate) mod fake {
         pub tables: Mutex<HashMap<String, String>>,
         /// Formula regions: label -> (sheet, (row1, col1, row2, col2)), 0-based.
         pub regions: Mutex<BTreeMap<String, (String, Bounds)>>,
+        pub rules: Mutex<BTreeMap<String, crate::regions::Rule>>,
     }
 
     /// (row1, col1, row2, col2), 0-based.
@@ -504,6 +510,7 @@ pub(crate) mod fake {
                 log: Mutex::default(),
                 tables: Mutex::default(),
                 regions: Mutex::default(),
+                rules: Mutex::default(),
             })
         }
 
@@ -517,6 +524,13 @@ pub(crate) mod fake {
                 address: format!("{}!{}:{}", quote_sheet(sheet), a1(*r1, *c1), a1(*r2, *c2)),
                 rows: r2 - r1 + 1,
                 cols: c2 - c1 + 1,
+                rule: self
+                    .rules
+                    .lock()
+                    .unwrap()
+                    .get(label)
+                    .copied()
+                    .unwrap_or_default(),
             })
         }
 
@@ -599,7 +613,13 @@ pub(crate) mod fake {
                     }
                 }
                 RegionOp::Check { name } => self.check_region(&name).map(Reply::Report),
+                RegionOp::SetRule { name, rule } => {
+                    self.region_info(&name)?;
+                    self.rules.lock().unwrap().insert(name.clone(), rule);
+                    Ok(Reply::Regions(vec![self.region_info(&name)?]))
+                }
                 RegionOp::Remove { name } => {
+                    self.rules.lock().unwrap().remove(&name);
                     self.regions
                         .lock()
                         .unwrap()

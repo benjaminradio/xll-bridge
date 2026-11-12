@@ -296,6 +296,15 @@ with someone who has no add-in; nothing has to be applied or stripped first.
   *Extend end by 1* (actuals gain a period) and *Slide the window by 1* (a rolling forecast) work along the
   region's long side, and the matching "back" actions undo them. Cells that leave a region can be turned into
   values (the usual roll-forward) or left as formulas, and cells it grows into get the anchor's formula.
+* **Rules and Roll all**: each region can carry a **roll rule**: *does not roll*, *move start* (forecast),
+  *extend end* (actuals) or *slide window* (rolling forecast), with *old cells become values* or *keep
+  formulas* for the two that drop cells. Select cells over any number of regions (a whole sheet, say) and
+  choose a rule under **Rules**: every region the selection touches gets it. The rule is stored in the comment
+  of the region's hidden name, so it travels with the workbook. **Roll all ▸ forward by 1** then rolls the
+  whole workbook in one click, each region by its own rule; regions with no rule stay put. It shows how many
+  regions will move which way first, and regions blocked by hardcodes where they grow are listed and rolled
+  only if you agree. **List** writes every region with its address, size and rule to a "Region rules" sheet
+  so you can review the rules of hundreds of regions at a glance.
 * **Overwrite without asking** (a toggle in the group) replaces hardcodes and one-off formulas without
   listing them first, to reset a file that has many.
 
@@ -308,6 +317,8 @@ r:apply{ overwrite = false } -- refuses (listing the cells) if something else is
 r:roll_start(1, { freeze = true })   -- forecast: the first period became an actual (freeze = to values)
 r:extend_end(1)              -- actuals: one more period
 r:roll(1)                    -- rolling forecast: slide the window
+r:set_rule("slide", { freeze = true })   -- "none" | "start" | "end" | "slide"; r:rule() reads it back
+xl.region.roll_all(1)        -- every region with a rule, each by its own: { rolled = {...}, failed = {...} }
 r:remove()
 xl.region.list()  xl.region.get("dates")  xl.region.at("Forecast!G5")
 ```

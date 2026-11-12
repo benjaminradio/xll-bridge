@@ -10,10 +10,12 @@ use windows::Win32::System::Variant::VARIANT;
 
 use super::cells::{
     com, count_of, describe, dispatch_of, open_book, read_variant, resolve, string_of,
+    write_variant,
 };
 use super::dispatch;
 use crate::regions::{
-    self, Axis, CheckReport, DevKind, Rect, RegionInfo, default_axis, label_of, name_for,
+    self, Axis, CheckReport, DevKind, Rect, RegionInfo, RollMode, Rule, default_axis, label_of,
+    name_for,
 };
 use crate::value::Value;
 use crate::xlapi::{RegionOp, Reply, XlError, describe_deviations};
@@ -52,6 +54,7 @@ pub(super) fn all(wb: &IDispatch) -> Result<Vec<Region>, XlError> {
         let Ok(info) = describe(&range, &book_of(&range), false) else {
             continue;
         };
+        let rule = rule_of(&nm);
         out.push(Region {
             label: label.to_owned(),
             name: nm,
@@ -61,10 +64,24 @@ pub(super) fn all(wb: &IDispatch) -> Result<Vec<Region>, XlError> {
                 address: info.address,
                 rows: info.rows,
                 cols: info.cols,
+                rule,
             },
         });
     }
     Ok(out)
+}
+
+/// The roll rule kept in the comment of a region's hidden name.
+fn rule_of(name: &IDispatch) -> Rule {
+    string_of(dispatch::get(name, "Comment"))
+        .map(|c| Rule::parse(&c))
+        .unwrap_or_default()
+}
+
+pub(super) fn set_rule(r: &Region, rule: Rule) -> Result<(), XlError> {
+    dispatch::put(&r.name, "Comment", VARIANT::from(rule.encode().as_str()))
+        .map(drop)
+        .map_err(com)
 }
 
 fn find(wb: &IDispatch, label: &str) -> Result<Region, XlError> {
@@ -205,6 +222,7 @@ fn create(wb: &IDispatch, range: &IDispatch, label: Option<String>) -> Result<Re
             address: info.address,
             rows: info.rows,
             cols: info.cols,
+            rule: Rule::default(),
         },
         label,
         name: nm,
@@ -314,6 +332,7 @@ pub(super) fn roll(
             address: info.address,
             rows: info.rows,
             cols: info.cols,
+            rule: r.info.rule,
         },
     })
 }
@@ -376,6 +395,12 @@ pub(super) fn run(app: &IDispatch, workbook: &Path, op: RegionOp) -> Result<Repl
         RegionOp::Remove { name } => {
             remove(&find(&wb, &name)?)?;
             Ok(Reply::Done)
+        }
+        RegionOp::SetRule { name, rule } => {
+            let mut r = find(&wb, &name)?;
+            set_rule(&r, rule)?;
+            r.info.rule = rule;
+            Ok(one(&r))
         }
     }
 }
@@ -655,5 +680,235 @@ pub(super) fn ui_roll(app: &IDispatch, tag: &str) {
     match go() {
         Ok(t) => set_status_bar(app, &t),
         Err(e) => fail(app, "Could not roll the formula region.", &e),
+    }
+}
+
+// ------------------------------------------------------------------ rules and the workbook roll
+
+fn rule_for_tag(tag: &str) -> Result<Rule, String> {
+    let (word, keep) = match tag.strip_suffix(":keep") {
+        Some(w) => (w, true),
+        None => (tag, false),
+    };
+    let mode = RollMode::from_word(word).ok_or("unknown rule")?;
+    Ok(Rule {
+        mode,
+        freeze: !keep,
+    })
+}
+
+/// "Rule": the regions touched by the selection get the rule in `tag`
+/// (`none`, `start`, `end`, `slide`; `start:keep` / `slide:keep` leave old cells as formulas).
+pub(super) fn ui_rule(app: &IDispatch, tag: &str) {
+    let go = || -> Result<String, String> {
+        let rule = rule_for_tag(tag)?;
+        let wb = active_workbook(app)?;
+        let sel = dispatch_of(dispatch::get(app, "Selection"))
+            .map_err(|_| "Select cells inside the formula regions first.".to_owned())?;
+        let mut n = 0;
+        for r in all(&wb).map_err(|e| e.message)? {
+            if overlaps(app, &sel, &r.range) {
+                set_rule(&r, rule).map_err(|e| e.message)?;
+                n += 1;
+            }
+        }
+        if n == 0 {
+            return Err(
+                "The selection does not touch any formula region. Select cells inside one or more regions."
+                    .into(),
+            );
+        }
+        Ok(format!("{n} formula region(s) now {}", rule.describe()))
+    };
+    match go() {
+        Ok(t) => set_status_bar(app, &t),
+        Err(e) => fail(app, "Could not set the roll rule.", &e),
+    }
+}
+
+fn plural(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// "Roll all": every region that has a rule moves by `n` periods (`1` or `-1`), each by its own
+/// rule. Regions blocked by hardcodes in their way are listed and rolled only if the user agrees.
+pub(super) fn ui_roll_all(app: &IDispatch, tag: &str) {
+    let go = || -> Result<String, String> {
+        let n: i32 = tag.parse().map_err(|_| "unknown roll amount".to_owned())?;
+        let wb = active_workbook(app)?;
+        let regs: Vec<Region> = all(&wb)
+            .map_err(|e| e.message)?
+            .into_iter()
+            .filter(|r| r.info.rule.mode != RollMode::None)
+            .collect();
+        if regs.is_empty() {
+            return Err(
+                "No formula region has a roll rule yet. Select regions and choose a rule under Rules."
+                    .into(),
+            );
+        }
+        let count = |m: RollMode| regs.iter().filter(|r| r.info.rule.mode == m).count();
+        let text = format!(
+            "Roll {} by {n:+}:\n\n  {} move their start\n  {} extend their end\n  {} slide their window\n\nThe regions without a rule stay as they are.",
+            plural(regs.len(), "formula region", "formula regions"),
+            count(RollMode::Start),
+            count(RollMode::End),
+            count(RollMode::Slide)
+        );
+        if !message(
+            excel_hwnd(app),
+            &text,
+            "Roll all formula regions",
+            MB_YESNO | MB_ICONINFORMATION,
+        ) {
+            return Ok("Nothing changed".into());
+        }
+        let overwrite = crate::settings::load().overwrite_regions;
+        let _ = dispatch::put(app, "ScreenUpdating", VARIANT::from(false));
+        let mut rolled = 0usize;
+        let mut blocked: Vec<(Region, String)> = Vec::new();
+        let mut failed: Vec<String> = Vec::new();
+        for r in regs {
+            let (start, end) = r.info.rule.steps(n);
+            match roll(&r, start, end, r.info.rule.freeze, overwrite) {
+                Ok(_) => rolled += 1,
+                Err(e) if is_blocked(&e) => blocked.push((r, e.message)),
+                Err(e) => failed.push(format!("{}: {}", r.label, e.message)),
+            }
+        }
+        if !blocked.is_empty() {
+            let names: Vec<&str> = blocked
+                .iter()
+                .take(15)
+                .map(|(r, _)| r.label.as_str())
+                .collect();
+            let more = blocked.len().saturating_sub(15);
+            let text = format!(
+                "{} cannot roll because cells where they grow hold something other than their formula:\n\n  {}{}\n\nReplace those cells with the region's formula and roll them?",
+                plural(blocked.len(), "region", "regions"),
+                names.join("\n  "),
+                if more > 0 {
+                    format!("\n  ... and {more} more")
+                } else {
+                    String::new()
+                }
+            );
+            if message(
+                excel_hwnd(app),
+                &text,
+                "Roll all formula regions",
+                MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+            ) {
+                for (r, _) in blocked.drain(..) {
+                    let (start, end) = r.info.rule.steps(n);
+                    match roll(&r, start, end, r.info.rule.freeze, true) {
+                        Ok(_) => rolled += 1,
+                        Err(e) => failed.push(format!("{}: {}", r.label, e.message)),
+                    }
+                }
+            }
+        }
+        let _ = dispatch::put(app, "ScreenUpdating", VARIANT::from(true));
+        let mut summary = format!(
+            "Rolled {}",
+            plural(rolled, "formula region", "formula regions")
+        );
+        if !blocked.is_empty() {
+            summary += &format!("; {} skipped", blocked.len());
+        }
+        if !failed.is_empty() {
+            let shown: Vec<&str> = failed.iter().take(10).map(String::as_str).collect();
+            fail(
+                app,
+                &format!(
+                    "{} could not be rolled:",
+                    plural(failed.len(), "region", "regions")
+                ),
+                &shown.join("\n"),
+            );
+        }
+        Ok(summary)
+    };
+    let result = go();
+    let _ = dispatch::put(app, "ScreenUpdating", VARIANT::from(true));
+    match result {
+        Ok(t) => set_status_bar(app, &t),
+        Err(e) => fail(app, "Could not roll the formula regions.", &e),
+    }
+}
+
+/// "Report": a sheet listing every region with its address, size and rule, to review them.
+pub(super) fn ui_report(app: &IDispatch) {
+    let go = || -> Result<String, String> {
+        let wb = active_workbook(app)?;
+        let regs = all(&wb).map_err(|e| e.message)?;
+        if regs.is_empty() {
+            return Err("This workbook has no formula regions.".into());
+        }
+        let sheets = dispatch_of(dispatch::get(&wb, "Worksheets")).map_err(|e| e.message)?;
+        let ws = match dispatch_of(dispatch::get_with(
+            &sheets,
+            "Item",
+            &[VARIANT::from("Region rules")],
+        )) {
+            Ok(ws) => {
+                let cells = dispatch_of(dispatch::get(&ws, "Cells")).map_err(|e| e.message)?;
+                dispatch::call(&cells, "ClearContents", &[]).map_err(|e| com(e).message)?;
+                ws
+            }
+            Err(_) => {
+                let ws = dispatch_of(dispatch::call(&sheets, "Add", &[])).map_err(|e| e.message)?;
+                dispatch::put(&ws, "Name", VARIANT::from("Region rules"))
+                    .map_err(|e| com(e).message)?;
+                ws
+            }
+        };
+        let s = |t: &str| Value::Str(t.to_owned());
+        let mut data = vec![
+            s("Region"),
+            s("Address"),
+            s("Rows"),
+            s("Columns"),
+            s("Rule"),
+            s("Old cells"),
+        ];
+        for r in &regs {
+            data.push(s(&r.label));
+            data.push(s(&r.info.address));
+            data.push(Value::Num(f64::from(r.info.rows)));
+            data.push(Value::Num(f64::from(r.info.cols)));
+            data.push(s(r.info.rule.mode.word()));
+            data.push(s(match r.info.rule.mode {
+                RollMode::None | RollMode::End => "",
+                _ if r.info.rule.freeze => "values",
+                _ => "formulas",
+            }));
+        }
+        let table = Value::Array(crate::value::Array::new(regs.len() + 1, 6, data));
+        let a1 = dispatch_of(dispatch::get_with(&ws, "Range", &[VARIANT::from("A1")]))
+            .map_err(|e| e.message)?;
+        let target = dispatch_of(dispatch::get_with(
+            &a1,
+            "Resize",
+            &[VARIANT::from(regs.len() as i32 + 1), VARIANT::from(6i32)],
+        ))
+        .map_err(|e| e.message)?;
+        dispatch::put(
+            &target,
+            "Value2",
+            write_variant(&table).map_err(|e| e.message)?,
+        )
+        .map_err(|e| com(e).message)?;
+        let cols = dispatch_of(dispatch::get(&ws, "Columns")).map_err(|e| e.message)?;
+        let _ = dispatch::call(&cols, "AutoFit", &[]);
+        let _ = dispatch::call(&ws, "Activate", &[]);
+        Ok(format!(
+            "Listed {} on the 'Region rules' sheet",
+            plural(regs.len(), "formula region", "formula regions")
+        ))
+    };
+    match go() {
+        Ok(t) => set_status_bar(app, &t),
+        Err(e) => fail(app, "Could not list the formula regions.", &e),
     }
 }

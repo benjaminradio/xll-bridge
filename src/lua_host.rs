@@ -1099,6 +1099,38 @@ impl UserData for LuaRegion {
                 this.roll(n, n, &opts)
             },
         );
+        // region:rule() -> "slide", freeze   /   region:set_rule("start" | "end" | "slide" | "none"
+        // [, { freeze = false }]): how xl.region.roll_all moves this region.
+        methods.add_method("rule", |_, this, ()| {
+            let r = this.info.borrow().rule;
+            Ok((r.mode.word().to_owned(), r.freeze))
+        });
+        methods.add_method(
+            "set_rule",
+            |_, this, (mode, opts): (String, Option<mlua::Table>)| {
+                let mode = crate::regions::RollMode::from_word(&mode).ok_or_else(|| {
+                    mlua::Error::runtime("the rule is 'none', 'start', 'end' or 'slide'")
+                })?;
+                let freeze = match &opts {
+                    Some(t) => !matches!(t.get::<LV>("freeze")?, LV::Boolean(false)),
+                    None => true,
+                };
+                let reply = region_call(
+                    &this.api,
+                    &this.workbook,
+                    xlapi::RegionOp::SetRule {
+                        name: this.name(),
+                        rule: crate::regions::Rule { mode, freeze },
+                    },
+                )?;
+                if let Reply::Regions(mut v) = reply
+                    && v.len() == 1
+                {
+                    *this.info.borrow_mut() = v.remove(0);
+                }
+                Ok(())
+            },
+        );
         methods.add_method("remove", |_, this, ()| {
             region_call(
                 &this.api,
@@ -1184,6 +1216,51 @@ fn install_region_api(lua: &Lua, workbook: &Path, api: Option<Arc<dyn XlApi>>) -
                 workbook: w.clone(),
                 info: Rc::new(RefCell::new(info)),
             })
+        })?,
+    )?;
+
+    // xl.region.roll_all(n = 1 [, { overwrite = false }]) -> { rolled = { names }, failed = { {name, error} } }
+    // Rolls every region that has a rule by n periods, each by its own rule.
+    let (a, w) = (Arc::clone(&api), wb.clone());
+    t.set(
+        "roll_all",
+        lua.create_function(move |lua, (n, opts): (Option<i32>, Option<mlua::Table>)| {
+            let n = n.unwrap_or(1);
+            let overwrite = bool_opt(&opts, "overwrite")?;
+            let Reply::Regions(list) = region_call(&a, &w, xlapi::RegionOp::List)? else {
+                return Err(mlua::Error::runtime("unexpected reply from Excel"));
+            };
+            let (rolled, failed) = (lua.create_table()?, lua.create_table()?);
+            for info in list {
+                let (start, end) = info.rule.steps(n);
+                if info.rule.mode == crate::regions::RollMode::None {
+                    continue;
+                }
+                let result = region_call(
+                    &a,
+                    &w,
+                    xlapi::RegionOp::Roll {
+                        name: info.name.clone(),
+                        start,
+                        end,
+                        freeze: info.rule.freeze,
+                        overwrite,
+                    },
+                );
+                match result {
+                    Ok(_) => rolled.raw_push(info.name.as_str())?,
+                    Err(e) => {
+                        let f = lua.create_table()?;
+                        f.set("name", info.name.as_str())?;
+                        f.set("error", e.to_string())?;
+                        failed.raw_push(f)?;
+                    }
+                }
+            }
+            let out = lua.create_table()?;
+            out.set("rolled", rolled)?;
+            out.set("failed", failed)?;
+            Ok(out)
         })?,
     )?;
 
@@ -1936,6 +2013,72 @@ mod tests {
         assert_eq!(q("EVALUATE B", false), Value::Str("2:3:BU:7.0".into()));
         assert_eq!(q("EVALUATE A", true), Value::Str("3:3:BU:7.0".into()));
         assert!(cache.join("fabric-cache").is_dir());
+    }
+
+    #[test]
+    fn region_rules_drive_a_workbook_roll() {
+        use crate::xlapi::fake::MemGrid;
+        let g = MemGrid::new();
+        {
+            let mut s = g.sheets.lock().unwrap();
+            let d = s.get_mut("Data").unwrap();
+            for c in [1, 2, 3, 6, 7, 8] {
+                d.formulas.insert((0, c), "=RC[-1]+1".into());
+            }
+            // a second row of actuals and a fixed block
+            for c in [1, 2] {
+                d.formulas.insert((2, c), "=RC[-1]+1".into());
+                d.formulas.insert((4, c), "=RC[-1]+1".into());
+            }
+        }
+        let h = grid_host(
+            r#"
+            function setup()
+              xl.region.define("B1:D1", { name = "fc" }):set_rule("start")
+              xl.region.define("G1:I1", { name = "roll" }):set_rule("slide", { freeze = false })
+              xl.region.define("B3:C3", { name = "act" }):set_rule("end")
+              xl.region.define("B5:C5", { name = "fixed" })
+            end
+            function rules()
+              local out = {}
+              for _, r in ipairs(xl.region.list()) do
+                local m, f = r:rule()
+                out[#out + 1] = r:name() .. "=" .. m .. (f and "+" or "-")
+              end
+              table.sort(out)
+              return table.concat(out, " ")
+            end
+            function go()
+              local res = xl.region.roll_all(1)
+              local out = {}
+              for _, n in ipairs(res.rolled) do out[#out + 1] = n end
+              table.sort(out)
+              return table.concat(out, ",") .. " failed=" .. #res.failed
+            end
+            function where_are()
+              local out = {}
+              for _, r in ipairs(xl.region.list()) do out[#out + 1] = r:name() .. "@" .. r:address() end
+              table.sort(out)
+              return table.concat(out, " ")
+            end
+            function bad() return pcall(function() xl.region.get("fc"):set_rule("sideways") end) end
+            "#,
+            Arc::clone(&g),
+        );
+        h.call("setup", &[]).unwrap();
+        assert_eq!(
+            h.call("rules", &[]).unwrap(),
+            Value::Str("act=end+ fc=start+ fixed=none+ roll=slide-".into())
+        );
+        assert_eq!(
+            h.call("go", &[]).unwrap(),
+            Value::Str("act,fc,roll failed=0".into())
+        );
+        assert_eq!(
+            h.call("where_are", &[]).unwrap(),
+            Value::Str("act@Data!B3:D3 fc@Data!C1:D1 fixed@Data!B5:C5 roll@Data!H1:J1".into())
+        );
+        assert_eq!(h.call("bad", &[]).unwrap(), Value::Bool(false));
     }
 
     #[test]

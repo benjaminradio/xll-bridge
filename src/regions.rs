@@ -22,6 +22,106 @@ pub struct RegionInfo {
     pub address: String,
     pub rows: u32,
     pub cols: u32,
+    /// How the region follows a workbook-wide roll-forward.
+    pub rule: Rule,
+}
+
+/// How a region moves when the whole workbook rolls forward by one period.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RollMode {
+    /// Stays where it is.
+    #[default]
+    None,
+    /// The start moves (a forecast: its first period became an actual).
+    Start,
+    /// The end moves (actuals: one more period).
+    End,
+    /// Both move (a rolling forecast).
+    Slide,
+}
+
+impl RollMode {
+    pub fn word(self) -> &'static str {
+        match self {
+            RollMode::None => "none",
+            RollMode::Start => "start",
+            RollMode::End => "end",
+            RollMode::Slide => "slide",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Option<RollMode> {
+        match w.trim().to_ascii_lowercase().as_str() {
+            "none" | "fixed" | "" => Some(RollMode::None),
+            "start" | "forecast" => Some(RollMode::Start),
+            "end" | "actuals" | "extend" => Some(RollMode::End),
+            "slide" | "both" | "rolling" => Some(RollMode::Slide),
+            _ => None,
+        }
+    }
+}
+
+/// A region's roll rule; stored in the comment of its hidden name (`roll=slide;freeze=1`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Rule {
+    pub mode: RollMode,
+    /// Cells that leave the region become values (the usual roll-forward).
+    pub freeze: bool,
+}
+
+impl Default for Rule {
+    fn default() -> Self {
+        Rule {
+            mode: RollMode::None,
+            freeze: true,
+        }
+    }
+}
+
+impl Rule {
+    pub fn encode(self) -> String {
+        format!("roll={};freeze={}", self.mode.word(), u8::from(self.freeze))
+    }
+
+    /// Reads a name's comment; anything unreadable means the default (no rule).
+    pub fn parse(comment: &str) -> Rule {
+        let mut rule = Rule::default();
+        for part in comment.split(';') {
+            match part.trim().split_once('=') {
+                Some(("roll", w)) => rule.mode = RollMode::from_word(w).unwrap_or_default(),
+                Some(("freeze", v)) => rule.freeze = v.trim() != "0",
+                _ => {}
+            }
+        }
+        rule
+    }
+
+    /// `(start, end)` for rolling `n` periods forward (negative = back).
+    pub fn steps(self, n: i32) -> (i32, i32) {
+        match self.mode {
+            RollMode::None => (0, 0),
+            RollMode::Start => (n, 0),
+            RollMode::End => (0, n),
+            RollMode::Slide => (n, n),
+        }
+    }
+
+    pub fn describe(self) -> String {
+        match self.mode {
+            RollMode::None => "does not roll".into(),
+            RollMode::Start => format!("moves its start{}", self.freeze_note()),
+            RollMode::End => "extends its end".into(),
+            RollMode::Slide => format!("slides its window{}", self.freeze_note()),
+        }
+    }
+
+    fn freeze_note(self) -> &'static str {
+        if self.freeze {
+            " (old cells become values)"
+        } else {
+            " (old cells keep formulas)"
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,6 +362,7 @@ mod tests {
                 address: "S!A1".into(),
                 rows: 2,
                 cols: 3,
+                rule: Rule::default(),
             },
             anchor: String::new(),
             deviations: d,
@@ -319,6 +420,31 @@ mod tests {
         assert!(roll(r, c, Axis::Columns, 0, -10).is_err());
         assert!(roll(r, c, Axis::Columns, 3, -7).is_err());
         assert!(roll(r, c, Axis::Columns, 3, -6).is_ok());
+    }
+
+    #[test]
+    fn rules_round_trip_and_give_steps() {
+        let r = Rule {
+            mode: RollMode::Slide,
+            freeze: false,
+        };
+        assert_eq!(r.encode(), "roll=slide;freeze=0");
+        assert_eq!(Rule::parse(&r.encode()), r);
+        assert_eq!(Rule::parse(""), Rule::default());
+        assert_eq!(Rule::parse("junk;roll=bogus"), Rule::default());
+        assert_eq!(Rule::parse("roll=forecast").mode, RollMode::Start);
+        assert!(Rule::parse("roll=end").freeze);
+        assert_eq!(r.steps(1), (1, 1));
+        assert_eq!(r.steps(-1), (-1, -1));
+        let s = |m| Rule {
+            mode: m,
+            freeze: true,
+        };
+        assert_eq!(s(RollMode::Start).steps(1), (1, 0));
+        assert_eq!(s(RollMode::End).steps(1), (0, 1));
+        assert_eq!(s(RollMode::None).steps(1), (0, 0));
+        assert_eq!(RollMode::from_word("Rolling"), Some(RollMode::Slide));
+        assert_eq!(RollMode::from_word("nonsense"), None);
     }
 
     #[test]
