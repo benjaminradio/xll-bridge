@@ -287,12 +287,14 @@ The group's buttons, in order (each with a dropdown where there is one):
   that hold something else are listed and you are asked first) and is remembered as a hidden workbook name
   (`_xs_<label>`). Because Excel keeps names current, **inserting or deleting rows and columns keeps the
   region right**. The anchor's own formula is the definition, so there is no second copy of the text to go
-  stale. **Define is context sensitive: a selection that overlaps one existing region redefines it**
-  (like Remove then Define, but the region keeps its name and roll rule). Select the new, larger or smaller
-  block and click. If it starts before the old anchor, the new top-left cell takes the old anchor's formula
-  when it is blank (otherwise it is the new anchor); cells that drop out of a shortened region keep their
-  formulas. A selection that overlaps several regions is refused (Remove them first). A plain click gives a
-  new region that *does not roll*; the dropdown picks a roll rule (below) for it instead.
+  stale. **Define is context sensitive: a selection that starts at an existing region's anchor redefines
+  that region** (like Remove then Define, but the region keeps its name and roll rule). Select the new,
+  larger or smaller block from the same top-left cell and click; cells that drop out of a shortened region
+  keep their formulas. **The anchor never moves**: any other selection that overlaps a region (including one
+  that merely contains some region's anchor) is refused, so an accidental selection cannot swallow a region.
+  To move a region's anchor to the left or up, Remove it, move the formula, then Define the new block. A
+  plain click on a new block gives a region that *does not roll*; the dropdown picks a roll rule (below) for
+  it instead.
 * **Apply** (dropdown: **Apply All**) fills the region around the active cell, or every region, from its
   anchor again (use it after editing the anchor, or to repair one-offs). Cells that hold something else are
   listed first.

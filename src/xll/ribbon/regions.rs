@@ -201,7 +201,7 @@ fn create(wb: &IDispatch, range: &IDispatch, label: Option<String>) -> Result<Re
         }
         if overlaps(&app, range, &other.range) {
             return Err(XlError::new(format!(
-                "the range overlaps the formula region '{}'",
+                "the range overlaps the formula region '{}'. {OVERLAP_HINT}",
                 other.label
             )));
         }
@@ -230,33 +230,34 @@ fn create(wb: &IDispatch, range: &IDispatch, label: Option<String>) -> Result<Re
     })
 }
 
+const OVERLAP_HINT: &str = "To redefine a region, select a block that starts at its anchor (top-left cell). To move the anchor, Remove the region, move the formula, then Define again";
+
 /// Makes `range` a region and fills it from its anchor; on failure nothing is left behind.
 ///
-/// A range that overlaps exactly one existing region **redefines** that region (like removing it
-/// and defining the range, but keeping its name and roll rule); one that overlaps several is
-/// refused. The flag says whether it was a redefinition.
+/// A range that starts at the anchor of an existing region **redefines** that region (like
+/// removing it and defining the range, but keeping its name and roll rule); the anchor never
+/// moves. Any other range that overlaps a region is refused. The flag says whether it was a
+/// redefinition.
 pub(super) fn define(
     wb: &IDispatch,
     range: &IDispatch,
     label: Option<String>,
     overwrite: bool,
 ) -> Result<(Region, bool), XlError> {
-    let app = application(wb)?;
-    let mut hits: Vec<Region> = all(wb)?
+    let first = |r: &IDispatch| -> Result<String, XlError> {
+        let c = dispatch_of(dispatch::get_with(
+            r,
+            "Cells",
+            &[VARIANT::from(1i32), VARIANT::from(1i32)],
+        ))?;
+        range_address(&c)
+    };
+    let top = first(range)?;
+    let existing = all(wb)?
         .into_iter()
-        .filter(|r| overlaps(&app, range, &r.range))
-        .collect();
-    if hits.len() > 1 {
-        let names: Vec<&str> = hits.iter().take(6).map(|r| r.label.as_str()).collect();
-        return Err(XlError::new(format!(
-            "the selection overlaps {} formula regions ({}{}). Remove them first, or select just one",
-            hits.len(),
-            names.join(", "),
-            if hits.len() > 6 { ", ..." } else { "" }
-        )));
-    }
-    if let Some(old) = hits.pop() {
-        return redefine(old, range, overwrite).map(|r| (r, true));
+        .find(|r| first(&r.range).is_ok_and(|a| a == top));
+    if let Some(old) = existing {
+        return redefine(wb, old, range, overwrite).map(|r| (r, true));
     }
     let region = create(wb, range, label)?;
     if let Err(e) = apply(&region, overwrite) {
@@ -266,45 +267,33 @@ pub(super) fn define(
     Ok((region, false))
 }
 
-/// Points an existing region at a new range and fills it. A blank new anchor cell (the range
-/// starts before the old anchor) takes the old anchor's formula.
-fn redefine(old: Region, range: &IDispatch, overwrite: bool) -> Result<Region, XlError> {
+/// Points an existing region at a new range with the same anchor and fills it.
+fn redefine(
+    wb: &IDispatch,
+    old: Region,
+    range: &IDispatch,
+    overwrite: bool,
+) -> Result<Region, XlError> {
     let info = describe(range, &book_of(range), false)?;
     if u64::from(info.rows) * u64::from(info.cols) < 2 {
         return Err(XlError::new("a formula region needs at least two cells"));
     }
-    let old_anchor = check(&old).ok().map(|r| r.anchor);
-    let new_anchor = dispatch_of(dispatch::get_with(
-        range,
-        "Cells",
-        &[VARIANT::from(1i32), VARIANT::from(1i32)],
-    ))?;
-    let mut wrote_anchor = false;
-    if let Some(f) = &old_anchor
-        && grid(&new_anchor)?
-            .first()
-            .is_some_and(|v| regions::classify(v).0 == DevKind::Blank)
-    {
-        fill(&new_anchor, f)?;
-        wrote_anchor = true;
+    let app = application(wb)?;
+    for other in all(wb)? {
+        if other.label != old.label && overlaps(&app, range, &other.range) {
+            return Err(XlError::new(format!(
+                "the range overlaps the formula region '{}'. {OVERLAP_HINT}",
+                other.label
+            )));
+        }
     }
     let previous = string_of(dispatch::get(&old.name, "RefersTo")).ok();
-    let undo = |wrote: bool| {
-        if let Some(p) = &previous {
-            let _ = dispatch::put(&old.name, "RefersTo", VARIANT::from(p.as_str()));
-        }
-        if wrote {
-            let _ = dispatch::call(&new_anchor, "ClearContents", &[]);
-        }
-    };
-    if let Err(e) = dispatch::put(
+    dispatch::put(
         &old.name,
         "RefersTo",
         VARIANT::from(format!("={}", info.address).as_str()),
-    ) {
-        undo(wrote_anchor);
-        return Err(com(e));
-    }
+    )
+    .map_err(com)?;
     let region = Region {
         label: old.label.clone(),
         name: old.name.clone(),
@@ -318,7 +307,9 @@ fn redefine(old: Region, range: &IDispatch, overwrite: bool) -> Result<Region, X
         },
     };
     if let Err(e) = apply(&region, overwrite) {
-        undo(wrote_anchor);
+        if let Some(p) = previous {
+            let _ = dispatch::put(&old.name, "RefersTo", VARIANT::from(p.as_str()));
+        }
         return Err(e);
     }
     Ok(region)

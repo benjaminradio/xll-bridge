@@ -637,29 +637,15 @@ pub(crate) mod fake {
                     overwrite,
                 } => {
                     let (sheet, b @ (r1, c1, r2, c2)) = self.resolve(&address)?;
-                    // A selection that overlaps one existing region redefines it (keeping its name and
-                    // rule); one that overlaps several is refused.
-                    let hits: Vec<(String, Bounds)> = self
+                    // A range starting at an existing anchor redefines that region (name and rule
+                    // kept); any other overlap is refused below.
+                    let same_anchor = self
                         .regions
                         .lock()
                         .unwrap()
                         .iter()
-                        .filter(|(_, (s, (a, b2, c, d)))| {
-                            *s == sheet && r1 <= *c && r2 >= *a && c1 <= *d && c2 >= *b2
-                        })
-                        .map(|(l, (_, old))| (l.clone(), *old))
-                        .collect();
-                    if hits.len() > 1 {
-                        let names: Vec<&str> = hits.iter().map(|(l, _)| l.as_str()).collect();
-                        return Err(XlError::new(format!(
-                            "the range overlaps several formula regions ({}); remove them first",
-                            names.join(", ")
-                        )));
-                    }
-                    let same_anchor = hits.into_iter().next();
-                    let old_anchor = same_anchor
-                        .as_ref()
-                        .and_then(|(l, _)| self.check_region(l).ok().map(|r| r.anchor));
+                        .find(|(_, (s, (a, c, _, _)))| *s == sheet && *a == r1 && *c == c1)
+                        .map(|(l, (_, old))| (l.clone(), *old));
                     let label = match &same_anchor {
                         Some((l, _)) => l.clone(),
                         None => label.unwrap_or_else(|| format!("{}_{}", sheet, a1(r1, c1))),
@@ -687,22 +673,7 @@ pub(crate) mod fake {
                         .lock()
                         .unwrap()
                         .insert(label.clone(), (sheet.clone(), b));
-                    // A new, blank anchor cell takes the old anchor's formula.
-                    let mut wrote_anchor = false;
-                    if let Some(f) = old_anchor {
-                        let mut sheets = self.sheets.lock().unwrap();
-                        let s = sheets.get_mut(&sheet).unwrap();
-                        if !s.formulas.contains_key(&(r1, c1)) && !s.values.contains_key(&(r1, c1))
-                        {
-                            s.formulas.insert((r1, c1), f);
-                            wrote_anchor = true;
-                        }
-                    }
                     if let Err(e) = self.apply_region(&label, overwrite) {
-                        if wrote_anchor {
-                            let mut sheets = self.sheets.lock().unwrap();
-                            sheets.get_mut(&sheet).unwrap().formulas.remove(&(r1, c1));
-                        }
                         let mut regions = self.regions.lock().unwrap();
                         match same_anchor {
                             Some((_, old)) => regions.insert(label.clone(), (sheet.clone(), old)),

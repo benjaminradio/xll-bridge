@@ -2092,8 +2092,8 @@ mod tests {
               local m, o = r:rule()
               return r:name() .. "@" .. r:address() .. " " .. m
             end
-            function extend_left() return xl.region.define("A5:D5"):address() end
-            function shrink() return xl.region.define("A5:C5"):address() end
+            function extend_left() return pcall(function() xl.region.define("A5:D5") end) end
+            function shrink() return xl.region.define("B5:C5"):address() end
             function several() return pcall(function() xl.region.define("A3:E5") end) end
             function bad() return pcall(function() xl.region.get("fc"):set_rule("sideways") end) end
             "#,
@@ -2118,15 +2118,12 @@ mod tests {
             h.call("redefine", &[]).unwrap(),
             Value::Str("fixed@Data!B5:D5 none".into())
         );
-        // Starting before the old anchor: the blank new anchor takes its formula. Shrinking works
-        // the same way, and a range over several regions is refused.
-        assert_eq!(
-            h.call("extend_left", &[]).unwrap(),
-            Value::Str("Data!A5:D5".into())
-        );
+        // The anchor never moves: a range starting elsewhere that overlaps a region is refused,
+        // while shrinking from the same anchor redefines it.
+        assert_eq!(h.call("extend_left", &[]).unwrap(), Value::Bool(false));
         assert_eq!(
             h.call("shrink", &[]).unwrap(),
-            Value::Str("Data!A5:C5".into())
+            Value::Str("Data!B5:C5".into())
         );
         assert_eq!(h.call("several", &[]).unwrap(), Value::Bool(false));
     }
