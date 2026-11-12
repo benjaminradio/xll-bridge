@@ -287,9 +287,12 @@ The group's buttons, in order (each with a dropdown where there is one):
   that hold something else are listed and you are asked first) and is remembered as a hidden workbook name
   (`_xs_<label>`). Because Excel keeps names current, **inserting or deleting rows and columns keeps the
   region right**. The anchor's own formula is the definition, so there is no second copy of the text to go
-  stale. **To extend (or shrink) a region, select the larger block starting at the same anchor and click
-  Define again**: the region is redefined, keeping its name and rule. A plain click gives a region that
-  *does not roll*; the dropdown picks a roll rule (below) for it instead.
+  stale. **Define is context sensitive: a selection that overlaps one existing region redefines it**
+  (like Remove then Define, but the region keeps its name and roll rule). Select the new, larger or smaller
+  block and click. If it starts before the old anchor, the new top-left cell takes the old anchor's formula
+  when it is blank (otherwise it is the new anchor); cells that drop out of a shortened region keep their
+  formulas. A selection that overlaps several regions is refused (Remove them first). A plain click gives a
+  new region that *does not roll*; the dropdown picks a roll rule (below) for it instead.
 * **Apply** (dropdown: **Apply All**) fills the region around the active cell, or every region, from its
   anchor again (use it after editing the anchor, or to repair one-offs). Cells that hold something else are
   listed first.
@@ -303,15 +306,16 @@ The group's buttons, in order (each with a dropdown where there is one):
 * **List** writes every region with its address, size and rule to a "Region rules" sheet.
 * **Show**: *Highlight anchors*, *Outline regions* and *Clear highlights and outlines*. The marks are
   conditional formats, so a cell's own formatting is untouched and they follow inserted rows and columns.
-* **Remove** (dropdown: **Remove All** on this sheet) stops tracking the region (or every region on the
-  active sheet); the cells keep their formulas. Editing the cells of a region by hand is always allowed: the
+* **Remove** (dropdown: **Remove All** on this sheet) stops tracking every region whose **anchor is inside
+  the selection** (so a rough selection over several is enough; with none it takes the region around the
+  active cell, and Remove All takes every region on the active sheet). The cells keep their formulas. Editing the cells of a region by hand is always allowed: the
   next Check tells you what you changed.
 * **Overwrite without asking** (a toggle) replaces hardcodes and one-off formulas without listing them first,
   to reset a file that has many.
 
 **Roll rules.** Each region carries a rule: *does not roll*, *move start* (forecast), *extend end* (actuals)
-or *slide window* (rolling forecast). For *move start* and *slide window* a submenu says what becomes of the
-cells that leave the region: **old cells become values** (the usual roll-forward), **keep their formulas**, or
+or *slide window* (rolling forecast). For *move start*, *extend end* and *slide window* (extend end also drops cells
+when you roll backwards) a submenu says what becomes of the cells that leave the region: **old cells become values** (the usual roll-forward), **keep their formulas**, or
 **are cleared**. Choosing a rule from the Define dropdown with cells selected that are not in a region
 defines them as a region with that rule; with cells that touch existing regions (a whole sheet, say) it sets
 the rule on every region the selection touches. The rule is stored in the comment of the region's hidden

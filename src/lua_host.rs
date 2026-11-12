@@ -2092,6 +2092,9 @@ mod tests {
               local m, o = r:rule()
               return r:name() .. "@" .. r:address() .. " " .. m
             end
+            function extend_left() return xl.region.define("A5:D5"):address() end
+            function shrink() return xl.region.define("A5:C5"):address() end
+            function several() return pcall(function() xl.region.define("A3:E5") end) end
             function bad() return pcall(function() xl.region.get("fc"):set_rule("sideways") end) end
             "#,
             Arc::clone(&g),
@@ -2115,6 +2118,17 @@ mod tests {
             h.call("redefine", &[]).unwrap(),
             Value::Str("fixed@Data!B5:D5 none".into())
         );
+        // Starting before the old anchor: the blank new anchor takes its formula. Shrinking works
+        // the same way, and a range over several regions is refused.
+        assert_eq!(
+            h.call("extend_left", &[]).unwrap(),
+            Value::Str("Data!A5:D5".into())
+        );
+        assert_eq!(
+            h.call("shrink", &[]).unwrap(),
+            Value::Str("Data!A5:C5".into())
+        );
+        assert_eq!(h.call("several", &[]).unwrap(), Value::Bool(false));
     }
 
     #[test]
@@ -2151,7 +2165,6 @@ mod tests {
             function grow() local r = xl.region.get("dates") r:extend_end(3) return r:address() end
             function forecast() local r = xl.region.get("dates") r:roll_start(1) return r:address() end
             function gone() xl.region.get("dates"):remove() return #xl.region.list() end
-            function overlap() return pcall(function() xl.region.define("C1:D1") end) end
             "#,
             Arc::clone(&g),
         );
@@ -2170,7 +2183,6 @@ mod tests {
         assert_eq!(h.call("repair", &[]).unwrap(), Value::Bool(true));
         assert_eq!(h.call("where_is", &[]).unwrap(), Value::Str("dates".into()));
         assert_eq!(h.call("outside", &[]).unwrap(), Value::Bool(true));
-        assert_eq!(h.call("overlap", &[]).unwrap(), Value::Bool(false));
         // Rolling: slide the window by two, grow the end by three, move the start by one.
         assert_eq!(
             h.call("slide", &[]).unwrap(),

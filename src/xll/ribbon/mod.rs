@@ -82,7 +82,11 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
               <button id="ruleStartKeep" label="Old cells keep their formulas" tag="start:keep" onAction="OnRegionRule"/>
               <button id="ruleStartClear" label="Old cells are cleared" tag="start:clear" onAction="OnRegionRule"/>
             </menu>
-            <button id="ruleEnd" label="Extend end (actuals)" tag="end" onAction="OnRegionRule"/>
+            <menu id="ruleEndMenu" label="Extend end (actuals)">
+              <button id="ruleEnd" label="Old cells become values" tag="end" onAction="OnRegionRule"/>
+              <button id="ruleEndKeep" label="Old cells keep their formulas" tag="end:keep" onAction="OnRegionRule"/>
+              <button id="ruleEndClear" label="Old cells are cleared" tag="end:clear" onAction="OnRegionRule"/>
+            </menu>
             <menu id="ruleSlideMenu" label="Slide window (rolling forecast)">
               <button id="ruleSlide" label="Old cells become values" tag="slide" onAction="OnRegionRule"/>
               <button id="ruleSlideKeep" label="Old cells keep their formulas" tag="slide:keep" onAction="OnRegionRule"/>
@@ -138,7 +142,7 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
           </menu>
           <splitButton id="splitRegionRemove" size="normal">
             <button id="btnRegionRemove" label="Remove" imageMso="Delete"
-                    screentip="Remove the formula region" supertip="Stop tracking the region around the active cell. Its cells keep their formulas."
+                    screentip="Remove the formula region" supertip="Stop tracking the regions whose anchor (top-left cell) is in your selection, so a rough selection over several is enough; with none, the region around the active cell. The cells keep their formulas."
                     onAction="OnRegionRemove"/>
             <menu id="menuRegionRemove" label="Remove">
               <button id="removeAll" label="Remove All on this sheet" tag="remove:all" onAction="OnRegionAct"/>
@@ -1103,8 +1107,8 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 41,
-            "every callback attribute of the ribbon XML (41)"
+            checked, 43,
+            "every callback attribute of the ribbon XML (43)"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));
     }

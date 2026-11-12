@@ -140,7 +140,7 @@ impl Rule {
         match self.mode {
             RollMode::None => "does not roll".into(),
             RollMode::Start => format!("moves its start{}", self.old_note()),
-            RollMode::End => "extends its end".into(),
+            RollMode::End => format!("extends its end{}", self.old_note()),
             RollMode::Slide => format!("slides its window{}", self.old_note()),
         }
     }
