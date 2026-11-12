@@ -102,12 +102,12 @@ pub enum RegionOp {
         overwrite: bool,
     },
     /// Move the start / end of the region along its long side; new cells get the anchor's formula
-    /// and, with `freeze`, cells that leave it are turned into values.
+    /// and the cells that leave it become values, stay as they are or are cleared (`old`).
     Roll {
         name: String,
         start: i32,
         end: i32,
-        freeze: bool,
+        old: crate::regions::OldCells,
         overwrite: bool,
     },
     /// Forget the region; its cells stay as they are.
@@ -637,7 +637,18 @@ pub(crate) mod fake {
                     overwrite,
                 } => {
                     let (sheet, b @ (r1, c1, r2, c2)) = self.resolve(&address)?;
-                    let label = label.unwrap_or_else(|| format!("{}_{}", sheet, a1(r1, c1)));
+                    // The same anchor again: that region is redefined (resized), keeping its rule.
+                    let same_anchor = self
+                        .regions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(_, (s, (a, c, _, _)))| *s == sheet && *a == r1 && *c == c1)
+                        .map(|(l, (_, old))| (l.clone(), *old));
+                    let label = match &same_anchor {
+                        Some((l, _)) => l.clone(),
+                        None => label.unwrap_or_else(|| format!("{}_{}", sheet, a1(r1, c1))),
+                    };
                     let label = label_of(&name_for(&label).map_err(XlError::new)?)
                         .unwrap_or_default()
                         .to_owned();
@@ -660,9 +671,13 @@ pub(crate) mod fake {
                     self.regions
                         .lock()
                         .unwrap()
-                        .insert(label.clone(), (sheet, b));
+                        .insert(label.clone(), (sheet.clone(), b));
                     if let Err(e) = self.apply_region(&label, overwrite) {
-                        self.regions.lock().unwrap().remove(&label);
+                        let mut regions = self.regions.lock().unwrap();
+                        match same_anchor {
+                            Some((_, old)) => regions.insert(label.clone(), (sheet.clone(), old)),
+                            None => regions.remove(&label),
+                        };
                         return Err(e);
                     }
                     Ok(Reply::Regions(vec![self.region_info(&label)?]))
@@ -671,7 +686,7 @@ pub(crate) mod fake {
                     name,
                     start,
                     end,
-                    freeze,
+                    old,
                     overwrite,
                 } => {
                     let (sheet, (r1, c1, r2, c2)) = self
@@ -694,7 +709,7 @@ pub(crate) mod fake {
                         )
                     };
                     let anchor = self.check_region(&name)?.anchor;
-                    if freeze {
+                    if old != crate::regions::OldCells::Keep {
                         let mut sheets = self.sheets.lock().unwrap();
                         let s = sheets.get_mut(&sheet).unwrap();
                         for rect in &plan.leaving {
@@ -703,6 +718,9 @@ pub(crate) mod fake {
                                 for col in b..=d {
                                     // "Values": a formula becomes the (here: unknown) value.
                                     s.formulas.remove(&(r, col));
+                                    if old == crate::regions::OldCells::Clear {
+                                        s.values.remove(&(r, col));
+                                    }
                                 }
                             }
                         }

@@ -70,15 +70,52 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
                   onAction="OnFilesClick"/>
         </group>
         <group id="grpRegions" label="Formula regions">
-          <button id="btnRegionDefine" size="large" label="Define" imageMso="FillRight"
-                  screentip="Define a formula region" supertip="Select a block of cells whose top-left cell holds the formula, then click: the formula is filled across the block and the block is tracked, so inserted rows and columns keep it consistent."
-                  onAction="OnRegionDefine"/>
-          <button id="btnRegionCheck" size="large" label="Check" imageMso="ReviewAcceptChange"
-                  screentip="Check formula regions" supertip="Look for cells in any formula region that differ from the region's formula: hardcoded values and one-off formulas."
-                  onAction="OnRegionCheck"/>
-          <button id="btnRegionApply" size="large" label="Apply" imageMso="FillDown"
-                  screentip="Apply the formula region" supertip="Fill the region around the active cell from its top-left cell again. Cells that hold something else are listed first."
-                  onAction="OnRegionApply"/>
+          <splitButton id="splitRegionDefine" size="large">
+            <button id="btnRegionDefine" label="Define" imageMso="FillRight"
+                    screentip="Define a formula region" supertip="Select a block of cells whose top-left cell holds the formula, then click: the formula is filled across the block and the block is tracked, so inserted rows and columns keep it consistent. Select a block that starts at an existing region's anchor to redefine (extend or shrink) that region. A plain click defines a region that does not roll; the dropdown picks a roll rule."
+                    onAction="OnRegionDefine"/>
+            <menu id="menuRegionRules" label="Define with roll rule"
+                  screentip="Roll rule" supertip="Choose how the region rolls forward with Roll All. Choosing a rule with cells selected that are not in a region defines them as a region with that rule; with cells that touch existing regions it sets the rule on all of them.">
+            <button id="ruleNone" label="Does not roll" tag="none" onAction="OnRegionRule"/>
+            <menu id="ruleStartMenu" label="Move start (forecast)">
+              <button id="ruleStart" label="Old cells become values" tag="start" onAction="OnRegionRule"/>
+              <button id="ruleStartKeep" label="Old cells keep their formulas" tag="start:keep" onAction="OnRegionRule"/>
+              <button id="ruleStartClear" label="Old cells are cleared" tag="start:clear" onAction="OnRegionRule"/>
+            </menu>
+            <button id="ruleEnd" label="Extend end (actuals)" tag="end" onAction="OnRegionRule"/>
+            <menu id="ruleSlideMenu" label="Slide window (rolling forecast)">
+              <button id="ruleSlide" label="Old cells become values" tag="slide" onAction="OnRegionRule"/>
+              <button id="ruleSlideKeep" label="Old cells keep their formulas" tag="slide:keep" onAction="OnRegionRule"/>
+              <button id="ruleSlideClear" label="Old cells are cleared" tag="slide:clear" onAction="OnRegionRule"/>
+            </menu>
+            </menu>
+          </splitButton>
+          <splitButton id="splitRegionApply" size="large">
+            <button id="btnRegionApply" label="Apply" imageMso="FillDown"
+                    screentip="Apply the formula region" supertip="Fill the region around the active cell from its top-left cell again. Cells that hold something else are listed first."
+                    onAction="OnRegionApply"/>
+            <menu id="menuRegionApply" label="Apply">
+              <button id="applyAll" label="Apply All" tag="apply:all" onAction="OnRegionAct"
+                      screentip="Apply all formula regions" supertip="Fill every formula region in the workbook from its anchor again. Regions that hold other values or formulas are listed first."/>
+            </menu>
+          </splitButton>
+          <splitButton id="splitRegionCheck" size="large">
+            <button id="btnRegionCheck" label="Check All" imageMso="ReviewAcceptChange"
+                    screentip="Check all formula regions" supertip="Look for cells in any formula region that differ from the region's formula: hardcoded values and one-off formulas."
+                    onAction="OnRegionCheck"/>
+            <menu id="menuRegionCheck" label="Check">
+              <button id="checkOne" label="Check (region at the active cell)" tag="check:one" onAction="OnRegionAct"/>
+              <button id="checkDiff" label="Check All and highlight differences" tag="check:diff" onAction="OnRegionAct"/>
+            </menu>
+          </splitButton>
+          <splitButton id="splitRegionRollAll" size="large">
+            <button id="btnRegionRollAll" label="Roll All" imageMso="RightArrow2" tag="1" onAction="OnRegionRollAll"
+                    screentip="Roll every region by its rule" supertip="Roll every formula region in the workbook that has a roll rule forward by 1 period, each by its own rule. Regions that do not roll stay as they are."/>
+            <menu id="menuRegionRollAll" label="Roll All">
+              <button id="rollAllFwd" label="Roll All forward by 1" tag="1" onAction="OnRegionRollAll"/>
+              <button id="rollAllBack" label="Roll All back by 1" tag="-1" onAction="OnRegionRollAll"/>
+            </menu>
+          </splitButton>
           <menu id="menuRegionRoll" size="large" label="Roll" imageMso="RightArrow2"
                 screentip="Roll the formula region forward" supertip="Move the start (forecast: a period became an actual), extend the end (actuals: one more period), or slide both (rolling forecast) for the region around the active cell.">
             <button id="rollStartFwd" label="Move start forward by 1 (forecast)" tag="start:1" onAction="OnRegionRoll"/>
@@ -89,26 +126,24 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
             <button id="rollEndBack" label="Shrink end by 1" tag="end:-1" onAction="OnRegionRoll"/>
             <button id="rollBothBack" label="Slide the window back by 1" tag="both:-1" onAction="OnRegionRoll"/>
           </menu>
-          <menu id="menuRegionRules" size="large" label="Rules" imageMso="TableDesign"
-                screentip="Roll rules" supertip="Choose how the formula regions in your selection follow a workbook roll: the start moves (forecast), the end extends (actuals), the window slides (rolling forecast), or they stay put.">
-            <button id="ruleNone" label="Does not roll" tag="none" onAction="OnRegionRule"/>
-            <button id="ruleStart" label="Move start (forecast); old cells become values" tag="start" onAction="OnRegionRule"/>
-            <button id="ruleStartKeep" label="Move start (forecast); old cells keep formulas" tag="start:keep" onAction="OnRegionRule"/>
-            <button id="ruleEnd" label="Extend end (actuals)" tag="end" onAction="OnRegionRule"/>
-            <button id="ruleSlide" label="Slide window (rolling forecast); old cells become values" tag="slide" onAction="OnRegionRule"/>
-            <button id="ruleSlideKeep" label="Slide window (rolling forecast); old cells keep formulas" tag="slide:keep" onAction="OnRegionRule"/>
-          </menu>
-          <menu id="menuRegionRollAll" size="large" label="Roll all" imageMso="RightArrow2"
-                screentip="Roll every region by its rule" supertip="Roll every formula region in the workbook that has a rule, each by its own rule. Regions with no rule stay as they are.">
-            <button id="rollAllFwd" label="Roll all forward by 1" tag="1" onAction="OnRegionRollAll"/>
-            <button id="rollAllBack" label="Roll all back by 1" tag="-1" onAction="OnRegionRollAll"/>
-          </menu>
           <button id="btnRegionReport" size="normal" label="List" imageMso="ViewsDatasheetView"
                   screentip="List formula regions" supertip="Write every region with its address, size and roll rule to a 'Region rules' sheet."
                   onAction="OnRegionReport"/>
-          <button id="btnRegionRemove" size="normal" label="Remove" imageMso="Delete"
-                  screentip="Remove the formula region" supertip="Stop tracking the region around the active cell. Its cells keep their formulas."
-                  onAction="OnRegionRemove"/>
+          <menu id="menuRegionShow" size="normal" label="Show" imageMso="ShapeOutlineColorPicker"
+                screentip="Show formula regions" supertip="Mark the formula regions on the sheet: highlight the anchor cells, outline each region, or clear the marks. The marks are conditional formats, so cell formatting is untouched.">
+            <button id="showAnchors" label="Highlight anchors" tag="show:anchors" onAction="OnRegionAct"/>
+            <button id="showOutlines" label="Outline regions" tag="show:outlines" onAction="OnRegionAct"/>
+            <menuSeparator id="showSep"/>
+            <button id="showClear" label="Clear highlights and outlines" tag="show:clear" onAction="OnRegionAct"/>
+          </menu>
+          <splitButton id="splitRegionRemove" size="normal">
+            <button id="btnRegionRemove" label="Remove" imageMso="Delete"
+                    screentip="Remove the formula region" supertip="Stop tracking the region around the active cell. Its cells keep their formulas."
+                    onAction="OnRegionRemove"/>
+            <menu id="menuRegionRemove" label="Remove">
+              <button id="removeAll" label="Remove All on this sheet" tag="remove:all" onAction="OnRegionAct"/>
+            </menu>
+          </splitButton>
           <toggleButton id="tglRegionOverwrite" size="normal" label="Overwrite without asking"
                   screentip="Overwrite without asking" supertip="Replace hardcoded values and one-off formulas inside a region without listing them first. Useful to reset a file with many hardcodes."
                   getPressed="GetRegionOverwrite" onAction="OnRegionOverwrite"/>
@@ -119,7 +154,7 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
 </customUI>"#;
 
 // IDispatch ids for the ribbon callbacks (names must match RIBBON_XML).
-const CALLBACKS: [(&str, i32); 21] = [
+const CALLBACKS: [(&str, i32); 22] = [
     ("OnRibbonLoad", 1),
     ("GetLabel", 2),
     ("GetScreentip", 3),
@@ -141,6 +176,7 @@ const CALLBACKS: [(&str, i32); 21] = [
     ("OnRegionRule", 19),
     ("OnRegionRollAll", 20),
     ("OnRegionReport", 21),
+    ("OnRegionAct", 22),
 ];
 
 #[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
@@ -829,7 +865,7 @@ impl IDispatch_Impl for Addin_Impl {
                     if let Some(app) = app() {
                         match id {
                             12 => regions::ui_define(&app),
-                            13 => regions::ui_check(&app),
+                            13 => regions::ui_check(&app, "all"),
                             14 => regions::ui_apply(&app),
                             _ => regions::ui_remove(&app),
                         }
@@ -867,6 +903,24 @@ impl IDispatch_Impl for Addin_Impl {
                 21 => {
                     if let Some(app) = app() {
                         regions::ui_report(&app);
+                    }
+                }
+                22 => {
+                    if params.cArgs >= 1 && !params.rgvarg.is_null() {
+                        // SAFETY: at least one argument present.
+                        let tag = IDispatch::try_from(unsafe { &*params.rgvarg })
+                            .ok()
+                            .and_then(|c| dispatch::get(&c, "Tag").ok())
+                            .and_then(|v| bstr_of(&v));
+                        if let (Some(tag), Some(app)) = (tag, app()) {
+                            match tag.split_once(':') {
+                                Some(("check", t)) => regions::ui_check(&app, t),
+                                Some(("apply", _)) => regions::ui_apply_all(&app),
+                                Some(("remove", _)) => regions::ui_remove_all(&app),
+                                Some(("show", t)) => regions::ui_show(&app, t),
+                                _ => {}
+                            }
+                        }
                     }
                 }
                 17 => {
@@ -1049,8 +1103,8 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 31,
-            "onLoad + 5 on the status button + refresh + sync + files + the macro menu + 4 region buttons + 6 roll items + the overwrite toggle (2) + 6 rule items + 2 roll-all items + list"
+            checked, 41,
+            "every callback attribute of the ribbon XML (41)"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));
     }

@@ -1005,6 +1005,24 @@ fn bool_opt(opts: &Option<mlua::Table>, key: &str) -> mlua::Result<bool> {
     })
 }
 
+/// `{ old = "values" | "keep" | "clear" }`; the older `{ freeze = true/false }` still reads.
+/// Without either, cells that leave a region are left alone.
+fn old_opt(opts: &Option<mlua::Table>) -> mlua::Result<crate::regions::OldCells> {
+    use crate::regions::OldCells;
+    let Some(t) = opts else {
+        return Ok(OldCells::Keep);
+    };
+    if let LV::String(w) = t.get::<LV>("old")? {
+        let w = w.to_string_lossy();
+        return OldCells::from_word(&w)
+            .ok_or_else(|| mlua::Error::runtime("old must be 'values', 'keep' or 'clear'"));
+    }
+    Ok(match t.get::<LV>("freeze")? {
+        LV::Boolean(true) => OldCells::Values,
+        _ => OldCells::Keep,
+    })
+}
+
 impl LuaRegion {
     fn name(&self) -> String {
         self.info.borrow().name.clone()
@@ -1018,7 +1036,7 @@ impl LuaRegion {
                 name: self.name(),
                 start,
                 end,
-                freeze: bool_opt(opts, "freeze")?,
+                old: old_opt(opts)?,
                 overwrite: bool_opt(opts, "overwrite")?,
             },
         )?;
@@ -1078,7 +1096,8 @@ impl UserData for LuaRegion {
             )
             .map(drop)
         });
-        // Roll-forward. opts: { freeze = true } turns cells that leave the region into values;
+        // Roll-forward. opts: { old = "values" | "keep" | "clear" } (or freeze = true) for the cells
+        // that leave the region;
         // { overwrite = true } replaces cells that already hold something where the region grows.
         methods.add_method(
             "roll_start",
@@ -1099,11 +1118,12 @@ impl UserData for LuaRegion {
                 this.roll(n, n, &opts)
             },
         );
-        // region:rule() -> "slide", freeze   /   region:set_rule("start" | "end" | "slide" | "none"
-        // [, { freeze = false }]): how xl.region.roll_all moves this region.
+        // region:rule() -> "slide", "values"   /   region:set_rule("start" | "end" | "slide" | "none"
+        // [, { old = "values" | "keep" | "clear" }]): how xl.region.roll_all moves this region and
+        // what becomes of the cells that leave it.
         methods.add_method("rule", |_, this, ()| {
             let r = this.info.borrow().rule;
-            Ok((r.mode.word().to_owned(), r.freeze))
+            Ok((r.mode.word().to_owned(), r.old.word().to_owned()))
         });
         methods.add_method(
             "set_rule",
@@ -1111,16 +1131,22 @@ impl UserData for LuaRegion {
                 let mode = crate::regions::RollMode::from_word(&mode).ok_or_else(|| {
                     mlua::Error::runtime("the rule is 'none', 'start', 'end' or 'slide'")
                 })?;
-                let freeze = match &opts {
-                    Some(t) => !matches!(t.get::<LV>("freeze")?, LV::Boolean(false)),
-                    None => true,
+                // A rule's default is that old cells become values.
+                let old = match &opts {
+                    Some(t)
+                        if !matches!(t.get::<LV>("old")?, LV::Nil)
+                            || !matches!(t.get::<LV>("freeze")?, LV::Nil) =>
+                    {
+                        old_opt(&opts)?
+                    }
+                    _ => crate::regions::OldCells::Values,
                 };
                 let reply = region_call(
                     &this.api,
                     &this.workbook,
                     xlapi::RegionOp::SetRule {
                         name: this.name(),
-                        rule: crate::regions::Rule { mode, freeze },
+                        rule: crate::regions::Rule { mode, old },
                     },
                 )?;
                 if let Reply::Regions(mut v) = reply
@@ -1243,7 +1269,7 @@ fn install_region_api(lua: &Lua, workbook: &Path, api: Option<Arc<dyn XlApi>>) -
                         name: info.name.clone(),
                         start,
                         end,
-                        freeze: info.rule.freeze,
+                        old: info.rule.old,
                         overwrite,
                     },
                 );
@@ -2035,15 +2061,15 @@ mod tests {
             r#"
             function setup()
               xl.region.define("B1:D1", { name = "fc" }):set_rule("start")
-              xl.region.define("G1:I1", { name = "roll" }):set_rule("slide", { freeze = false })
+              xl.region.define("G1:I1", { name = "roll" }):set_rule("slide", { old = "clear" })
               xl.region.define("B3:C3", { name = "act" }):set_rule("end")
               xl.region.define("B5:C5", { name = "fixed" })
             end
             function rules()
               local out = {}
               for _, r in ipairs(xl.region.list()) do
-                local m, f = r:rule()
-                out[#out + 1] = r:name() .. "=" .. m .. (f and "+" or "-")
+                local m, o = r:rule()
+                out[#out + 1] = r:name() .. "=" .. m .. "/" .. o
               end
               table.sort(out)
               return table.concat(out, " ")
@@ -2061,6 +2087,11 @@ mod tests {
               table.sort(out)
               return table.concat(out, " ")
             end
+            function redefine()
+              local r = xl.region.define("B5:D5")
+              local m, o = r:rule()
+              return r:name() .. "@" .. r:address() .. " " .. m
+            end
             function bad() return pcall(function() xl.region.get("fc"):set_rule("sideways") end) end
             "#,
             Arc::clone(&g),
@@ -2068,7 +2099,7 @@ mod tests {
         h.call("setup", &[]).unwrap();
         assert_eq!(
             h.call("rules", &[]).unwrap(),
-            Value::Str("act=end+ fc=start+ fixed=none+ roll=slide-".into())
+            Value::Str("act=end/values fc=start/values fixed=none/values roll=slide/clear".into())
         );
         assert_eq!(
             h.call("go", &[]).unwrap(),
@@ -2079,6 +2110,11 @@ mod tests {
             Value::Str("act@Data!B3:D3 fc@Data!C1:D1 fixed@Data!B5:C5 roll@Data!H1:J1".into())
         );
         assert_eq!(h.call("bad", &[]).unwrap(), Value::Bool(false));
+        // Defining again from the same anchor extends that region and keeps its name and rule.
+        assert_eq!(
+            h.call("redefine", &[]).unwrap(),
+            Value::Str("fixed@Data!B5:D5 none".into())
+        );
     }
 
     #[test]

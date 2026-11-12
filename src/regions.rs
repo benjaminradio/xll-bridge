@@ -61,35 +61,65 @@ impl RollMode {
     }
 }
 
-/// A region's roll rule; stored in the comment of its hidden name (`roll=slide;freeze=1`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Rule {
-    pub mode: RollMode,
-    /// Cells that leave the region become values (the usual roll-forward).
-    pub freeze: bool,
+/// What happens to cells that leave a region when it rolls.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OldCells {
+    /// They become values (the usual roll-forward).
+    #[default]
+    Values,
+    /// They keep their formulas.
+    Keep,
+    /// They are cleared.
+    Clear,
 }
 
-impl Default for Rule {
-    fn default() -> Self {
-        Rule {
-            mode: RollMode::None,
-            freeze: true,
+impl OldCells {
+    pub fn word(self) -> &'static str {
+        match self {
+            OldCells::Values => "values",
+            OldCells::Keep => "keep",
+            OldCells::Clear => "clear",
+        }
+    }
+
+    pub fn from_word(w: &str) -> Option<OldCells> {
+        match w.trim().to_ascii_lowercase().as_str() {
+            "values" | "value" | "freeze" => Some(OldCells::Values),
+            "keep" | "formulas" => Some(OldCells::Keep),
+            "clear" | "cleared" | "blank" => Some(OldCells::Clear),
+            _ => None,
         }
     }
 }
 
+/// A region's roll rule; stored in the comment of its hidden name (`roll=slide;old=clear`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rule {
+    pub mode: RollMode,
+    /// What becomes of cells that leave the region.
+    pub old: OldCells,
+}
+
 impl Rule {
     pub fn encode(self) -> String {
-        format!("roll={};freeze={}", self.mode.word(), u8::from(self.freeze))
+        format!("roll={};old={}", self.mode.word(), self.old.word())
     }
 
-    /// Reads a name's comment; anything unreadable means the default (no rule).
+    /// Reads a name's comment; anything unreadable means the default (no rule). The earlier
+    /// `freeze=0/1` spelling still reads.
     pub fn parse(comment: &str) -> Rule {
         let mut rule = Rule::default();
         for part in comment.split(';') {
             match part.trim().split_once('=') {
                 Some(("roll", w)) => rule.mode = RollMode::from_word(w).unwrap_or_default(),
-                Some(("freeze", v)) => rule.freeze = v.trim() != "0",
+                Some(("old", w)) => rule.old = OldCells::from_word(w).unwrap_or_default(),
+                Some(("freeze", v)) => {
+                    rule.old = if v.trim() == "0" {
+                        OldCells::Keep
+                    } else {
+                        OldCells::Values
+                    }
+                }
                 _ => {}
             }
         }
@@ -109,17 +139,17 @@ impl Rule {
     pub fn describe(self) -> String {
         match self.mode {
             RollMode::None => "does not roll".into(),
-            RollMode::Start => format!("moves its start{}", self.freeze_note()),
+            RollMode::Start => format!("moves its start{}", self.old_note()),
             RollMode::End => "extends its end".into(),
-            RollMode::Slide => format!("slides its window{}", self.freeze_note()),
+            RollMode::Slide => format!("slides its window{}", self.old_note()),
         }
     }
 
-    fn freeze_note(self) -> &'static str {
-        if self.freeze {
-            " (old cells become values)"
-        } else {
-            " (old cells keep formulas)"
+    fn old_note(self) -> &'static str {
+        match self.old {
+            OldCells::Values => " (old cells become values)",
+            OldCells::Keep => " (old cells keep formulas)",
+            OldCells::Clear => " (old cells are cleared)",
         }
     }
 }
@@ -426,19 +456,21 @@ mod tests {
     fn rules_round_trip_and_give_steps() {
         let r = Rule {
             mode: RollMode::Slide,
-            freeze: false,
+            old: OldCells::Clear,
         };
-        assert_eq!(r.encode(), "roll=slide;freeze=0");
+        assert_eq!(r.encode(), "roll=slide;old=clear");
         assert_eq!(Rule::parse(&r.encode()), r);
+        assert_eq!(Rule::parse("roll=start;freeze=0").old, OldCells::Keep);
+        assert_eq!(Rule::parse("roll=start;freeze=1").old, OldCells::Values);
         assert_eq!(Rule::parse(""), Rule::default());
         assert_eq!(Rule::parse("junk;roll=bogus"), Rule::default());
         assert_eq!(Rule::parse("roll=forecast").mode, RollMode::Start);
-        assert!(Rule::parse("roll=end").freeze);
+        assert_eq!(Rule::parse("roll=end").old, OldCells::Values);
         assert_eq!(r.steps(1), (1, 1));
         assert_eq!(r.steps(-1), (-1, -1));
         let s = |m| Rule {
             mode: m,
-            freeze: true,
+            old: OldCells::Values,
         };
         assert_eq!(s(RollMode::Start).steps(1), (1, 0));
         assert_eq!(s(RollMode::End).steps(1), (0, 1));

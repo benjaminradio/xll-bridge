@@ -280,33 +280,43 @@ which is what filling right or down produces). It keeps forecast periods formula
 hardcodes. The workbook stays an ordinary workbook (the cells hold plain formulas), so you can share it
 with someone who has no add-in; nothing has to be applied or stripped first.
 
-* **Define**: type the formula in the top-left cell of a block (the *anchor*), select the block and click
-  **Lua ▸ Formula regions ▸ Define**. The block is filled with the anchor's formula (blank cells are simply
-  filled; cells that hold something else are listed and you are asked first) and is remembered as a hidden
-  workbook name (`_xs_<label>`). Because Excel keeps names current, **inserting or deleting rows and columns
-  keeps the region right** (a column inserted inside it becomes part of it). The anchor's own formula is the
-  definition, so there is no second copy of the text to go stale.
-* **Check** looks at every region in the workbook and lists cells that differ from their anchor: blank cells,
-  hardcoded values and different formulas. It offers to select them.
-* **Apply** fills the region around the active cell from its anchor again (use it after editing the anchor, or
-  to repair one-offs).
-* **Remove** stops tracking the region; its cells keep their formulas. Editing the cells of a region by
-  hand is always allowed: the next Check tells you what you changed.
-* **Roll** moves a region forward in time. *Move start forward by 1* (a forecast period became an actual),
-  *Extend end by 1* (actuals gain a period) and *Slide the window by 1* (a rolling forecast) work along the
-  region's long side, and the matching "back" actions undo them. Cells that leave a region can be turned into
-  values (the usual roll-forward) or left as formulas, and cells it grows into get the anchor's formula.
-* **Rules and Roll all**: each region can carry a **roll rule**: *does not roll*, *move start* (forecast),
-  *extend end* (actuals) or *slide window* (rolling forecast), with *old cells become values* or *keep
-  formulas* for the two that drop cells. Select cells over any number of regions (a whole sheet, say) and
-  choose a rule under **Rules**: every region the selection touches gets it. The rule is stored in the comment
-  of the region's hidden name, so it travels with the workbook. **Roll all ▸ forward by 1** then rolls the
-  whole workbook in one click, each region by its own rule; regions with no rule stay put. It shows how many
-  regions will move which way first, and regions blocked by hardcodes where they grow are listed and rolled
-  only if you agree. **List** writes every region with its address, size and rule to a "Region rules" sheet
-  so you can review the rules of hundreds of regions at a glance.
-* **Overwrite without asking** (a toggle in the group) replaces hardcodes and one-off formulas without
-  listing them first, to reset a file that has many.
+The group's buttons, in order (each with a dropdown where there is one):
+
+* **Define** (dropdown: roll rules): type the formula in the top-left cell of a block (the *anchor*), select
+  the block and click. The block is filled with the anchor's formula (blank cells are simply filled; cells
+  that hold something else are listed and you are asked first) and is remembered as a hidden workbook name
+  (`_xs_<label>`). Because Excel keeps names current, **inserting or deleting rows and columns keeps the
+  region right**. The anchor's own formula is the definition, so there is no second copy of the text to go
+  stale. **To extend (or shrink) a region, select the larger block starting at the same anchor and click
+  Define again**: the region is redefined, keeping its name and rule. A plain click gives a region that
+  *does not roll*; the dropdown picks a roll rule (below) for it instead.
+* **Apply** (dropdown: **Apply All**) fills the region around the active cell, or every region, from its
+  anchor again (use it after editing the anchor, or to repair one-offs). Cells that hold something else are
+  listed first.
+* **Check All** (dropdown: **Check** for the region at the active cell; **Check All and highlight
+  differences**) lists every cell that differs from its anchor: blank cells, hardcoded values and different
+  formulas. It offers to select them; the highlight variant marks them on the sheet instead.
+* **Roll All** (dropdown: forward / back by 1) rolls every region that has a roll rule, each by its own rule
+  (see Rules below). **Roll** works on the region at the active cell: *Move start forward by 1* (a forecast
+  period became an actual), *Extend end by 1* (actuals gain a period) and *Slide the window by 1* (a rolling
+  forecast), along the region's long side, and the matching "back" actions.
+* **List** writes every region with its address, size and rule to a "Region rules" sheet.
+* **Show**: *Highlight anchors*, *Outline regions* and *Clear highlights and outlines*. The marks are
+  conditional formats, so a cell's own formatting is untouched and they follow inserted rows and columns.
+* **Remove** (dropdown: **Remove All** on this sheet) stops tracking the region (or every region on the
+  active sheet); the cells keep their formulas. Editing the cells of a region by hand is always allowed: the
+  next Check tells you what you changed.
+* **Overwrite without asking** (a toggle) replaces hardcodes and one-off formulas without listing them first,
+  to reset a file that has many.
+
+**Roll rules.** Each region carries a rule: *does not roll*, *move start* (forecast), *extend end* (actuals)
+or *slide window* (rolling forecast). For *move start* and *slide window* a submenu says what becomes of the
+cells that leave the region: **old cells become values** (the usual roll-forward), **keep their formulas**, or
+**are cleared**. Choosing a rule from the Define dropdown with cells selected that are not in a region
+defines them as a region with that rule; with cells that touch existing regions (a whole sheet, say) it sets
+the rule on every region the selection touches. The rule is stored in the comment of the region's hidden
+name, so it travels with the workbook. **Roll All** shows how many regions will move which way first, and
+regions blocked by hardcodes where they grow are listed and rolled only if you agree.
 
 From Lua (for scripts and macros; reading works anywhere, changing needs a macro or `LUA.ASYNC`):
 
@@ -314,10 +324,10 @@ From Lua (for scripts and macros; reading works anywhere, changing needs a macro
 local r = xl.region.define("Forecast!E5:KJ5", { name = "dates" })   -- fills it from E5; { overwrite = true }
 r:check()                    -- { ok, anchor, count, deviations = { {address, kind, text}, ... } }
 r:apply{ overwrite = false } -- refuses (listing the cells) if something else is in the way
-r:roll_start(1, { freeze = true })   -- forecast: the first period became an actual (freeze = to values)
+r:roll_start(1, { old = "values" })   -- forecast: the first period became an actual (old = "values" | "keep" | "clear")
 r:extend_end(1)              -- actuals: one more period
 r:roll(1)                    -- rolling forecast: slide the window
-r:set_rule("slide", { freeze = true })   -- "none" | "start" | "end" | "slide"; r:rule() reads it back
+r:set_rule("slide", { old = "clear" })   -- "none" | "start" | "end" | "slide"; old = "values" | "keep" | "clear"; r:rule() reads it back
 xl.region.roll_all(1)        -- every region with a rule, each by its own: { rolled = {...}, failed = {...} }
 r:remove()
 xl.region.list()  xl.region.get("dates")  xl.region.at("Forecast!G5")
