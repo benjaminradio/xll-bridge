@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::ThreadId;
 use std::time::Duration;
 
+use crate::regions::{CheckReport, RegionInfo};
 use crate::value::Value;
 
 /// Largest range (in cells) read or written in one operation.
@@ -60,6 +61,11 @@ pub enum Op {
         address: String,
         name: String,
     },
+    /// Formula regions (see [`crate::regions`]).
+    Region {
+        workbook: PathBuf,
+        op: RegionOp,
+    },
     Sheets {
         workbook: PathBuf,
     },
@@ -72,12 +78,54 @@ pub enum Op {
     },
 }
 
+/// Operations on formula regions. A region is named by its label.
+#[derive(Clone, Debug)]
+pub enum RegionOp {
+    /// Make the range a region (its top-left cell is the anchor) and fill it with the anchor's
+    /// formula. Cells that hold something else stop this unless `overwrite`.
+    Define {
+        address: String,
+        label: Option<String>,
+        overwrite: bool,
+    },
+    List,
+    /// The region containing a cell, if any.
+    At {
+        address: String,
+    },
+    Check {
+        name: String,
+    },
+    /// Fill the region from its anchor again.
+    Apply {
+        name: String,
+        overwrite: bool,
+    },
+    /// Move the start / end of the region along its long side; new cells get the anchor's formula
+    /// and, with `freeze`, cells that leave it are turned into values.
+    Roll {
+        name: String,
+        start: i32,
+        end: i32,
+        freeze: bool,
+        overwrite: bool,
+    },
+    /// Forget the region; its cells stay as they are.
+    Remove {
+        name: String,
+    },
+}
+
 impl Op {
     pub fn is_write(&self) -> bool {
-        matches!(
-            self,
-            Op::Write { .. } | Op::Clear { .. } | Op::AsTable { .. }
-        )
+        match self {
+            Op::Write { .. } | Op::Clear { .. } | Op::AsTable { .. } => true,
+            Op::Region { op, .. } => !matches!(
+                op,
+                RegionOp::List | RegionOp::At { .. } | RegionOp::Check { .. }
+            ),
+            _ => false,
+        }
     }
 }
 
@@ -90,6 +138,8 @@ pub struct RangeInfo {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Reply {
+    Regions(Vec<RegionInfo>),
+    Report(CheckReport),
     Info(RangeInfo),
     Data(Value),
     Names(Vec<String>),
@@ -122,6 +172,40 @@ impl std::fmt::Display for XlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
+}
+
+/// The message for cells that stop a region from being filled: what they hold and where.
+pub fn describe_deviations(report: &CheckReport) -> String {
+    let held: Vec<String> = report
+        .deviations
+        .iter()
+        .filter(|d| d.kind != crate::regions::DevKind::Blank)
+        .map(|d| {
+            format!(
+                "{} ({}{})",
+                d.address,
+                d.kind.word(),
+                if d.text.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", d.text)
+                }
+            )
+        })
+        .collect();
+    let shown = held.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+    let more = held.len().saturating_sub(8);
+    format!(
+        "{} cell(s) of region '{}' hold something other than its formula {}: {shown}{}; pass overwrite = true to replace them",
+        held.len(),
+        report.region.name,
+        report.anchor,
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )
 }
 
 pub trait XlApi: Send + Sync {
@@ -364,6 +448,8 @@ pub(crate) mod fake {
         pub log: Mutex<Vec<String>>,
         /// Excel table name -> address of its range (header included).
         pub tables: Mutex<HashMap<String, String>>,
+        /// Formula regions: label -> (sheet, (row1, col1, row2, col2)), 0-based.
+        pub regions: Mutex<BTreeMap<String, (String, Bounds)>>,
     }
 
     /// (row1, col1, row2, col2), 0-based.
@@ -417,7 +503,218 @@ pub(crate) mod fake {
                 selection: Mutex::new(None),
                 log: Mutex::default(),
                 tables: Mutex::default(),
+                regions: Mutex::default(),
             })
+        }
+
+        fn region_info(&self, label: &str) -> Result<crate::regions::RegionInfo, XlError> {
+            let regions = self.regions.lock().unwrap();
+            let (sheet, (r1, c1, r2, c2)) = regions
+                .get(label)
+                .ok_or_else(|| XlError::new(format!("no formula region named '{label}'")))?;
+            Ok(crate::regions::RegionInfo {
+                name: label.to_owned(),
+                address: format!("{}!{}:{}", quote_sheet(sheet), a1(*r1, *c1), a1(*r2, *c2)),
+                rows: r2 - r1 + 1,
+                cols: c2 - c1 + 1,
+            })
+        }
+
+        fn cell(&self, sheet: &str, r: u32, c: u32) -> Value {
+            let sheets = self.sheets.lock().unwrap();
+            let s = &sheets[sheet];
+            match s.formulas.get(&(r, c)) {
+                Some(f) => Value::Str(f.clone()),
+                None => s.values.get(&(r, c)).cloned().unwrap_or(Value::Empty),
+            }
+        }
+
+        fn check_region(&self, label: &str) -> Result<crate::regions::CheckReport, XlError> {
+            let region = self.region_info(label)?;
+            let (sheet, (r1, c1, r2, c2)) = self.regions.lock().unwrap()[label].clone();
+            let anchor = match self.cell(&sheet, r1, c1) {
+                Value::Str(f) if f.starts_with('=') => f,
+                _ => return Err(XlError::new("the anchor (top-left cell) holds no formula")),
+            };
+            let mut cells = Vec::new();
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    cells.push(self.cell(&sheet, r, c));
+                }
+            }
+            let deviations =
+                crate::regions::compare(&anchor, &cells, (c2 - c1 + 1) as usize, |i, j| {
+                    a1(r1 + i as u32, c1 + j as u32)
+                });
+            Ok(crate::regions::CheckReport {
+                region,
+                anchor,
+                deviations,
+            })
+        }
+
+        fn apply_region(&self, label: &str, overwrite: bool) -> Result<(), XlError> {
+            let report = self.check_region(label)?;
+            if report.non_blank() > 0 && !overwrite {
+                return Err(XlError::new(describe_deviations(&report)));
+            }
+            let (sheet, (r1, c1, r2, c2)) = self.regions.lock().unwrap()[label].clone();
+            let mut sheets = self.sheets.lock().unwrap();
+            let s = sheets.get_mut(&sheet).unwrap();
+            for r in r1..=r2 {
+                for c in c1..=c2 {
+                    s.values.remove(&(r, c));
+                    s.formulas.insert((r, c), report.anchor.clone());
+                }
+            }
+            Ok(())
+        }
+
+        fn region(&self, op: RegionOp) -> Result<Reply, XlError> {
+            use crate::regions::{Axis, default_axis, label_of, name_for, roll};
+            match op {
+                RegionOp::List => {
+                    let labels: Vec<String> =
+                        self.regions.lock().unwrap().keys().cloned().collect();
+                    labels
+                        .iter()
+                        .map(|l| self.region_info(l))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map(Reply::Regions)
+                }
+                RegionOp::At { address } => {
+                    let (sheet, (r, c, _, _)) = self.resolve(&address)?;
+                    let hit = self
+                        .regions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(_, (s, (r1, c1, r2, c2)))| {
+                            *s == sheet && r >= *r1 && r <= *r2 && c >= *c1 && c <= *c2
+                        })
+                        .map(|(l, _)| l.clone());
+                    match hit {
+                        Some(l) => Ok(Reply::Regions(vec![self.region_info(&l)?])),
+                        None => Ok(Reply::Regions(Vec::new())),
+                    }
+                }
+                RegionOp::Check { name } => self.check_region(&name).map(Reply::Report),
+                RegionOp::Remove { name } => {
+                    self.regions
+                        .lock()
+                        .unwrap()
+                        .remove(&name)
+                        .ok_or_else(|| XlError::new(format!("no formula region named '{name}'")))?;
+                    Ok(Reply::Done)
+                }
+                RegionOp::Apply { name, overwrite } => {
+                    self.apply_region(&name, overwrite)?;
+                    Ok(Reply::Regions(vec![self.region_info(&name)?]))
+                }
+                RegionOp::Define {
+                    address,
+                    label,
+                    overwrite,
+                } => {
+                    let (sheet, b @ (r1, c1, r2, c2)) = self.resolve(&address)?;
+                    let label = label.unwrap_or_else(|| format!("{}_{}", sheet, a1(r1, c1)));
+                    let label = label_of(&name_for(&label).map_err(XlError::new)?)
+                        .unwrap_or_default()
+                        .to_owned();
+                    let overlaps =
+                        self.regions
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(l, (s, (a, b2, c, d)))| {
+                                *s == sheet
+                                    && *l != label
+                                    && r1 <= *c
+                                    && r2 >= *a
+                                    && c1 <= *d
+                                    && c2 >= *b2
+                            });
+                    if overlaps {
+                        return Err(XlError::new("the range overlaps another formula region"));
+                    }
+                    self.regions
+                        .lock()
+                        .unwrap()
+                        .insert(label.clone(), (sheet, b));
+                    if let Err(e) = self.apply_region(&label, overwrite) {
+                        self.regions.lock().unwrap().remove(&label);
+                        return Err(e);
+                    }
+                    Ok(Reply::Regions(vec![self.region_info(&label)?]))
+                }
+                RegionOp::Roll {
+                    name,
+                    start,
+                    end,
+                    freeze,
+                    overwrite,
+                } => {
+                    let (sheet, (r1, c1, r2, c2)) = self
+                        .regions
+                        .lock()
+                        .unwrap()
+                        .get(&name)
+                        .cloned()
+                        .ok_or_else(|| XlError::new(format!("no formula region named '{name}'")))?;
+                    let (rows, cols) = ((r2 - r1 + 1) as i32, (c2 - c1 + 1) as i32);
+                    let axis = default_axis(rows, cols);
+                    let plan = roll(rows, cols, axis, start, end).map_err(XlError::new)?;
+                    let _ = Axis::Rows;
+                    let shifted = |rect: crate::regions::Rect| {
+                        (
+                            (r1 as i32 + rect.row) as u32,
+                            (c1 as i32 + rect.col) as u32,
+                            (r1 as i32 + rect.row + rect.rows - 1) as u32,
+                            (c1 as i32 + rect.col + rect.cols - 1) as u32,
+                        )
+                    };
+                    let anchor = self.check_region(&name)?.anchor;
+                    if freeze {
+                        let mut sheets = self.sheets.lock().unwrap();
+                        let s = sheets.get_mut(&sheet).unwrap();
+                        for rect in &plan.leaving {
+                            let (a, b, c, d) = shifted(*rect);
+                            for r in a..=c {
+                                for col in b..=d {
+                                    // "Values": a formula becomes the (here: unknown) value.
+                                    s.formulas.remove(&(r, col));
+                                }
+                            }
+                        }
+                    }
+                    let nb = shifted(plan.new);
+                    self.regions
+                        .lock()
+                        .unwrap()
+                        .insert(name.clone(), (sheet.clone(), nb));
+                    // The new cells get the anchor's formula; the new anchor is the first cell.
+                    {
+                        let mut sheets = self.sheets.lock().unwrap();
+                        let s = sheets.get_mut(&sheet).unwrap();
+                        for rect in &plan.entering {
+                            let (a, b, c, d) = shifted(*rect);
+                            for r in a..=c {
+                                for col in b..=d {
+                                    if !overwrite
+                                        && (s.formulas.contains_key(&(r, col))
+                                            || s.values.contains_key(&(r, col)))
+                                    {
+                                        continue;
+                                    }
+                                    s.values.remove(&(r, col));
+                                    s.formulas.insert((r, col), anchor.clone());
+                                }
+                            }
+                        }
+                    }
+                    Ok(Reply::Regions(vec![self.region_info(&name)?]))
+                }
+            }
         }
 
         pub fn put(&self, sheet: &str, address: &str, v: Value) {
@@ -550,6 +847,7 @@ pub(crate) mod fake {
                     self.tables.lock().unwrap().insert(name, address);
                     Ok(Reply::Done)
                 }
+                Op::Region { op, .. } => self.region(op),
                 Op::Table { name, .. } => {
                     let address = self
                         .tables

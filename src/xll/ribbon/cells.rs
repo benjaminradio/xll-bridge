@@ -179,7 +179,7 @@ const VBA_E_IGNORE: u32 = 0x800A_C472;
 const DISP_E_BADINDEX: u32 = 0x8002_000B;
 const E_EXCEL_BAD_REFERENCE: u32 = 0x800A_03EC;
 
-fn com(e: windows::core::Error) -> XlError {
+pub(super) fn com(e: windows::core::Error) -> XlError {
     let code = e.code().0 as u32;
     let text = e.message();
     if matches!(
@@ -194,18 +194,18 @@ fn com(e: windows::core::Error) -> XlError {
     }
 }
 
-fn dispatch_of(v: windows::core::Result<VARIANT>) -> Result<IDispatch, XlError> {
+pub(super) fn dispatch_of(v: windows::core::Result<VARIANT>) -> Result<IDispatch, XlError> {
     v.and_then(|v| IDispatch::try_from(&v)).map_err(com)
 }
 
-fn string_of(v: windows::core::Result<VARIANT>) -> Result<String, XlError> {
+pub(super) fn string_of(v: windows::core::Result<VARIANT>) -> Result<String, XlError> {
     v.and_then(|v| BSTR::try_from(&v))
         .map(|b| b.to_string())
         .map_err(com)
 }
 
 /// An omitted optional argument (`DISP_E_PARAMNOTFOUND`).
-fn missing_arg() -> VARIANT {
+pub(super) fn missing_arg() -> VARIANT {
     let mut v = VARIANT::default();
     // SAFETY: writing the discriminant and the matching union member of a fresh VARIANT.
     unsafe {
@@ -216,7 +216,7 @@ fn missing_arg() -> VARIANT {
     v
 }
 
-fn count_of(obj: &IDispatch, prop: &str) -> Result<i32, XlError> {
+pub(super) fn count_of(obj: &IDispatch, prop: &str) -> Result<i32, XlError> {
     dispatch::get(obj, prop)
         .and_then(|v| i32::try_from(&v))
         .map_err(com)
@@ -224,7 +224,7 @@ fn count_of(obj: &IDispatch, prop: &str) -> Result<i32, XlError> {
 
 // ------------------------------------------------------------------ resolving ranges
 
-fn book_name_of(path: &Path) -> Option<String> {
+pub(super) fn book_name_of(path: &Path) -> Option<String> {
     super::workbook_name_by_path(path)
 }
 
@@ -239,14 +239,18 @@ pub(super) fn open_book(app: &IDispatch, name: &str) -> Result<IDispatch, XlErro
     })
 }
 
-struct Resolved {
-    range: IDispatch,
+pub(super) struct Resolved {
+    pub(super) range: IDispatch,
     /// Name of the workbook the range lives in, and whether the caller named it explicitly.
-    book: String,
-    explicit_book: bool,
+    pub(super) book: String,
+    pub(super) explicit_book: bool,
 }
 
-fn resolve(app: &IDispatch, workbook: &Path, address: &str) -> Result<Resolved, XlError> {
+pub(super) fn resolve(
+    app: &IDispatch,
+    workbook: &Path,
+    address: &str,
+) -> Result<Resolved, XlError> {
     let addr: Addr = split_address(address).map_err(XlError::new)?;
     let default_book = book_name_of(workbook).ok_or_else(|| {
         XlError::new(
@@ -295,7 +299,11 @@ fn resolve(app: &IDispatch, workbook: &Path, address: &str) -> Result<Resolved, 
     })
 }
 
-fn describe(range: &IDispatch, book: &str, explicit_book: bool) -> Result<RangeInfo, XlError> {
+pub(super) fn describe(
+    range: &IDispatch,
+    book: &str,
+    explicit_book: bool,
+) -> Result<RangeInfo, XlError> {
     let areas = dispatch_of(dispatch::get(range, "Areas"))?;
     if count_of(&areas, "Count")? != 1 {
         return Err(XlError::new(
@@ -425,6 +433,7 @@ pub(super) fn execute(op: Op) -> Result<Reply, XlError> {
             }
             Ok(Reply::Done)
         }
+        Op::Region { workbook, op } => super::regions::run(&app, &workbook, op),
         Op::Table { workbook, name } => {
             let book = book_name_of(&workbook)
                 .ok_or_else(|| XlError::new("this workbook is not open in Excel"))?;

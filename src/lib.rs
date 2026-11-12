@@ -16,6 +16,7 @@ pub mod macros;
 pub mod package;
 pub mod panel;
 pub mod procrun;
+pub mod regions;
 pub mod runtime;
 pub mod settings;
 pub mod sqldb;

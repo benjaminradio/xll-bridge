@@ -1677,12 +1677,9 @@ fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> Optio
                     let _ = GetClientRect(hwnd, &mut rc);
                 }
                 let dpi = dpi_scale(hwnd, 96).max(1);
-                let saved = MODEL.with(|m| {
-                    let mut m = m.borrow_mut();
-                    m.settings.panel_width = rc.right * 96 / dpi;
-                    m.settings
-                });
-                settings::save(&saved);
+                let width = rc.right * 96 / dpi;
+                let saved = settings::update(|s| s.panel_width = width);
+                MODEL.with(|m| m.borrow_mut().settings = saved);
             }
             Some(LRESULT(0))
         }
@@ -1770,12 +1767,8 @@ fn process_queue() {
 
 /// Docked <-> floating: remember the choice, then recreate the window in the other mode.
 fn switch_mode(app: &IDispatch) {
-    let saved = MODEL.with(|m| {
-        let mut m = m.borrow_mut();
-        m.settings.docked = !m.settings.docked;
-        m.settings
-    });
-    settings::save(&saved);
+    let saved = settings::update(|s| s.docked = !s.docked);
+    MODEL.with(|m| m.borrow_mut().settings = saved);
     recreate(app);
 }
 

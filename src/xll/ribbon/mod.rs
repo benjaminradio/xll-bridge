@@ -19,6 +19,7 @@ mod folder;
 mod icon;
 mod live;
 mod pane;
+mod regions;
 pub(crate) mod rtd;
 
 use std::cell::RefCell;
@@ -68,13 +69,40 @@ const RIBBON_XML: &str = r#"<customUI xmlns="http://schemas.microsoft.com/office
                   screentip="Lua files" supertip="Show or hide the panel that lists the files embedded in this workbook, with add, delete, rename, import and export."
                   onAction="OnFilesClick"/>
         </group>
+        <group id="grpRegions" label="Formula regions">
+          <button id="btnRegionDefine" size="large" label="Define" imageMso="FillRight"
+                  screentip="Define a formula region" supertip="Select a block of cells whose top-left cell holds the formula, then click: the formula is filled across the block and the block is tracked, so inserted rows and columns keep it consistent."
+                  onAction="OnRegionDefine"/>
+          <button id="btnRegionCheck" size="large" label="Check" imageMso="ReviewAcceptChange"
+                  screentip="Check formula regions" supertip="Look for cells in any formula region that differ from the region's formula: hardcoded values and one-off formulas."
+                  onAction="OnRegionCheck"/>
+          <button id="btnRegionApply" size="large" label="Apply" imageMso="FillDown"
+                  screentip="Apply the formula region" supertip="Fill the region around the active cell from its top-left cell again. Cells that hold something else are listed first."
+                  onAction="OnRegionApply"/>
+          <menu id="menuRegionRoll" size="large" label="Roll" imageMso="RightArrow2"
+                screentip="Roll the formula region forward" supertip="Move the start (forecast: a period became an actual), extend the end (actuals: one more period), or slide both (rolling forecast) for the region around the active cell.">
+            <button id="rollStartFwd" label="Move start forward by 1 (forecast)" tag="start:1" onAction="OnRegionRoll"/>
+            <button id="rollEndFwd" label="Extend end by 1 (actuals)" tag="end:1" onAction="OnRegionRoll"/>
+            <button id="rollBothFwd" label="Slide the window forward by 1 (rolling forecast)" tag="both:1" onAction="OnRegionRoll"/>
+            <menuSeparator id="rollSep"/>
+            <button id="rollStartBack" label="Move start back by 1" tag="start:-1" onAction="OnRegionRoll"/>
+            <button id="rollEndBack" label="Shrink end by 1" tag="end:-1" onAction="OnRegionRoll"/>
+            <button id="rollBothBack" label="Slide the window back by 1" tag="both:-1" onAction="OnRegionRoll"/>
+          </menu>
+          <button id="btnRegionRemove" size="normal" label="Remove" imageMso="Delete"
+                  screentip="Remove the formula region" supertip="Stop tracking the region around the active cell. Its cells keep their formulas."
+                  onAction="OnRegionRemove"/>
+          <toggleButton id="tglRegionOverwrite" size="normal" label="Overwrite without asking"
+                  screentip="Overwrite without asking" supertip="Replace hardcoded values and one-off formulas inside a region without listing them first. Useful to reset a file with many hardcodes."
+                  getPressed="GetRegionOverwrite" onAction="OnRegionOverwrite"/>
+        </group>
       </tab>
     </tabs>
   </ribbon>
 </customUI>"#;
 
 // IDispatch ids for the ribbon callbacks (names must match RIBBON_XML).
-const CALLBACKS: [(&str, i32); 11] = [
+const CALLBACKS: [(&str, i32); 18] = [
     ("OnRibbonLoad", 1),
     ("GetLabel", 2),
     ("GetScreentip", 3),
@@ -86,6 +114,13 @@ const CALLBACKS: [(&str, i32); 11] = [
     ("OnMacroClick", 9),
     ("GetMacros", 10),
     ("OnSyncClick", 11),
+    ("OnRegionDefine", 12),
+    ("OnRegionCheck", 13),
+    ("OnRegionApply", 14),
+    ("OnRegionRemove", 15),
+    ("OnRegionRoll", 16),
+    ("OnRegionOverwrite", 17),
+    ("GetRegionOverwrite", 18),
 ];
 
 #[interface("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
@@ -770,6 +805,42 @@ impl IDispatch_Impl for Addin_Impl {
                     }
                 }
                 10 => ret(VARIANT::from(macro_menu_xml().as_str()), result, params),
+                12..=15 => {
+                    if let Some(app) = app() {
+                        match id {
+                            12 => regions::ui_define(&app),
+                            13 => regions::ui_check(&app),
+                            14 => regions::ui_apply(&app),
+                            _ => regions::ui_remove(&app),
+                        }
+                    }
+                }
+                16 => {
+                    // onAction(control): the roll kind and amount travel in the item's tag.
+                    if params.cArgs >= 1 && !params.rgvarg.is_null() {
+                        // SAFETY: at least one argument present.
+                        let tag = IDispatch::try_from(unsafe { &*params.rgvarg })
+                            .ok()
+                            .and_then(|c| dispatch::get(&c, "Tag").ok())
+                            .and_then(|v| bstr_of(&v));
+                        if let (Some(tag), Some(app)) = (tag, app()) {
+                            regions::ui_roll(&app, &tag);
+                        }
+                    }
+                }
+                17 => {
+                    // onAction(control, pressed): the last declared parameter comes first.
+                    if params.cArgs >= 1 && !params.rgvarg.is_null() {
+                        // SAFETY: at least one argument present.
+                        let pressed = bool::try_from(unsafe { &*params.rgvarg }).unwrap_or(false);
+                        crate::settings::update(|s| s.overwrite_regions = pressed);
+                    }
+                }
+                18 => ret(
+                    VARIANT::from(crate::settings::load().overwrite_regions),
+                    result,
+                    params,
+                ),
                 11 => {
                     crate::log::note("ribbon: Sync folder clicked");
                     if let Some(app) = app() {
@@ -914,6 +985,7 @@ mod tests {
             "getSupertip",
             "onAction",
             "getContent",
+            "getPressed",
         ] {
             let needle = format!("{attr}=\"");
             for (at, _) in xml.match_indices(&needle) {
@@ -936,8 +1008,8 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 10,
-            "onLoad + 5 on the status button + refresh + sync + files + the macro menu"
+            checked, 22,
+            "onLoad + 5 on the status button + refresh + sync + files + the macro menu + 4 region buttons + 6 roll items + the overwrite toggle (2)"
         );
         assert!(xml.contains("onAction=\"OnFilesClick\""));
     }

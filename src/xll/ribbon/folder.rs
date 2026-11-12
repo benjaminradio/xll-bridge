@@ -159,13 +159,13 @@ pub(super) fn tick(app: &IDispatch) {
     }
 }
 
-enum Choice {
+pub(super) enum Choice {
     Yes,
     No,
     Cancel,
 }
 
-fn ask3(owner: windows::Win32::Foundation::HWND, text: &str, caption: &str) -> Choice {
+pub(super) fn ask3(owner: windows::Win32::Foundation::HWND, text: &str, caption: &str) -> Choice {
     let (t, c): (Vec<u16>, Vec<u16>) = (
         text.encode_utf16().chain(Some(0)).collect(),
         caption.encode_utf16().chain(Some(0)).collect(),

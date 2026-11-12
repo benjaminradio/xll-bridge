@@ -14,7 +14,7 @@ in the background and stream live values into cells.
 
 ## Contents
 
-[Quick start](#quick-start) · [Worksheet functions](#worksheet-functions) · [Lua API](#lua-api) · [SQL over cells](#sql-over-cells) ·
+[Quick start](#quick-start) · [Worksheet functions](#worksheet-functions) · [Lua API](#lua-api) · [SQL over cells](#sql-over-cells) · [Formula regions](#formula-regions) ·
 [The Lua ribbon tab](#the-lua-ribbon-tab) · [Editing scripts in your own editor](#editing-scripts-in-your-own-editor)
 · [Trust model](#trust-model) · [Files on disk](#files-on-disk) · [How it works](#how-it-works) ·
 [Troubleshooting](#troubleshooting) · [Limitations](#limitations) · [Future considerations](#future-considerations)
@@ -272,6 +272,48 @@ table, opts)` (options `clean_names` (default true: `'Dim'[BU]` becomes `BU`), `
 `range:as_table(name)`, `xl.hash(text)`, `xl.stat(path)`, `xl.mkdir(path)`, `xl.local_dir()`. Column types come
 from the data; codes with leading zeros (`007`) stay text; empty fields are NULL / empty cells; dates are
 read as ISO 8601 into Excel date numbers.
+
+## Formula regions
+
+A **formula region** is a block of cells that must all carry the same formula (the same R1C1 formula,
+which is what filling right or down produces). It keeps forecast periods formulaic: no one-offs, no stray
+hardcodes. The workbook stays an ordinary workbook (the cells hold plain formulas), so you can share it
+with someone who has no add-in; nothing has to be applied or stripped first.
+
+* **Define**: type the formula in the top-left cell of a block (the *anchor*), select the block and click
+  **Lua ▸ Formula regions ▸ Define**. The block is filled with the anchor's formula (blank cells are simply
+  filled; cells that hold something else are listed and you are asked first) and is remembered as a hidden
+  workbook name (`_xs_<label>`). Because Excel keeps names current, **inserting or deleting rows and columns
+  keeps the region right** (a column inserted inside it becomes part of it). The anchor's own formula is the
+  definition, so there is no second copy of the text to go stale.
+* **Check** looks at every region in the workbook and lists cells that differ from their anchor: blank cells,
+  hardcoded values and different formulas. It offers to select them.
+* **Apply** fills the region around the active cell from its anchor again (use it after editing the anchor, or
+  to repair one-offs).
+* **Remove** stops tracking the region; its cells keep their formulas. Editing the cells of a region by
+  hand is always allowed: the next Check tells you what you changed.
+* **Roll** moves a region forward in time. *Move start forward by 1* (a forecast period became an actual),
+  *Extend end by 1* (actuals gain a period) and *Slide the window by 1* (a rolling forecast) work along the
+  region's long side, and the matching "back" actions undo them. Cells that leave a region can be turned into
+  values (the usual roll-forward) or left as formulas, and cells it grows into get the anchor's formula.
+* **Overwrite without asking** (a toggle in the group) replaces hardcodes and one-off formulas without
+  listing them first, to reset a file that has many.
+
+From Lua (for scripts and macros; reading works anywhere, changing needs a macro or `LUA.ASYNC`):
+
+```lua
+local r = xl.region.define("Forecast!E5:KJ5", { name = "dates" })   -- fills it from E5; { overwrite = true }
+r:check()                    -- { ok, anchor, count, deviations = { {address, kind, text}, ... } }
+r:apply{ overwrite = false } -- refuses (listing the cells) if something else is in the way
+r:roll_start(1, { freeze = true })   -- forecast: the first period became an actual (freeze = to values)
+r:extend_end(1)              -- actuals: one more period
+r:roll(1)                    -- rolling forecast: slide the window
+r:remove()
+xl.region.list()  xl.region.get("dates")  xl.region.at("Forecast!G5")
+```
+
+Notes: changes made by the add-in cannot be undone with Ctrl+Z (Excel clears its undo history when a program
+changes cells), and checking is on demand. A region needs at least two cells and cannot overlap another.
 
 ## The Lua ribbon tab
 

@@ -126,6 +126,7 @@ impl LuaHost {
         install_process_api(&lua, Rc::clone(&limits))?;
         install_range_api(&lua, ctx.workbook, ctx.xl.clone())?;
         install_macro_api(&lua)?;
+        install_region_api(&lua, ctx.workbook, ctx.xl.clone())?;
         install_file_helpers(&lua)?;
         let sql_env = Rc::new(SqlEnv {
             api: ctx.xl.clone(),
@@ -971,6 +972,240 @@ fn install_db_api(lua: &Lua, env: Rc<SqlEnv>) -> mlua::Result<()> {
     xl.set("db", db)
 }
 
+/// A formula region (see [`crate::regions`]) seen from Lua.
+struct LuaRegion {
+    api: Arc<dyn XlApi>,
+    workbook: PathBuf,
+    info: Rc<RefCell<crate::regions::RegionInfo>>,
+}
+
+fn region_call(api: &Arc<dyn XlApi>, workbook: &Path, op: xlapi::RegionOp) -> mlua::Result<Reply> {
+    api.call(Op::Region {
+        workbook: workbook.to_owned(),
+        op,
+    })
+    .map_err(api_err)
+}
+
+fn region_of(api: &Arc<dyn XlApi>, workbook: &Path, reply: Reply) -> mlua::Result<LuaRegion> {
+    match reply {
+        Reply::Regions(mut v) if v.len() == 1 => Ok(LuaRegion {
+            api: Arc::clone(api),
+            workbook: workbook.to_owned(),
+            info: Rc::new(RefCell::new(v.remove(0))),
+        }),
+        _ => Err(mlua::Error::runtime("unexpected reply from Excel")),
+    }
+}
+
+fn bool_opt(opts: &Option<mlua::Table>, key: &str) -> mlua::Result<bool> {
+    Ok(match opts {
+        Some(t) => matches!(t.get::<LV>(key)?, LV::Boolean(true)),
+        None => false,
+    })
+}
+
+impl LuaRegion {
+    fn name(&self) -> String {
+        self.info.borrow().name.clone()
+    }
+
+    fn roll(&self, start: i32, end: i32, opts: &Option<mlua::Table>) -> mlua::Result<()> {
+        let reply = region_call(
+            &self.api,
+            &self.workbook,
+            xlapi::RegionOp::Roll {
+                name: self.name(),
+                start,
+                end,
+                freeze: bool_opt(opts, "freeze")?,
+                overwrite: bool_opt(opts, "overwrite")?,
+            },
+        )?;
+        if let Reply::Regions(mut v) = reply
+            && v.len() == 1
+        {
+            *self.info.borrow_mut() = v.remove(0);
+        }
+        Ok(())
+    }
+}
+
+impl UserData for LuaRegion {
+    fn add_methods<M: mlua::UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("name", |_, this, ()| Ok(this.name()));
+        methods.add_method("address", |_, this, ()| {
+            Ok(this.info.borrow().address.clone())
+        });
+        methods.add_method("size", |_, this, ()| {
+            let i = this.info.borrow();
+            Ok((i.rows, i.cols))
+        });
+        // region:check() -> { ok, anchor, count, deviations = { {address, kind, text}, ... } }
+        methods.add_method("check", |lua, this, ()| {
+            let Reply::Report(r) = region_call(
+                &this.api,
+                &this.workbook,
+                xlapi::RegionOp::Check { name: this.name() },
+            )?
+            else {
+                return Err(mlua::Error::runtime("unexpected reply from Excel"));
+            };
+            let t = lua.create_table()?;
+            t.set("ok", r.deviations.is_empty())?;
+            t.set("anchor", r.anchor.as_str())?;
+            t.set("count", r.deviations.len())?;
+            let list = lua.create_table()?;
+            for (i, d) in r.deviations.iter().enumerate() {
+                let e = lua.create_table()?;
+                e.set("address", d.address.as_str())?;
+                e.set("kind", d.kind.word())?;
+                e.set("text", d.text.as_str())?;
+                list.raw_set(i + 1, e)?;
+            }
+            t.set("deviations", list)?;
+            Ok(t)
+        });
+        // region:apply{ overwrite = false }: fill the whole region from its anchor again
+        methods.add_method("apply", |_, this, opts: Option<mlua::Table>| {
+            region_call(
+                &this.api,
+                &this.workbook,
+                xlapi::RegionOp::Apply {
+                    name: this.name(),
+                    overwrite: bool_opt(&opts, "overwrite")?,
+                },
+            )
+            .map(drop)
+        });
+        // Roll-forward. opts: { freeze = true } turns cells that leave the region into values;
+        // { overwrite = true } replaces cells that already hold something where the region grows.
+        methods.add_method(
+            "roll_start",
+            |_, this, (n, opts): (Option<i32>, Option<mlua::Table>)| {
+                this.roll(n.unwrap_or(1), 0, &opts)
+            },
+        );
+        methods.add_method(
+            "extend_end",
+            |_, this, (n, opts): (Option<i32>, Option<mlua::Table>)| {
+                this.roll(0, n.unwrap_or(1), &opts)
+            },
+        );
+        methods.add_method(
+            "roll",
+            |_, this, (n, opts): (Option<i32>, Option<mlua::Table>)| {
+                let n = n.unwrap_or(1);
+                this.roll(n, n, &opts)
+            },
+        );
+        methods.add_method("remove", |_, this, ()| {
+            region_call(
+                &this.api,
+                &this.workbook,
+                xlapi::RegionOp::Remove { name: this.name() },
+            )
+            .map(drop)
+        });
+        methods.add_meta_method("__tostring", |_, this, ()| {
+            let i = this.info.borrow();
+            Ok(format!("region({} = {})", i.name, i.address))
+        });
+    }
+}
+
+/// `xl.region.define / get / at / list`
+fn install_region_api(lua: &Lua, workbook: &Path, api: Option<Arc<dyn XlApi>>) -> mlua::Result<()> {
+    let xl: mlua::Table = lua.globals().get("xl")?;
+    let api = api.unwrap_or_else(|| Arc::new(Detached));
+    let t = lua.create_table()?;
+    let wb = workbook.to_owned();
+
+    // xl.region.define("Forecast!E5:KJ5" [, { name = "dates", overwrite = false }])
+    let (a, w) = (Arc::clone(&api), wb.clone());
+    t.set(
+        "define",
+        lua.create_function(move |_, (address, opts): (String, Option<mlua::Table>)| {
+            let label = match &opts {
+                Some(o) => match o.get::<LV>("name")? {
+                    LV::String(s) => Some(s.to_string_lossy()),
+                    _ => None,
+                },
+                None => None,
+            };
+            let reply = region_call(
+                &a,
+                &w,
+                xlapi::RegionOp::Define {
+                    address,
+                    label,
+                    overwrite: bool_opt(&opts, "overwrite")?,
+                },
+            )?;
+            region_of(&a, &w, reply)
+        })?,
+    )?;
+
+    let (a, w) = (Arc::clone(&api), wb.clone());
+    t.set(
+        "list",
+        lua.create_function(move |lua, ()| {
+            let Reply::Regions(list) = region_call(&a, &w, xlapi::RegionOp::List)? else {
+                return Err(mlua::Error::runtime("unexpected reply from Excel"));
+            };
+            let out = lua.create_table()?;
+            for (i, info) in list.into_iter().enumerate() {
+                out.raw_set(
+                    i + 1,
+                    LuaRegion {
+                        api: Arc::clone(&a),
+                        workbook: w.clone(),
+                        info: Rc::new(RefCell::new(info)),
+                    },
+                )?;
+            }
+            Ok(out)
+        })?,
+    )?;
+
+    let (a, w) = (Arc::clone(&api), wb.clone());
+    t.set(
+        "get",
+        lua.create_function(move |_, name: String| {
+            let Reply::Regions(list) = region_call(&a, &w, xlapi::RegionOp::List)? else {
+                return Err(mlua::Error::runtime("unexpected reply from Excel"));
+            };
+            let info = list
+                .into_iter()
+                .find(|i| i.name == name)
+                .ok_or_else(|| mlua::Error::runtime(format!("no formula region named '{name}'")))?;
+            Ok(LuaRegion {
+                api: Arc::clone(&a),
+                workbook: w.clone(),
+                info: Rc::new(RefCell::new(info)),
+            })
+        })?,
+    )?;
+
+    // xl.region.at("Forecast!G5") -> the region containing that cell, or nil
+    let (a, w) = (api, wb);
+    t.set(
+        "at",
+        lua.create_function(move |_, address: String| {
+            let Reply::Regions(mut list) = region_call(&a, &w, xlapi::RegionOp::At { address })?
+            else {
+                return Err(mlua::Error::runtime("unexpected reply from Excel"));
+            };
+            Ok(list.pop().map(|info| LuaRegion {
+                api: Arc::clone(&a),
+                workbook: w.clone(),
+                info: Rc::new(RefCell::new(info)),
+            }))
+        })?,
+    )?;
+    xl.set("region", t)
+}
+
 /// Stands in when no Excel is attached.
 struct Detached;
 impl XlApi for Detached {
@@ -1701,6 +1936,76 @@ mod tests {
         assert_eq!(q("EVALUATE B", false), Value::Str("2:3:BU:7.0".into()));
         assert_eq!(q("EVALUATE A", true), Value::Str("3:3:BU:7.0".into()));
         assert!(cache.join("fabric-cache").is_dir());
+    }
+
+    #[test]
+    fn formula_regions_from_lua() {
+        use crate::xlapi::fake::MemGrid;
+        let g = MemGrid::new();
+        // A row of dates: seed in A1, the formula in B1 only.
+        g.sheets
+            .lock()
+            .unwrap()
+            .get_mut("Data")
+            .unwrap()
+            .formulas
+            .insert((0, 1), "=EOMONTH(RC[-1],1)".into());
+        let h = grid_host(
+            r#"
+            function setup()
+              local r = xl.region.define("B1:F1", { name = "dates" })
+              return r:name() .. " " .. r:address()
+            end
+            function clean() return xl.region.get("dates"):check().ok end
+            function spoil() xl.range("D1"):set(99) xl.range("E1"):set_formulas({{"=RC[-2]"}}) end
+            function report()
+              local c = xl.region.get("dates"):check()
+              local out = {}
+              for _, d in ipairs(c.deviations) do out[#out + 1] = d.address .. ":" .. d.kind end
+              return c.count .. " " .. table.concat(out, ",")
+            end
+            function refused() return pcall(function() xl.region.get("dates"):apply() end) end
+            function repair() xl.region.get("dates"):apply { overwrite = true } return xl.region.get("dates"):check().ok end
+            function where_is() local r = xl.region.at("C1") return r and r:name() or "none" end
+            function outside() return xl.region.at("A5") == nil end
+            function slide() local r = xl.region.get("dates") r:roll(2) return r:address() end
+            function grow() local r = xl.region.get("dates") r:extend_end(3) return r:address() end
+            function forecast() local r = xl.region.get("dates") r:roll_start(1) return r:address() end
+            function gone() xl.region.get("dates"):remove() return #xl.region.list() end
+            function overlap() return pcall(function() xl.region.define("C1:D1") end) end
+            "#,
+            Arc::clone(&g),
+        );
+        assert_eq!(
+            h.call("setup", &[]).unwrap(),
+            Value::Str("dates Data!B1:F1".into())
+        );
+        assert_eq!(h.call("clean", &[]).unwrap(), Value::Bool(true));
+        h.call("spoil", &[]).unwrap();
+        assert_eq!(
+            h.call("report", &[]).unwrap(),
+            Value::Str("2 D1:constant,E1:formula".into())
+        );
+        // Without overwrite the apply is refused and says what is in the way.
+        assert_eq!(h.call("refused", &[]).unwrap(), Value::Bool(false));
+        assert_eq!(h.call("repair", &[]).unwrap(), Value::Bool(true));
+        assert_eq!(h.call("where_is", &[]).unwrap(), Value::Str("dates".into()));
+        assert_eq!(h.call("outside", &[]).unwrap(), Value::Bool(true));
+        assert_eq!(h.call("overlap", &[]).unwrap(), Value::Bool(false));
+        // Rolling: slide the window by two, grow the end by three, move the start by one.
+        assert_eq!(
+            h.call("slide", &[]).unwrap(),
+            Value::Str("Data!D1:H1".into())
+        );
+        assert_eq!(
+            h.call("grow", &[]).unwrap(),
+            Value::Str("Data!D1:K1".into())
+        );
+        assert_eq!(
+            h.call("forecast", &[]).unwrap(),
+            Value::Str("Data!E1:K1".into())
+        );
+        assert_eq!(h.call("gone", &[]).unwrap(), Value::Num(0.0));
     }
 
     #[test]

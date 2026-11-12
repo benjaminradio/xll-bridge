@@ -12,6 +12,8 @@ pub struct Settings {
     pub docked: bool,
     /// Docked panel width in pixels at 96 DPI.
     pub panel_width: i32,
+    /// Formula regions: replace cells that hold something else without asking first.
+    pub overwrite_regions: bool,
 }
 
 impl Default for Settings {
@@ -19,6 +21,7 @@ impl Default for Settings {
         Settings {
             docked: true,
             panel_width: 340,
+            overwrite_regions: false,
         }
     }
 }
@@ -56,6 +59,15 @@ pub fn save(s: &Settings) {
     }
 }
 
+/// Changes one setting without clobbering the others (other parts may have saved since this
+/// part last looked): reads the file again, applies `f`, writes it back.
+pub fn update(f: impl FnOnce(&mut Settings)) -> Settings {
+    let mut s = load();
+    f(&mut s);
+    save(&s);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +85,7 @@ mod tests {
         let s = Settings {
             docked: false,
             panel_width: 400,
+            ..Default::default()
         };
         save_to(&file, &s).unwrap();
         assert_eq!(load_from(&file), s);
@@ -85,7 +98,7 @@ mod tests {
             load_from(&file),
             Settings {
                 docked: false,
-                panel_width: 340
+                ..Default::default()
             }
         );
     }
