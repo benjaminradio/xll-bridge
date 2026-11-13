@@ -166,8 +166,8 @@ pub fn read_array(path: &Path, opts: &Options, max_cells: u64) -> Result<Array, 
     let mut rd = reader(path)?;
     for rec in rd.records().skip(1) {
         let rec = rec.map_err(|e| e.to_string())?;
-        for i in 0..cols {
-            data.push(convert(lay.kinds[i], rec.get(i).unwrap_or("")));
+        for (i, kind) in lay.kinds.iter().enumerate().take(cols) {
+            data.push(convert(*kind, rec.get(i).unwrap_or("")));
         }
         if data.len() as u64 > max_cells {
             return Err(format!(
